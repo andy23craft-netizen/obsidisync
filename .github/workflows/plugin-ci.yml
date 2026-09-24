@@ -49,9 +49,14 @@ jobs:
           if-no-files-found: error
 
   docker:
-    name: Build and push container image
-    runs-on: ubuntu-latest
+    name: Test, build, smoke-test, and push native ARM64 image
+    runs-on: ubuntu-24.04-arm
     needs: plugin
+    outputs:
+      handoff: ${{ steps.image.outputs.handoff }}
+    env:
+      UPSTREAM_BASE_TAG: v0.15.0
+      UPSTREAM_BASE_COMMIT: 96b83659d93877546d5164d7b468be51bac626be
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -59,6 +64,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify native ARM64 runner
+        run: test "$(uname -m)" = aarch64
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test plugin and server
+        run: npm test
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -78,15 +92,79 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=ref,event=tag
-            type=raw,value=latest
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
+      - name: Build native ARM64 image
+        env:
+          IMAGE_TAG: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
+        run: |
+          set -euo pipefail
+          label_args=()
+          while IFS= read -r label; do
+            [[ -n "$label" ]] && label_args+=(--label "$label")
+          done <<< "$IMAGE_LABELS"
+          docker buildx build --platform linux/arm64 --load --tag "$IMAGE_TAG" "${label_args[@]}" .
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE_TAG")" = arm64
+
+      - name: Smoke-test image over loopback
+        env:
+          IMAGE_TAG: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+        run: bash scripts/smoke-container.sh "$IMAGE_TAG"
+
+      - name: Push or reuse immutable release tag and record digest
+        id: image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+            promotion_result=reused_existing_tag
+          else
+            docker push "$IMAGE_TAG"
+            promotion_result=published_new_tag
+          fi
+          digest="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest}}' | jq -er '.digest')"
+          docker buildx imagetools inspect "$IMAGE@$digest" --format '{{json .Image}}' | jq -e \
+            --arg commit "$GITHUB_SHA" \
+            '.architecture == "arm64" and .os == "linux" and .config.Labels["org.opencontainers.image.revision"] == $commit' >/dev/null
+          anonymous_docker_config="$(mktemp -d)"
+          trap 'rm -rf "$anonymous_docker_config"' EXIT
+          DOCKER_CONFIG="$anonymous_docker_config" docker pull "$IMAGE@$digest"
+          test "$(DOCKER_CONFIG="$anonymous_docker_config" docker image inspect --format '{{.Architecture}}' "$IMAGE@$digest")" = arm64
+          printf 'digest=%s\nhandoff=%s@%s\npromotion_result=%s\n' \
+            "$digest" "$IMAGE" "$digest" "$promotion_result" >> "$GITHUB_OUTPUT"
+
+      - name: Write ARM64 build evidence
+        env:
+          IMAGE_HANDOFF: ${{ steps.image.outputs.handoff }}
+          PROMOTION_RESULT: ${{ steps.image.outputs.promotion_result }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'ObsidiSync native ARM64 image evidence'
+            echo "source_tag=$GITHUB_REF_NAME"
+            echo "source_commit=$GITHUB_SHA"
+            echo "source_repository=https://github.com/$GITHUB_REPOSITORY"
+            echo "upstream_base_tag=$UPSTREAM_BASE_TAG"
+            echo "upstream_base_commit=$UPSTREAM_BASE_COMMIT"
+            echo "builder_runner=$RUNNER_OS"
+            echo "builder_architecture=$(uname -m)"
+            echo 'test_command=npm test'
+            echo 'test_result=passed'
+            echo "image=$IMAGE_HANDOFF"
+            echo "promotion_result=$PROMOTION_RESULT"
+            echo "remote_provenance=verified (org.opencontainers.image.revision matches source_commit)"
+            echo 'smoke_test=passed (loopback GET /v1/server/info with synthetic configuration)'
+            echo 'anonymous_pull=passed'
+          } > arm64-image-evidence.txt
+
+      - name: Upload ARM64 build evidence
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          name: obsidisync-${{ github.ref_name }}-arm64-evidence
+          path: arm64-image-evidence.txt
+          if-no-files-found: error
 
   release:
     name: Publish plugin release assets
@@ -138,10 +216,10 @@ jobs:
             printf '### Sync server container image\n\n'
             printf 'The sync server is published to the GitHub Container Registry:\n\n'
             printf '```bash\n'
-            printf 'docker pull %s:%s\n' "$image" "$GITHUB_REF_NAME"
+            printf 'docker pull %s\n' '${{ needs.docker.outputs.handoff }}'
             printf '```\n\n'
-            printf -- '- `%s:%s`\n' "$image" "$GITHUB_REF_NAME"
-            printf -- '- `%s:latest`\n\n' "$image"
+            printf -- '- `%s`\n' '${{ needs.docker.outputs.handoff }}'
+            printf -- '- `%s:%s`\n\n' "$image" "$GITHUB_REF_NAME"
             printf 'Image page: https://github.com/%s/pkgs/container/%s\n' "$GITHUB_REPOSITORY" "$package"
           } > release-notes.md
 
