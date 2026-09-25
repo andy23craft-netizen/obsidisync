@@ -20,6 +20,42 @@ use tower::ServiceExt;
 const USER: &str = "alice";
 const VAULT: &str = "notes";
 
+#[tokio::test]
+async fn password_mode_get_login_on_fresh_storage_renders_setup_form() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("data");
+    let app = router(
+        AppState::new(
+            VaultService::new(data_dir.clone()),
+            AuthVerifier::password_with_setup_token(
+                "Alice@example.com".to_string(),
+                data_dir,
+                Some("setup-token-123456".to_string()),
+            )
+            .unwrap(),
+            PublicAuthConfig::Password,
+        ),
+        1024 * 1024,
+        Vec::new(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("Set password"), "{body}");
+    assert!(body.contains("name=\"setup_token\""), "{body}");
+}
+
 #[test]
 fn validates_paths_and_user_claims() {
     assert_eq!(normalize_user_claim("Alice@example.com").unwrap(), "alice");

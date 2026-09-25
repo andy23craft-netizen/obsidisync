@@ -1,6 +1,4 @@
 use anyhow::{bail, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use obsidian_git_sync_server::auth::{AuthVerifier, ZitadelAuthorization};
 use obsidian_git_sync_server::http::{
     router_with_webdav_limit, AppState, PublicAuthConfig, DEFAULT_WEBDAV_MAX_BODY_BYTES,
@@ -89,10 +87,6 @@ impl RuntimeConfig {
             )
         } else if let Some(user) = password_user_env() {
             let setup_token = password_setup_token()?;
-            tracing::warn!(
-                "password mode first-time setup requires OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN or this generated setup token: {}",
-                setup_token
-            );
             (
                 AuthVerifier::password_with_setup_token(user, data_dir.clone(), Some(setup_token))?,
                 PublicAuthConfig::Password,
@@ -200,10 +194,16 @@ fn password_user_env() -> Option<String> {
 }
 
 fn password_setup_token() -> Result<String> {
-    match std::env::var("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN") {
-        Ok(value) => non_empty_env_value("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN", value),
-        Err(_) => random_setup_token(),
-    }
+    password_setup_token_from_env(std::env::var("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN"))
+}
+
+fn password_setup_token_from_env(
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<String> {
+    let value = value.map_err(|_| {
+        anyhow::anyhow!("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN is required in password mode")
+    })?;
+    non_empty_env_value("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN", value)
 }
 
 fn non_empty_env_value(name: &str, value: String) -> Result<String> {
@@ -215,13 +215,6 @@ fn non_empty_env_value(name: &str, value: String) -> Result<String> {
         bail!("{name} must not contain whitespace");
     }
     Ok(value)
-}
-
-fn random_setup_token() -> Result<String> {
-    let mut token = [0_u8; 32];
-    getrandom::fill(&mut token)
-        .map_err(|error| anyhow::anyhow!("random generator failed: {error}"))?;
-    Ok(URL_SAFE_NO_PAD.encode(token))
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -250,4 +243,67 @@ fn parse_csv_env(name: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone)]
+    struct EventRecorder(Arc<Mutex<Vec<String>>>);
+
+    impl<S> Layer<S> for EventRecorder
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(event.metadata().name().to_string());
+        }
+    }
+
+    #[test]
+    fn configured_password_setup_token_is_never_logged() {
+        let token = "production-setup-token-123456";
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventRecorder(events.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                password_setup_token_from_env(Ok(token.to_string())).unwrap(),
+                token
+            );
+        });
+
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn password_mode_requires_a_setup_token() {
+        let error = password_setup_token_from_env(Err(std::env::VarError::NotPresent))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN is required in password mode"
+        );
+    }
+
+    #[test]
+    fn password_mode_rejects_an_invalid_setup_token() {
+        let data_dir = tempfile::tempdir().unwrap();
+        assert!(AuthVerifier::password_with_setup_token(
+            "alice".to_string(),
+            data_dir.path(),
+            Some("too-short".to_string()),
+        )
+        .is_err());
+    }
 }

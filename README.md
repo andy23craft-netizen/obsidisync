@@ -235,7 +235,7 @@ export OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS="github.com,gitlab.com,git.example
 npm run start:server
 ```
 
-Then click **Log in** in the Obsidian plugin settings. On the first login, the plugin asks for the setup token and sets the password through the server; later logins use the same button and store the returned access token automatically. If `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN` is not set, the server generates a random setup token and logs it at startup. The web `/login` page remains available for browser access to the change feed and manual token recovery. `OBSIDIAN_GIT_SYNC_USER` is accepted as a shorter alias for `OBSIDIAN_GIT_SYNC_PASSWORD_USER`.
+Then click **Log in** in the Obsidian plugin settings. On the first login, the plugin asks for the setup token and sets the password through the server; later logins use the same button and store the returned access token automatically. `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN` is required in password mode and is never logged by the server. The web `/login` page remains available for browser access to the change feed and manual token recovery. `OBSIDIAN_GIT_SYNC_USER` is accepted as a shorter alias for `OBSIDIAN_GIT_SYNC_PASSWORD_USER`.
 
 After logging in, the page also shows a recent change feed for the user's synced vaults.
 
@@ -275,7 +275,7 @@ Security defaults:
 - Failed WebDAV logins are throttled: 20 failures from one client address (first `X-Forwarded-For` hop, otherwise the TCP peer) or 100 failures for one username within 15 minutes lock that key for 15 minutes with a `429` and `Retry-After` response. Successful logins clear the counter.
 - Password setup and login (both `/login` forms and JSON endpoints) use the same limits and `429`/`Retry-After` behavior. Password username limits are independent of the client address, so changing an address cannot evade them. Password endpoints use the TCP peer and deliberately do not trust client-supplied forwarded-address headers.
 - Staged JSON uploads have a maximum declared file size (default 512 MiB), a per-vault incomplete-upload reservation budget (default 1 GiB), and an incomplete-upload TTL (default 24 hours). Complete uploads are never TTL-cleaned because a live sync may still reference them; they are removed when consumed by sync.
-- First-time password setup requires `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN` or the generated setup token printed in server logs.
+- Password mode requires `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN`; first-time password setup requires the same token.
 - Plugin server/OIDC URLs must use HTTPS, except localhost development URLs.
 - Leaving the Git remote URL blank is allowed and selects server-local Git storage in `OBSIDIAN_GIT_SYNC_DATA_DIR`.
 - Git remotes must use HTTPS or SSH. Local paths and `file://` remotes are disabled unless `OBSIDIAN_GIT_SYNC_ALLOW_LOCAL_REMOTES=true`.
