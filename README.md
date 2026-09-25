@@ -216,6 +216,9 @@ export OBSIDIAN_GIT_SYNC_DATA_DIR="/srv/obsidian-git-sync"
 export OBSIDIAN_GIT_SYNC_LISTEN="127.0.0.1:8787"
 export OBSIDIAN_GIT_SYNC_MAX_BODY_BYTES="52428800"
 export OBSIDIAN_GIT_SYNC_WEBDAV_MAX_BODY_BYTES="209715200" # largest single WebDAV upload (PDF notes)
+export OBSIDIAN_GIT_SYNC_MAX_DECLARED_UPLOAD_BYTES="536870912" # largest staged JSON sync upload (512 MiB)
+export OBSIDIAN_GIT_SYNC_MAX_INCOMPLETE_UPLOAD_BYTES="1073741824" # per-vault reservation for incomplete staged uploads (1 GiB)
+export OBSIDIAN_GIT_SYNC_INCOMPLETE_UPLOAD_TTL_SECONDS="86400" # remove incomplete staged uploads after 24 hours
 export OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS="github.com,gitlab.com,git.example.com" # required for network remotes
 export OBSIDIAN_GIT_SYNC_ALLOWED_ORIGINS="" # default: no browser CORS headers
 npm run start:server
@@ -270,6 +273,8 @@ Security defaults:
 - Password mode stores the Argon2 password hash under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/password.json` and hashed server session tokens under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/sessions.json`.
 - WebDAV device passwords are generated server-side, stored only as SHA-256 hashes under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/device-passwords.json`, and each grants access to a single vault folder. They are created and revoked with a normal plugin login and work in every auth mode.
 - Failed WebDAV logins are throttled: 20 failures from one client address (first `X-Forwarded-For` hop, otherwise the TCP peer) or 100 failures for one username within 15 minutes lock that key for 15 minutes with a `429` and `Retry-After` response. Successful logins clear the counter.
+- Password setup and login (both `/login` forms and JSON endpoints) use the same limits and `429`/`Retry-After` behavior. Password username limits are independent of the client address, so changing an address cannot evade them. Password endpoints use the TCP peer and deliberately do not trust client-supplied forwarded-address headers.
+- Staged JSON uploads have a maximum declared file size (default 512 MiB), a per-vault incomplete-upload reservation budget (default 1 GiB), and an incomplete-upload TTL (default 24 hours). Complete uploads are never TTL-cleaned because a live sync may still reference them; they are removed when consumed by sync.
 - First-time password setup requires `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN` or the generated setup token printed in server logs.
 - Plugin server/OIDC URLs must use HTTPS, except localhost development URLs.
 - Leaving the Git remote URL blank is allowed and selects server-local Git storage in `OBSIDIAN_GIT_SYNC_DATA_DIR`.
@@ -277,6 +282,7 @@ Security defaults:
 - HTTPS remote URLs with embedded credentials are rejected so tokens are not written to `state.json`; configure server-side Git credentials or SSH keys instead.
 - Network remote hosts are default-deny. List each allowed Git host in `OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS` when using a remote URL.
 - CORS headers are not emitted by default. Set `OBSIDIAN_GIT_SYNC_ALLOWED_ORIGINS` to exact origins if you intentionally call the API from a browser app.
+- If a reverse proxy supplies `X-Forwarded-*`, it must remove client-supplied values and set replacement values itself. Do not pass those headers through from the public client.
 
 ## Plugin setup
 
@@ -472,6 +478,8 @@ Back up the complete server data directory configured by `OBSIDIAN_GIT_SYNC_DATA
 - `data/users/{user}/vaults/{vault}/state.json`
 - `auth/password.json` when using password mode
 - `auth/device-passwords.json` when devices sync over WebDAV
+- `auth/sessions.json` (hashed session/refresh-token records)
+- `users/*/vaults/*/uploads` while transfers are incomplete or complete-but-not-yet-consumed
 
 Recommended procedure:
 
@@ -491,12 +499,20 @@ Do not restore only the Git repository without the binary object store. Binary f
 
 ## Server maintenance
 
-- Rotate password-mode tokens by stopping the server and deleting `auth/password.json`; then complete password setup again.
+- **Password/session compromise recovery:** stop the server, take a protected backup for investigation, and remove both `auth/password.json` and `auth/sessions.json` from the controlled `/data/auth` directory. Start it with a newly generated `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN`, set a new password once, and have every plugin/browser client log in again. This intentionally invalidates every password-mode session and refresh token; do not attempt a partial reset.
 - Server-issued access tokens last 24 hours. Server-issued refresh tokens last 180 days, are rotated on every refresh, and can only be used once.
 - For OIDC, SSO is used for the initial login exchange. Clients refresh expired app sessions through the sync server; otherwise they should log in again when the plugin reports an expired or unauthorized login.
-- Keep `uploads/` on persistent storage while syncs are active. Stale upload directories can be removed only when no clients are syncing.
+- Keep `uploads/` on persistent storage while syncs are active; incomplete entries are automatically cleaned using `OBSIDIAN_GIT_SYNC_INCOMPLETE_UPLOAD_TTL_SECONDS`.
 - Keep the `binary/` object store with the Git repo. Pruning binary objects without checking Git metadata can break historical binary versions.
 - Monitor server logs for `request failed`, Git rebase failures, and upload verification failures.
+
+### Secret-bearing data and logging checklist
+
+Treat the entire `/data` backup as sensitive: repositories and binary objects contain vault contents; `auth/password.json`, `auth/sessions.json`, and `auth/device-passwords.json` contain authentication material. Saber encryption passwords are stored in clear text in `auth/device-passwords.json` when server-side Saber PDF rendering is enabled, so that file can permit decryption of Saber notes. Keep backups encrypted and access-controlled.
+
+- Redact `Authorization`, cookies, password/setup-token fields, bearer tokens, and full vault/document paths before sharing logs.
+- Do not enable request-body logging in Caddy, Podman, or the server.
+- Share only minimal error context and request IDs; never paste `/data` files or raw sync payloads into tickets.
 
 ## API
 

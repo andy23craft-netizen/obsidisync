@@ -9,7 +9,7 @@ use crate::protocol::*;
 use crate::saber::push::{TabletPusher, DEFAULT_PUSH_DELAY};
 use crate::saber::sync::{SaberRenderer, DEFAULT_RENDER_DELAY};
 use crate::vault::VaultService;
-use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
@@ -40,6 +40,8 @@ pub struct AppState {
     pub public_auth: PublicAuthConfig,
     pub device_passwords: Arc<DevicePasswordStore>,
     pub webdav_throttle: Arc<AuthThrottle>,
+    /// Password setup/login uses the same bounded in-memory throttle as WebDAV.
+    pub password_throttle: Arc<AuthThrottle>,
     /// Largest single WebDAV upload. Enforced while streaming the body to disk.
     pub webdav_max_body_bytes: usize,
     /// Renders Saber uploads to PDFs in the background.
@@ -67,6 +69,7 @@ impl AppState {
             public_auth,
             device_passwords,
             webdav_throttle: Arc::new(AuthThrottle::new()),
+            password_throttle: Arc::new(AuthThrottle::new()),
             webdav_max_body_bytes: DEFAULT_WEBDAV_MAX_BODY_BYTES,
             saber,
             tablet,
@@ -155,8 +158,22 @@ where
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = self.0.to_string();
-        tracing::warn!(error = %message, "request failed");
-        let status = if message.contains("unauthorized")
+        // Errors may include client-controlled paths or parser context. Keep server logs useful
+        // without turning them into a second store for vault names or request secrets.
+        tracing::warn!(status = %status_for_error(&message), "request failed");
+        let status = status_for_error(&message);
+        (
+            status,
+            Json(ApiErrorBody {
+                error: public_error_message(status, &message),
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn status_for_error(message: &str) -> StatusCode {
+    if message.contains("unauthorized")
             || message.contains("authorization")
             || message.contains("OIDC")
             || message.contains("bearer")
@@ -173,15 +190,7 @@ impl IntoResponse for ApiError {
             StatusCode::NOT_FOUND
         } else {
             StatusCode::BAD_REQUEST
-        };
-        (
-            status,
-            Json(ApiErrorBody {
-                error: public_error_message(status, &message),
-            }),
-        )
-            .into_response()
-    }
+        }
 }
 
 pub fn router(state: AppState, max_body_bytes: usize, allowed_origins: Vec<String>) -> Router {
@@ -411,12 +420,17 @@ async fn password_page(
 async fn password_form(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     Form(form): Form<PasswordLoginForm>,
 ) -> Result<Response, ApiError> {
     if !matches!(state.public_auth, PublicAuthConfig::Password) {
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
     let configured = state.auth.password_is_configured().await?;
+    let keys = password_throttle_keys(&form.username, peer.as_ref());
+    if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
+        return Ok(password_throttled_form(configured, state.auth.password_setup_token_is_required()?, safe_next_path(form.next.as_deref()).as_deref(), retry_after));
+    }
     let result = if configured {
         state
             .auth
@@ -434,6 +448,7 @@ async fn password_form(
     let next = safe_next_path(form.next.as_deref());
     match result {
         Ok(session) => {
+            state.password_throttle.record_success(&keys).await;
             if configured {
                 Ok(redirect_with_site_session(
                     next.as_deref().unwrap_or("/change-feed"),
@@ -453,15 +468,21 @@ async fn password_form(
                 .into_response())
             }
         }
-        Err(error) => Ok(Html(render_password_page(
+        Err(_) => {
+            state.password_throttle.record_failure(&keys).await;
+            if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
+                return Ok(password_throttled_form(configured, state.auth.password_setup_token_is_required()?, next.as_deref(), retry_after));
+            }
+            Ok(Html(render_password_page(
             configured,
             state.auth.password_setup_token_is_required()?,
-            Some(error.to_string()),
+            Some("login failed".to_string()),
             None,
             &[],
             next.as_deref(),
         ))
-        .into_response()),
+        .into_response())
+        }
     }
 }
 
@@ -482,36 +503,54 @@ async fn change_feed_page(
 
 async fn setup_password(
     State(state): State<Arc<AppState>>,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     Json(request): Json<PasswordAuthRequest>,
-) -> Result<Json<crate::password_auth::PasswordAuthSession>, ApiError> {
+) -> Result<Response, ApiError> {
     if !matches!(state.public_auth, PublicAuthConfig::Password) {
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
-    Ok(Json(
-        state
-            .auth
-            .setup_password(
-                &request.username,
-                &request.password,
-                request.setup_token.as_deref(),
-            )
-            .await?,
-    ))
+    password_json_attempt(&state, &request, peer.as_ref(), true).await
 }
 
 async fn login_password(
     State(state): State<Arc<AppState>>,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     Json(request): Json<PasswordAuthRequest>,
-) -> Result<Json<crate::password_auth::PasswordAuthSession>, ApiError> {
+) -> Result<Response, ApiError> {
     if !matches!(state.public_auth, PublicAuthConfig::Password) {
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
-    Ok(Json(
-        state
-            .auth
-            .login_password(&request.username, &request.password)
-            .await?,
-    ))
+    password_json_attempt(&state, &request, peer.as_ref(), false).await
+}
+
+fn password_throttle_keys(username: &str, peer: Option<&ConnectInfo<std::net::SocketAddr>>) -> Vec<String> {
+    // Deliberately ignore X-Forwarded-For. The TCP peer is the only directly observed address;
+    // username throttling remains effective even if a proxy is misconfigured.
+    let ip = peer.map(|value| value.0.ip().to_string()).unwrap_or_else(|| "unknown-peer".to_string());
+    vec![AuthThrottle::ip_key(&ip), AuthThrottle::user_key(username)]
+}
+
+fn throttled_response(retry_after: u64) -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(ApiErrorBody { error: "too many failed login attempts; try again later".to_string() })).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) { response.headers_mut().insert(header::RETRY_AFTER, value); }
+    response
+}
+
+fn password_throttled_form(configured: bool, setup_token_required: bool, next: Option<&str>, retry_after: u64) -> Response {
+    let mut response = Html(render_password_page(configured, setup_token_required, Some("too many failed login attempts; try again later".to_string()), None, &[], next)).into_response();
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) { response.headers_mut().insert(header::RETRY_AFTER, value); }
+    response
+}
+
+async fn password_json_attempt(state: &Arc<AppState>, request: &PasswordAuthRequest, peer: Option<&ConnectInfo<std::net::SocketAddr>>, setup: bool) -> Result<Response, ApiError> {
+    let keys = password_throttle_keys(&request.username, peer);
+    if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await { return Ok(throttled_response(retry_after)); }
+    let result = if setup { state.auth.setup_password(&request.username, &request.password, request.setup_token.as_deref()).await } else { state.auth.login_password(&request.username, &request.password).await };
+    match result {
+        Ok(session) => { state.password_throttle.record_success(&keys).await; Ok(Json(session).into_response()) }
+        Err(_) => { state.password_throttle.record_failure(&keys).await; if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await { Ok(throttled_response(retry_after)) } else { Err(ApiError(anyhow::anyhow!(if setup { "password setup failed" } else { "invalid username or password" }))) } }
+    }
 }
 
 async fn login_oidc(
@@ -1237,4 +1276,82 @@ async fn resolve_inkvault(
             .resolve_inkvault(&user, &vault, request)
             .await?,
     ))
+}
+
+#[cfg(test)]
+mod password_throttle_route_tests {
+    use super::*;
+    use crate::auth_throttle::IP_FAILURE_LIMIT;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn app() -> Router {
+        let root = tempfile::tempdir().unwrap().keep();
+        let auth = AuthVerifier::password("alice".to_string(), &root).unwrap();
+        auth.setup_password("alice", "correct horse battery staple", None)
+            .await
+            .unwrap();
+        router(
+            AppState::new(VaultService::new_for_tests(root), auth, PublicAuthConfig::Password),
+            1024 * 1024,
+            Vec::new(),
+        )
+    }
+
+    fn json_login(password: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/password/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"username":"alice","password":"{password}"}}"#)))
+            .unwrap()
+    }
+
+    fn form_login(password: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("username=alice&password={password}")))
+            .unwrap()
+    }
+
+    async fn assert_lockout(
+        app: Router,
+        request: fn(&str) -> axum::http::Request<Body>,
+        failure_status: StatusCode,
+    ) {
+        for _ in 0..IP_FAILURE_LIMIT - 1 {
+            assert_eq!(app.clone().oneshot(request("wrong-password")).await.unwrap().status(), failure_status);
+        }
+        let response = app.clone().oneshot(request("wrong-password")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).is_some_and(|v| v > 0));
+    }
+
+    async fn assert_success_resets(
+        app: Router,
+        request: fn(&str) -> axum::http::Request<Body>,
+        failure_status: StatusCode,
+    ) {
+        for _ in 0..IP_FAILURE_LIMIT - 1 {
+            let _ = app.clone().oneshot(request("wrong-password")).await.unwrap();
+        }
+        let response = app.clone().oneshot(request("correct horse battery staple")).await.unwrap();
+        assert!(response.status().is_success() || response.status().is_redirection());
+        let response = app.clone().oneshot(request("wrong-password")).await.unwrap();
+        assert_eq!(response.status(), failure_status);
+    }
+
+    #[tokio::test]
+    async fn password_json_login_is_throttled_and_success_resets() {
+        assert_lockout(app().await, json_login, StatusCode::UNAUTHORIZED).await;
+        assert_success_resets(app().await, json_login, StatusCode::UNAUTHORIZED).await;
+    }
+
+    #[tokio::test]
+    async fn password_browser_form_is_throttled_and_success_resets() {
+        assert_lockout(app().await, form_login, StatusCode::OK).await;
+        assert_success_resets(app().await, form_login, StatusCode::OK).await;
+    }
 }

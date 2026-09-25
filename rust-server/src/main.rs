@@ -6,7 +6,10 @@ use obsidian_git_sync_server::http::{
     router_with_webdav_limit, AppState, PublicAuthConfig, DEFAULT_WEBDAV_MAX_BODY_BYTES,
 };
 use obsidian_git_sync_server::remote::RemotePolicy;
-use obsidian_git_sync_server::vault::{VaultService, VaultServiceOptions};
+use obsidian_git_sync_server::vault::{
+    UploadLimits, VaultService, VaultServiceOptions, DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS,
+    DEFAULT_MAX_DECLARED_UPLOAD_BYTES, DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -34,6 +37,7 @@ async fn async_main() -> Result<()> {
     let vaults = VaultService::new_with_options(VaultServiceOptions {
         data_dir: config.data_dir,
         remote_policy: config.remote_policy,
+        upload_limits: config.upload_limits,
     });
     let app = router_with_webdav_limit(
         AppState::new(vaults, config.auth, config.public_auth),
@@ -60,6 +64,7 @@ struct RuntimeConfig {
     webdav_max_body_bytes: usize,
     remote_policy: RemotePolicy,
     allowed_origins: Vec<String>,
+    upload_limits: UploadLimits,
 }
 
 impl RuntimeConfig {
@@ -144,6 +149,26 @@ impl RuntimeConfig {
             allowed_hosts: parse_csv_env("OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS"),
         };
         let allowed_origins = parse_csv_env("OBSIDIAN_GIT_SYNC_ALLOWED_ORIGINS");
+        let upload_limits = UploadLimits {
+            max_declared_bytes: parse_u64_env(
+                "OBSIDIAN_GIT_SYNC_MAX_DECLARED_UPLOAD_BYTES",
+                DEFAULT_MAX_DECLARED_UPLOAD_BYTES,
+            )?,
+            max_incomplete_bytes: parse_u64_env(
+                "OBSIDIAN_GIT_SYNC_MAX_INCOMPLETE_UPLOAD_BYTES",
+                DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES,
+            )?,
+            incomplete_ttl_seconds: parse_u64_env(
+                "OBSIDIAN_GIT_SYNC_INCOMPLETE_UPLOAD_TTL_SECONDS",
+                DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS,
+            )?,
+        };
+        if upload_limits.max_declared_bytes == 0
+            || upload_limits.max_incomplete_bytes == 0
+            || upload_limits.incomplete_ttl_seconds == 0
+        {
+            bail!("upload limit environment values must be positive");
+        }
 
         Ok(Self {
             listen,
@@ -154,7 +179,15 @@ impl RuntimeConfig {
             webdav_max_body_bytes,
             remote_policy,
             allowed_origins,
+            upload_limits,
         })
+    }
+}
+
+fn parse_u64_env(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value.parse::<u64>().map_err(Into::into),
+        Err(_) => Ok(default),
     }
 }
 

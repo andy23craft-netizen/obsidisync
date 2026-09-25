@@ -9,6 +9,7 @@ use crate::paths::{
 };
 use crate::protocol::*;
 use crate::remote::RemotePolicy;
+use crate::time_format::unix_now;
 use crate::version_registry::{
     read_devices, read_version_metadata, version_metadata_key, write_devices,
     write_version_metadata, DEVICES_FILE_NAME, VERSION_METADATA_FILE_NAME,
@@ -31,18 +32,36 @@ pub mod inkvault;
 const UPLOAD_CHUNK_SIZE_BYTES: u64 = 512 * 1024;
 const PENDING_CONFLICTS_PATH: &str = "pending-conflicts.json";
 const PENDING_CONFLICT_REASON: &str = "file is already awaiting conflict resolution";
+pub const DEFAULT_MAX_DECLARED_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct VaultService {
     pub data_dir: PathBuf,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     remote_policy: RemotePolicy,
+    upload_limits: UploadLimits,
 }
 
 #[derive(Debug, Clone)]
 pub struct VaultServiceOptions {
     pub data_dir: PathBuf,
     pub remote_policy: RemotePolicy,
+    pub upload_limits: UploadLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UploadLimits {
+    pub max_declared_bytes: u64,
+    pub max_incomplete_bytes: u64,
+    pub incomplete_ttl_seconds: u64,
+}
+
+impl Default for UploadLimits {
+    fn default() -> Self {
+        Self { max_declared_bytes: DEFAULT_MAX_DECLARED_UPLOAD_BYTES, max_incomplete_bytes: DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES, incomplete_ttl_seconds: DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +83,8 @@ struct UploadState {
     size: u64,
     received: u64,
     complete: bool,
+    #[serde(default)]
+    updated_at: u64,
 }
 
 #[derive(Default)]
@@ -93,6 +114,7 @@ impl VaultService {
         Self::new_with_options(VaultServiceOptions {
             data_dir,
             remote_policy: RemotePolicy::default(),
+            upload_limits: UploadLimits::default(),
         })
     }
 
@@ -103,6 +125,7 @@ impl VaultService {
                 allow_local_remotes: true,
                 allowed_hosts: Vec::new(),
             },
+            upload_limits: UploadLimits::default(),
         })
     }
 
@@ -111,6 +134,7 @@ impl VaultService {
             data_dir: options.data_dir,
             locks: Arc::new(Mutex::new(HashMap::new())),
             remote_policy: options.remote_policy,
+            upload_limits: options.upload_limits,
         }
     }
 
@@ -162,9 +186,17 @@ impl VaultService {
             if request.size > i64::MAX as u64 {
                 bail!("invalid upload size");
             }
+            if request.size > self.upload_limits.max_declared_bytes {
+                bail!("upload exceeds the configured maximum size");
+            }
 
             let upload_dir = self.upload_dir(&user, &vault);
             fs::create_dir_all(&upload_dir).await?;
+            self.cleanup_stale_incomplete_uploads(&user, &vault).await?;
+            let retained = self.incomplete_upload_bytes(&user, &vault).await?;
+            if retained.saturating_add(request.size) > self.upload_limits.max_incomplete_bytes {
+                bail!("incomplete upload storage limit reached; finish or retry later");
+            }
             let upload_id = self.new_upload_id(&upload_dir).await?;
             let state = UploadState {
                 path,
@@ -172,6 +204,7 @@ impl VaultService {
                 size: request.size,
                 received: 0,
                 complete: false,
+                updated_at: unix_now(),
             };
             fs::write(self.upload_content_path(&user, &vault, &upload_id), []).await?;
             self.write_upload_state(&user, &vault, &upload_id, &state)
@@ -221,6 +254,7 @@ impl VaultService {
                 .await?;
             file.write_all(&content).await?;
             state.received = received;
+            state.updated_at = unix_now();
             self.write_upload_state(&user, &vault, &upload_id, &state)
                 .await?;
             Ok(UploadChunkResponse {
@@ -250,6 +284,7 @@ impl VaultService {
                 bail!("upload checksum mismatch");
             }
             state.complete = true;
+            state.updated_at = unix_now();
             self.write_upload_state(&user, &vault, &upload_id, &state)
                 .await?;
             Ok(UploadCompleteResponse {
@@ -1846,6 +1881,47 @@ impl VaultService {
         Ok(state)
     }
 
+    async fn incomplete_upload_bytes(&self, user: &str, vault: &str) -> Result<u64> {
+        let mut total = 0_u64;
+        let mut entries = match fs::read_dir(self.upload_dir(user, vault)).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().extension().and_then(|v| v.to_str()) != Some("json") { continue; }
+            let state: UploadState = match serde_json::from_slice(&fs::read(entry.path()).await?) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            if !state.complete { total = total.saturating_add(state.size); }
+        }
+        Ok(total)
+    }
+
+    /// Only incomplete files expire. A complete staging object can still be referenced by an
+    /// in-flight sync, and is removed by `read_upload_content` after that sync consumes it.
+    async fn cleanup_stale_incomplete_uploads(&self, user: &str, vault: &str) -> Result<()> {
+        let now = unix_now();
+        let ttl = self.upload_limits.incomplete_ttl_seconds;
+        let upload_dir = self.upload_dir(user, vault);
+        let mut entries = fs::read_dir(&upload_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") { continue; }
+            let state: UploadState = match serde_json::from_slice(&fs::read(&path).await?) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            if !state.complete && now.saturating_sub(state.updated_at) >= ttl {
+                let stem = match path.file_stem().and_then(|v| v.to_str()) { Some(v) => v, None => continue };
+                let _ = fs::remove_file(&path).await;
+                let _ = fs::remove_file(upload_dir.join(format!("{stem}.bin"))).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn write_upload_state(
         &self,
         user: &str,
@@ -2302,4 +2378,66 @@ fn is_client_visible_conflict_path(path: &str) -> bool {
 fn isoish_now() -> String {
     // Avoid pulling a time crate into the server just for commit subjects.
     format!("{:?}", std::time::SystemTime::now())
+}
+
+#[cfg(test)]
+mod upload_limit_tests {
+    use super::*;
+
+    fn request(size: u64) -> UploadInitRequest {
+        UploadInitRequest {
+            path: "large.bin".to_string(),
+            sha256: "0".repeat(64),
+            size,
+        }
+    }
+
+    fn service(root: &Path, limits: UploadLimits) -> VaultService {
+        VaultService::new_with_options(VaultServiceOptions {
+            data_dir: root.to_path_buf(),
+            remote_policy: RemotePolicy::default(),
+            upload_limits: limits,
+        })
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_declarations_and_incomplete_quota_exhaustion() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(
+            root.path(),
+            UploadLimits {
+                max_declared_bytes: 10,
+                max_incomplete_bytes: 12,
+                incomplete_ttl_seconds: 60,
+            },
+        );
+        assert!(service.init_upload("alice", "vault", request(11)).await.is_err());
+        service.init_upload("alice", "vault", request(7)).await.unwrap();
+        assert!(service.init_upload("alice", "vault", request(6)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleans_only_stale_incomplete_uploads() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(
+            root.path(),
+            UploadLimits {
+                max_declared_bytes: 10,
+                max_incomplete_bytes: 20,
+                incomplete_ttl_seconds: 1,
+            },
+        );
+        let incomplete = service.init_upload("alice", "vault", request(5)).await.unwrap();
+        let complete = service.init_upload("alice", "vault", request(0)).await.unwrap();
+        let mut complete_state = service.read_upload_state("alice", "vault", &complete.upload_id).await.unwrap();
+        complete_state.complete = true;
+        complete_state.updated_at = 0;
+        service.write_upload_state("alice", "vault", &complete.upload_id, &complete_state).await.unwrap();
+        let mut old = service.read_upload_state("alice", "vault", &incomplete.upload_id).await.unwrap();
+        old.updated_at = 0;
+        service.write_upload_state("alice", "vault", &incomplete.upload_id, &old).await.unwrap();
+        service.cleanup_stale_incomplete_uploads("alice", "vault").await.unwrap();
+        assert!(service.read_upload_state("alice", "vault", &incomplete.upload_id).await.is_err());
+        assert!(service.read_upload_state("alice", "vault", &complete.upload_id).await.is_ok());
+    }
 }
