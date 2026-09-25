@@ -174,23 +174,23 @@ impl IntoResponse for ApiError {
 
 fn status_for_error(message: &str) -> StatusCode {
     if message.contains("unauthorized")
-            || message.contains("authorization")
-            || message.contains("OIDC")
-            || message.contains("bearer")
-            || message.contains("refresh token")
-            || message.contains("invalid username or password")
-            || message.contains("password is not set")
-        {
-            StatusCode::UNAUTHORIZED
-        } else if message.starts_with("InkNote changed since conflict") {
-            StatusCode::CONFLICT
-        } else if message.contains("forbidden") {
-            StatusCode::FORBIDDEN
-        } else if message.contains("not found") || message.contains("Unknown vault") {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::BAD_REQUEST
-        }
+        || message.contains("authorization")
+        || message.contains("OIDC")
+        || message.contains("bearer")
+        || message.contains("refresh token")
+        || message.contains("invalid username or password")
+        || message.contains("password is not set")
+    {
+        StatusCode::UNAUTHORIZED
+    } else if message.starts_with("InkNote changed since conflict") {
+        StatusCode::CONFLICT
+    } else if message.contains("forbidden") {
+        StatusCode::FORBIDDEN
+    } else if message.contains("not found") || message.contains("Unknown vault") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 pub fn router(state: AppState, max_body_bytes: usize, allowed_origins: Vec<String>) -> Router {
@@ -429,7 +429,12 @@ async fn password_form(
     let configured = state.auth.password_is_configured().await?;
     let keys = password_throttle_keys(&form.username, peer.as_ref());
     if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
-        return Ok(password_throttled_form(configured, state.auth.password_setup_token_is_required()?, safe_next_path(form.next.as_deref()).as_deref(), retry_after));
+        return Ok(password_throttled_form(
+            configured,
+            state.auth.password_setup_token_is_required()?,
+            safe_next_path(form.next.as_deref()).as_deref(),
+            retry_after,
+        ));
     }
     let result = if configured {
         state
@@ -471,17 +476,22 @@ async fn password_form(
         Err(_) => {
             state.password_throttle.record_failure(&keys).await;
             if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
-                return Ok(password_throttled_form(configured, state.auth.password_setup_token_is_required()?, next.as_deref(), retry_after));
+                return Ok(password_throttled_form(
+                    configured,
+                    state.auth.password_setup_token_is_required()?,
+                    next.as_deref(),
+                    retry_after,
+                ));
             }
             Ok(Html(render_password_page(
-            configured,
-            state.auth.password_setup_token_is_required()?,
-            Some("login failed".to_string()),
-            None,
-            &[],
-            next.as_deref(),
-        ))
-        .into_response())
+                configured,
+                state.auth.password_setup_token_is_required()?,
+                Some("login failed".to_string()),
+                None,
+                &[],
+                next.as_deref(),
+            ))
+            .into_response())
         }
     }
 }
@@ -523,33 +533,96 @@ async fn login_password(
     password_json_attempt(&state, &request, peer.as_ref(), false).await
 }
 
-fn password_throttle_keys(username: &str, peer: Option<&ConnectInfo<std::net::SocketAddr>>) -> Vec<String> {
+fn password_throttle_keys(
+    username: &str,
+    peer: Option<&ConnectInfo<std::net::SocketAddr>>,
+) -> Vec<String> {
     // Deliberately ignore X-Forwarded-For. The TCP peer is the only directly observed address;
     // username throttling remains effective even if a proxy is misconfigured.
-    let ip = peer.map(|value| value.0.ip().to_string()).unwrap_or_else(|| "unknown-peer".to_string());
+    let ip = peer
+        .map(|value| value.0.ip().to_string())
+        .unwrap_or_else(|| "unknown-peer".to_string());
     vec![AuthThrottle::ip_key(&ip), AuthThrottle::user_key(username)]
 }
 
 fn throttled_response(retry_after: u64) -> Response {
-    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(ApiErrorBody { error: "too many failed login attempts; try again later".to_string() })).into_response();
-    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) { response.headers_mut().insert(header::RETRY_AFTER, value); }
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiErrorBody {
+            error: "too many failed login attempts; try again later".to_string(),
+        }),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }
 
-fn password_throttled_form(configured: bool, setup_token_required: bool, next: Option<&str>, retry_after: u64) -> Response {
-    let mut response = Html(render_password_page(configured, setup_token_required, Some("too many failed login attempts; try again later".to_string()), None, &[], next)).into_response();
+fn password_throttled_form(
+    configured: bool,
+    setup_token_required: bool,
+    next: Option<&str>,
+    retry_after: u64,
+) -> Response {
+    let mut response = Html(render_password_page(
+        configured,
+        setup_token_required,
+        Some("too many failed login attempts; try again later".to_string()),
+        None,
+        &[],
+        next,
+    ))
+    .into_response();
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) { response.headers_mut().insert(header::RETRY_AFTER, value); }
+    if let Ok(value) = HeaderValue::from_str(&retry_after.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }
 
-async fn password_json_attempt(state: &Arc<AppState>, request: &PasswordAuthRequest, peer: Option<&ConnectInfo<std::net::SocketAddr>>, setup: bool) -> Result<Response, ApiError> {
+async fn password_json_attempt(
+    state: &Arc<AppState>,
+    request: &PasswordAuthRequest,
+    peer: Option<&ConnectInfo<std::net::SocketAddr>>,
+    setup: bool,
+) -> Result<Response, ApiError> {
     let keys = password_throttle_keys(&request.username, peer);
-    if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await { return Ok(throttled_response(retry_after)); }
-    let result = if setup { state.auth.setup_password(&request.username, &request.password, request.setup_token.as_deref()).await } else { state.auth.login_password(&request.username, &request.password).await };
+    if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
+        return Ok(throttled_response(retry_after));
+    }
+    let result = if setup {
+        state
+            .auth
+            .setup_password(
+                &request.username,
+                &request.password,
+                request.setup_token.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .auth
+            .login_password(&request.username, &request.password)
+            .await
+    };
     match result {
-        Ok(session) => { state.password_throttle.record_success(&keys).await; Ok(Json(session).into_response()) }
-        Err(_) => { state.password_throttle.record_failure(&keys).await; if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await { Ok(throttled_response(retry_after)) } else { Err(ApiError(anyhow::anyhow!(if setup { "password setup failed" } else { "invalid username or password" }))) } }
+        Ok(session) => {
+            state.password_throttle.record_success(&keys).await;
+            Ok(Json(session).into_response())
+        }
+        Err(_) => {
+            state.password_throttle.record_failure(&keys).await;
+            if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
+                Ok(throttled_response(retry_after))
+            } else {
+                Err(ApiError(anyhow::anyhow!(if setup {
+                    "password setup failed"
+                } else {
+                    "invalid username or password"
+                })))
+            }
+        }
     }
 }
 
@@ -1292,7 +1365,11 @@ mod password_throttle_route_tests {
             .await
             .unwrap();
         router(
-            AppState::new(VaultService::new_for_tests(root), auth, PublicAuthConfig::Password),
+            AppState::new(
+                VaultService::new_for_tests(root),
+                auth,
+                PublicAuthConfig::Password,
+            ),
             1024 * 1024,
             Vec::new(),
         )
@@ -1303,7 +1380,9 @@ mod password_throttle_route_tests {
             .method("POST")
             .uri("/v1/auth/password/login")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(format!(r#"{{"username":"alice","password":"{password}"}}"#)))
+            .body(Body::from(format!(
+                r#"{{"username":"alice","password":"{password}"}}"#
+            )))
             .unwrap()
     }
 
@@ -1322,11 +1401,27 @@ mod password_throttle_route_tests {
         failure_status: StatusCode,
     ) {
         for _ in 0..IP_FAILURE_LIMIT - 1 {
-            assert_eq!(app.clone().oneshot(request("wrong-password")).await.unwrap().status(), failure_status);
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("wrong-password"))
+                    .await
+                    .unwrap()
+                    .status(),
+                failure_status
+            );
         }
-        let response = app.clone().oneshot(request("wrong-password")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("wrong-password"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).is_some_and(|v| v > 0));
+        assert!(response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|v| v > 0));
     }
 
     async fn assert_success_resets(
@@ -1335,11 +1430,23 @@ mod password_throttle_route_tests {
         failure_status: StatusCode,
     ) {
         for _ in 0..IP_FAILURE_LIMIT - 1 {
-            let _ = app.clone().oneshot(request("wrong-password")).await.unwrap();
+            let _ = app
+                .clone()
+                .oneshot(request("wrong-password"))
+                .await
+                .unwrap();
         }
-        let response = app.clone().oneshot(request("correct horse battery staple")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("correct horse battery staple"))
+            .await
+            .unwrap();
         assert!(response.status().is_success() || response.status().is_redirection());
-        let response = app.clone().oneshot(request("wrong-password")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("wrong-password"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), failure_status);
     }
 

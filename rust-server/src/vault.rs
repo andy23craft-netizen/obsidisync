@@ -60,7 +60,11 @@ pub struct UploadLimits {
 
 impl Default for UploadLimits {
     fn default() -> Self {
-        Self { max_declared_bytes: DEFAULT_MAX_DECLARED_UPLOAD_BYTES, max_incomplete_bytes: DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES, incomplete_ttl_seconds: DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS }
+        Self {
+            max_declared_bytes: DEFAULT_MAX_DECLARED_UPLOAD_BYTES,
+            max_incomplete_bytes: DEFAULT_MAX_INCOMPLETE_UPLOAD_BYTES,
+            incomplete_ttl_seconds: DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS,
+        }
     }
 }
 
@@ -1889,12 +1893,16 @@ impl VaultService {
             Err(error) => return Err(error.into()),
         };
         while let Some(entry) = entries.next_entry().await? {
-            if entry.path().extension().and_then(|v| v.to_str()) != Some("json") { continue; }
+            if entry.path().extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
             let state: UploadState = match serde_json::from_slice(&fs::read(entry.path()).await?) {
                 Ok(state) => state,
                 Err(_) => continue,
             };
-            if !state.complete { total = total.saturating_add(state.size); }
+            if !state.complete {
+                total = total.saturating_add(state.size);
+            }
         }
         Ok(total)
     }
@@ -1908,13 +1916,18 @@ impl VaultService {
         let mut entries = fs::read_dir(&upload_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|v| v.to_str()) != Some("json") { continue; }
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
             let state: UploadState = match serde_json::from_slice(&fs::read(&path).await?) {
                 Ok(state) => state,
                 Err(_) => continue,
             };
             if !state.complete && now.saturating_sub(state.updated_at) >= ttl {
-                let stem = match path.file_stem().and_then(|v| v.to_str()) { Some(v) => v, None => continue };
+                let stem = match path.file_stem().and_then(|v| v.to_str()) {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let _ = fs::remove_file(&path).await;
                 let _ = fs::remove_file(upload_dir.join(format!("{stem}.bin"))).await;
             }
@@ -2411,9 +2424,18 @@ mod upload_limit_tests {
                 incomplete_ttl_seconds: 60,
             },
         );
-        assert!(service.init_upload("alice", "vault", request(11)).await.is_err());
-        service.init_upload("alice", "vault", request(7)).await.unwrap();
-        assert!(service.init_upload("alice", "vault", request(6)).await.is_err());
+        assert!(service
+            .init_upload("alice", "vault", request(11))
+            .await
+            .is_err());
+        service
+            .init_upload("alice", "vault", request(7))
+            .await
+            .unwrap();
+        assert!(service
+            .init_upload("alice", "vault", request(6))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -2427,17 +2449,44 @@ mod upload_limit_tests {
                 incomplete_ttl_seconds: 1,
             },
         );
-        let incomplete = service.init_upload("alice", "vault", request(5)).await.unwrap();
-        let complete = service.init_upload("alice", "vault", request(0)).await.unwrap();
-        let mut complete_state = service.read_upload_state("alice", "vault", &complete.upload_id).await.unwrap();
+        let incomplete = service
+            .init_upload("alice", "vault", request(5))
+            .await
+            .unwrap();
+        let complete = service
+            .init_upload("alice", "vault", request(0))
+            .await
+            .unwrap();
+        let mut complete_state = service
+            .read_upload_state("alice", "vault", &complete.upload_id)
+            .await
+            .unwrap();
         complete_state.complete = true;
         complete_state.updated_at = 0;
-        service.write_upload_state("alice", "vault", &complete.upload_id, &complete_state).await.unwrap();
-        let mut old = service.read_upload_state("alice", "vault", &incomplete.upload_id).await.unwrap();
+        service
+            .write_upload_state("alice", "vault", &complete.upload_id, &complete_state)
+            .await
+            .unwrap();
+        let mut old = service
+            .read_upload_state("alice", "vault", &incomplete.upload_id)
+            .await
+            .unwrap();
         old.updated_at = 0;
-        service.write_upload_state("alice", "vault", &incomplete.upload_id, &old).await.unwrap();
-        service.cleanup_stale_incomplete_uploads("alice", "vault").await.unwrap();
-        assert!(service.read_upload_state("alice", "vault", &incomplete.upload_id).await.is_err());
-        assert!(service.read_upload_state("alice", "vault", &complete.upload_id).await.is_ok());
+        service
+            .write_upload_state("alice", "vault", &incomplete.upload_id, &old)
+            .await
+            .unwrap();
+        service
+            .cleanup_stale_incomplete_uploads("alice", "vault")
+            .await
+            .unwrap();
+        assert!(service
+            .read_upload_state("alice", "vault", &incomplete.upload_id)
+            .await
+            .is_err());
+        assert!(service
+            .read_upload_state("alice", "vault", &complete.upload_id)
+            .await
+            .is_ok());
     }
 }
