@@ -235,6 +235,7 @@ impl VaultService {
 
     /// Conditional variant of `dav_write_from_file`. The comparison and write share the vault
     /// lock, so two callers using the same entity tag cannot both commit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dav_write_from_file_if_match(
         &self,
         user: &str,
@@ -260,6 +261,7 @@ impl VaultService {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dav_write_source(
         &self,
         user: &str,
