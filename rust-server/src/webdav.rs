@@ -837,6 +837,23 @@ fn parse_range(value: Option<&HeaderValue>, total: u64) -> Result<Option<(u64, u
     }
 }
 
+/// Return the one strong entity tag accepted by this endpoint. We deliberately do not support
+/// wildcards, weak tags, or tag lists: a conditional PUT must name the exact current revision.
+fn if_match_tag(headers: &HeaderMap) -> Result<Option<String>, DavError> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.trim().strip_prefix('"'))
+        .and_then(|value| value.strip_suffix('"'))
+        .filter(|value| !value.is_empty() && !value.contains('"') && !value.contains(','));
+    value
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| DavError::new(StatusCode::PRECONDITION_FAILED, "precondition failed"))
+}
+
 async fn put(
     state: &AppState,
     grant: &DeviceGrant,
@@ -862,6 +879,19 @@ async fn put(
     if declared_length.is_some_and(|length| length > limit) {
         return Err(DavError::payload_too_large(limit));
     }
+    let if_match = if_match_tag(headers)?;
+    if let Some(if_match) = if_match.as_deref() {
+        if !state
+            .vaults
+            .dav_etag_matches(&grant.user, &grant.vault, path, if_match)
+            .await?
+        {
+            return Err(DavError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "precondition failed",
+            ));
+        }
+    }
 
     let staged = state
         .vaults
@@ -872,17 +902,35 @@ async fn put(
         return Err(error);
     }
     let client_mtime = client_mtime_millis(headers);
-    let created = state
-        .vaults
-        .dav_write_from_file(
-            &grant.user,
-            &grant.vault,
-            path,
-            &staged,
-            client_mtime,
-            &device_for(grant),
-        )
-        .await?;
+    let created = match if_match.as_deref() {
+        Some(if_match) => {
+            state
+                .vaults
+                .dav_write_from_file_if_match(
+                    &grant.user,
+                    &grant.vault,
+                    path,
+                    &staged,
+                    client_mtime,
+                    if_match,
+                    &device_for(grant),
+                )
+                .await?
+        }
+        None => {
+            state
+                .vaults
+                .dav_write_from_file(
+                    &grant.user,
+                    &grant.vault,
+                    path,
+                    &staged,
+                    client_mtime,
+                    &device_for(grant),
+                )
+                .await?
+        }
+    };
     notify_saber(state, grant, vec![path.to_string()]);
     let status = if created {
         StatusCode::CREATED

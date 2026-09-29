@@ -27,6 +27,123 @@ fn state(root: &std::path::Path) -> AppState {
     )
 }
 
+#[tokio::test]
+async fn webdav_if_match_is_atomic_and_advances_an_unchanged_resource_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app(root.path());
+    register(&app).await;
+    let created = create_password(&app, "Writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    let uri = "/dav/notes/Tablet/todo.md";
+    let original = b"- [ ] concurrency\n".to_vec();
+
+    assert_eq!(
+        dav(&app, "PUT", uri, Some(&auth), &[], original.clone())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let original_etag = dav_etag(&app, &auth, uri).await;
+
+    // A current tag succeeds. Identical bytes stay identical but consume that revision.
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &[("if-match", &original_etag)],
+            original.clone()
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let revised_etag = dav_etag(&app, &auth, uri).await;
+    assert_ne!(revised_etag, original_etag);
+    let after = dav(&app, "GET", uri, Some(&auth), &[], Vec::new()).await;
+    assert_eq!(
+        to_bytes(after.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+        original
+    );
+
+    // The stale tag neither succeeds nor changes the bytes.
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &[("if-match", &original_etag)],
+            b"stale\n".to_vec()
+        )
+        .await
+        .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let after_stale = dav(&app, "GET", uri, Some(&auth), &[], Vec::new()).await;
+    assert_eq!(
+        to_bytes(after_stale.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+        original
+    );
+
+    // Omitting If-Match retains the legacy last-write-wins/no-op behavior.
+    assert_eq!(
+        dav(&app, "PUT", uri, Some(&auth), &[], original.clone())
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let legacy_after = dav(&app, "GET", uri, Some(&auth), &[], Vec::new()).await;
+    assert_eq!(
+        to_bytes(legacy_after.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+        original
+    );
+
+    let race_etag = dav_etag(&app, &auth, uri).await;
+    let race_headers = [("if-match", race_etag.as_str())];
+    let (left, right) = tokio::join!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &race_headers,
+            b"left\n".to_vec()
+        ),
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &race_headers,
+            b"right\n".to_vec()
+        ),
+    );
+    let successes = [left.status(), right.status()]
+        .into_iter()
+        .filter(|status| *status == StatusCode::NO_CONTENT)
+        .count();
+    assert_eq!(successes, 1);
+    assert!(matches!(
+        left.status(),
+        StatusCode::NO_CONTENT | StatusCode::PRECONDITION_FAILED
+    ));
+    assert!(matches!(
+        right.status(),
+        StatusCode::NO_CONTENT | StatusCode::PRECONDITION_FAILED
+    ));
+}
+
 fn app(root: &std::path::Path) -> axum::Router {
     router(state(root), 1024 * 1024, Vec::new())
 }
@@ -112,6 +229,18 @@ async fn text(response: Response<Body>) -> String {
 async fn json(response: Response<Body>) -> Value {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn dav_etag(app: &axum::Router, auth: &str, uri: &str) -> String {
+    let response = dav(app, "GET", uri, Some(auth), &[], Vec::new()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 async fn sync_files(app: &axum::Router, base_head: Option<&str>) -> (Value, Vec<ServerFileChange>) {

@@ -160,6 +160,29 @@ impl VaultService {
         Ok(staged)
     }
 
+    /// Fast preflight for a conditional upload. The write repeats this check under the same
+    /// lock as its revision update; this avoids staging clearly stale request bodies.
+    pub async fn dav_etag_matches(
+        &self,
+        user: &str,
+        vault: &str,
+        path: &str,
+        expected: &str,
+    ) -> Result<bool> {
+        let user = validate_slug(user, "user")?;
+        let vault = validate_slug(vault, "vault")?;
+        let path = validate_dav_path(path)?;
+        self.with_lock(&user, &vault, || async {
+            self.read_registered_state(&user, &vault).await?;
+            let repo = self.repo_dir(&user, &vault);
+            let manifest = read_manifest(&repo).await?;
+            Ok(stat_unlocked(&repo, &manifest, &path)
+                .await?
+                .is_some_and(|entry| !entry.is_dir && entry.etag == expected))
+        })
+        .await
+    }
+
     /// Writes a whole file from memory. Returns `true` when the file did not exist before.
     pub async fn dav_write(
         &self,
@@ -169,8 +192,16 @@ impl VaultService {
         content: Vec<u8>,
         device: &DavDevice,
     ) -> Result<bool> {
-        self.dav_write_source(user, vault, path, WriteSource::Bytes(content), None, device)
-            .await
+        self.dav_write_source(
+            user,
+            vault,
+            path,
+            WriteSource::Bytes(content),
+            None,
+            None,
+            device,
+        )
+        .await
     }
 
     /// Writes a whole file from a staged upload. The staged file is always cleaned up.
@@ -194,6 +225,34 @@ impl VaultService {
                 path,
                 WriteSource::File(staged.to_path_buf()),
                 mtime_millis,
+                None,
+                device,
+            )
+            .await;
+        let _ = fs::remove_file(staged).await;
+        result
+    }
+
+    /// Conditional variant of `dav_write_from_file`. The comparison and write share the vault
+    /// lock, so two callers using the same entity tag cannot both commit.
+    pub async fn dav_write_from_file_if_match(
+        &self,
+        user: &str,
+        vault: &str,
+        path: &str,
+        staged: &Path,
+        mtime_millis: Option<i64>,
+        if_match: &str,
+        device: &DavDevice,
+    ) -> Result<bool> {
+        let result = self
+            .dav_write_source(
+                user,
+                vault,
+                path,
+                WriteSource::File(staged.to_path_buf()),
+                mtime_millis,
+                Some(if_match),
                 device,
             )
             .await;
@@ -208,6 +267,7 @@ impl VaultService {
         path: &str,
         source: WriteSource,
         mtime_millis: Option<i64>,
+        if_match: Option<&str>,
         device: &DavDevice,
     ) -> Result<bool> {
         let user = validate_slug(user, "user")?;
@@ -231,6 +291,22 @@ impl VaultService {
             if existing.as_ref().is_some_and(|entry| entry.is_dir) {
                 bail!("conflict: {path} is a directory");
             }
+            if if_match.is_some_and(|expected| {
+                existing.as_ref().map(|entry| entry.etag.as_str()) != Some(expected)
+            }) {
+                bail!("precondition failed");
+            }
+            let mtime_millis = if if_match.is_some() {
+                Some(
+                    existing
+                        .as_ref()
+                        .map(|entry| entry.mtime_millis.saturating_add(1))
+                        .unwrap_or(0)
+                        .max(unix_now_millis()),
+                )
+            } else {
+                mtime_millis
+            };
             write_unlocked(
                 &repo,
                 &binary_root,
@@ -536,7 +612,7 @@ fn binary_entry(path: &str, entry: &crate::binary_store::BinaryEntry) -> DavEntr
         is_dir: false,
         size: entry.size,
         mtime_millis: entry.mtime,
-        etag: entry.sha256.clone(),
+        etag: format!("{}-{}", entry.sha256, entry.mtime),
     }
 }
 
