@@ -25,6 +25,7 @@ const MAX_LABEL_LENGTH: usize = 80;
 
 #[derive(Debug)]
 pub struct DevicePasswordStore {
+    data_dir: PathBuf,
     store_path: PathBuf,
     lock: Mutex<()>,
 }
@@ -153,8 +154,10 @@ impl DeviceGrant {
 
 impl DevicePasswordStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
         Self {
-            store_path: data_dir.into().join("auth/device-passwords.json"),
+            store_path: data_dir.join("auth/device-passwords.json"),
+            data_dir,
             lock: Mutex::new(()),
         }
     }
@@ -259,6 +262,16 @@ impl DevicePasswordStore {
             .map(DevicePasswordRecord::public_entry)
             .collect())
     }
+    /// Redacted offline operator inventory; never expose this through an ordinary route.
+    pub async fn inventory(&self) -> Result<Vec<DevicePasswordEntry>> {
+        Ok(self
+            .read_store()
+            .await?
+            .passwords
+            .iter()
+            .map(DevicePasswordRecord::public_entry)
+            .collect())
+    }
 
     /// Offline administration rotates only the hash, retaining the complete grant and metadata.
     pub async fn rotate(&self, user: &str, vault: &str, id: &str) -> Result<CreatedDevicePassword> {
@@ -307,6 +320,8 @@ impl DevicePasswordStore {
 
     /// Removes the password. Returns `false` when no password with that id belongs to the user.
     pub async fn revoke(&self, user: &str, vault: &str, id: &str) -> Result<bool> {
+        let operations = crate::grants::operation_lock(&self.data_dir);
+        let _revocation = operations.write().await;
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let _guard = self.lock.lock().await;
@@ -326,21 +341,58 @@ impl DevicePasswordStore {
     /// password identifies the device. Records last use at most every few minutes.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<DeviceGrant> {
         let user = normalize_user_claim(username).map_err(|_| anyhow!("unauthorized"))?;
-        self.authenticate_inner(Some(&user), password).await
+        self.authenticate_inner(Some(&user), password, false).await
     }
 
     /// Verifies a device password presented on its own, as a bearer token. Nextcloud clients
     /// send app passwords this way; the password alone identifies the device because every
     /// password is server-generated with ~100 bits of entropy.
     pub async fn authenticate_bearer(&self, password: &str) -> Result<DeviceGrant> {
-        self.authenticate_inner(None, password).await
+        self.authenticate_inner(None, password, false).await
     }
 
-    async fn authenticate_inner(&self, user: Option<&str>, password: &str) -> Result<DeviceGrant> {
+    pub async fn authenticate_published(
+        &self,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<DeviceGrant> {
+        let user = username.map(normalize_user_claim).transpose()?;
+        self.authenticate_inner(user.as_deref(), password, true)
+            .await
+    }
+
+    pub async fn grant_is_live(&self, grant: &DeviceGrant) -> Result<bool> {
+        Ok(self.read_store().await?.passwords.iter().any(|r| {
+            r.id == grant.id
+                && r.user == grant.user
+                && r.vault == grant.vault
+                && r.folder == grant.folder
+                && r.kind == grant.kind
+                && r.saber == grant.saber
+        }))
+    }
+
+    async fn authenticate_inner(
+        &self,
+        user: Option<&str>,
+        password: &str,
+        published: bool,
+    ) -> Result<DeviceGrant> {
         let password_hash = hash_password(password.trim());
         let _guard = self.lock.lock().await;
         let mut store = self.read_store().await?;
         let now = unix_now();
+        let count = store
+            .passwords
+            .iter()
+            .filter(|r| {
+                user.is_none_or(|u| r.user == u)
+                    && constant_time_eq(&r.password_hash, &password_hash)
+            })
+            .count();
+        if count != 1 {
+            bail!("unauthorized");
+        }
         let record = store
             .passwords
             .iter_mut()
@@ -358,6 +410,14 @@ impl DevicePasswordStore {
             kind: record.kind,
             saber: record.saber.clone(),
         };
+        if published {
+            crate::publication::Publication::load(&self.data_dir)?.legacy_device(
+                &grant.user,
+                &grant.vault,
+                &grant.id,
+                "dav",
+            )?;
+        }
         let should_record = record
             .last_used_at
             .map(|last| now.saturating_sub(last) >= LAST_USED_WRITE_INTERVAL_SECONDS)

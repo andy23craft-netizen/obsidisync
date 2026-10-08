@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    crate::paths::reject_storage_links(path)?;
     match fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|_| {
             anyhow::anyhow!(
@@ -21,12 +22,13 @@ pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_with_checkpoints(path, value, |_| Ok(()))
 }
 
-fn write_with_checkpoints<T: Serialize>(
+pub(crate) fn write_with_checkpoints<T: Serialize>(
     path: &Path,
     value: &T,
     checkpoint: impl Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let parent = path.parent().context("store requires a parent directory")?;
+    crate::paths::reject_storage_links(path)?;
     fs::create_dir_all(parent)?;
     #[cfg(unix)]
     {

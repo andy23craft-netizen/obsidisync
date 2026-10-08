@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub enum Principal {
     Local { account_id: String },
     Oidc { issuer: String, subject: String },
+    Development { user: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +142,13 @@ impl AccountStore {
     }
     pub fn validate_principal(&self, principal: &Principal) -> Result<()> {
         match principal {
+            Principal::Development { user } => {
+                crate::paths::validate_slug(user, "development user")?;
+                if normalize_user_claim(user)? != *user {
+                    bail!("development identity must use its canonical configured namespace");
+                }
+                Ok(())
+            }
             Principal::Local { account_id }
                 if self.accounts.iter().any(|a| &a.id == account_id) =>
             {

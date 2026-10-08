@@ -13,10 +13,12 @@ use obsidian_git_sync_server::protocol::{
 use obsidian_git_sync_server::vault::VaultService;
 use serde_json::Value;
 use tower::ServiceExt;
+mod common;
 
 const BEARER: &str = "Bearer secret";
 
 fn state(root: &std::path::Path) -> AppState {
+    common::initialize(&root.join("data"));
     AppState::new(
         VaultService::new(root.join("data")),
         AuthVerifier::StaticTokenForDev {
@@ -31,7 +33,7 @@ fn state(root: &std::path::Path) -> AppState {
 async fn webdav_if_match_is_atomic_and_advances_an_unchanged_resource_revision() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Writer", "Tablet").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
     let uri = "/dav/notes/Tablet/todo.md";
@@ -148,7 +150,16 @@ fn app(root: &std::path::Path) -> axum::Router {
     router(state(root), 1024 * 1024, Vec::new())
 }
 
-async fn register(app: &axum::Router) {
+async fn register(app: &axum::Router, root: &std::path::Path) {
+    common::publish_legacy(
+        &root.join("data"),
+        "alice",
+        "notes",
+        obsidian_git_sync_server::accounts::Principal::Development {
+            user: "alice".into(),
+        },
+    )
+    .await;
     let response = app
         .clone()
         .oneshot(
@@ -306,14 +317,11 @@ async fn device_password_management_requires_bearer_auth_and_registered_vault() 
         )
         .await
         .unwrap();
-    assert_eq!(before_registration.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(before_registration.status(), StatusCode::NOT_FOUND);
     let error = json(before_registration).await;
-    assert!(error["error"]
-        .as_str()
-        .unwrap()
-        .contains("sync this vault from Obsidian once"));
+    assert!(error["error"].as_str().unwrap().contains("not found"));
 
-    register(&app).await;
+    register(&app, root.path()).await;
 
     let created = create_password(&app, "Boox tablet", "/Tablet/Notes/").await;
     assert_eq!(created["username"], "alice");
@@ -408,7 +416,7 @@ async fn device_password_management_requires_bearer_auth_and_registered_vault() 
 async fn webdav_authenticates_with_device_passwords_and_scopes_to_folder() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet/Notes").await;
     let password = created["password"].as_str().unwrap();
     let auth = basic("alice", password);
@@ -480,7 +488,7 @@ async fn webdav_authenticates_with_device_passwords_and_scopes_to_folder() {
         "/dav/notes/root.md",
     ] {
         let put = dav(&app, "PUT", uri, Some(&auth), &[], b"x".to_vec()).await;
-        assert_eq!(put.status(), StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(put.status(), StatusCode::NOT_FOUND, "{uri}");
     }
     let get_root = dav(&app, "GET", "/dav/notes/", Some(&auth), &[], Vec::new()).await;
     assert_eq!(get_root.status(), StatusCode::FORBIDDEN);
@@ -549,7 +557,7 @@ async fn webdav_authenticates_with_device_passwords_and_scopes_to_folder() {
 async fn webdav_uploads_reach_obsidian_clients_through_sync() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox tablet", "Tablet/Notes").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
 
@@ -746,7 +754,7 @@ async fn webdav_uploads_reach_obsidian_clients_through_sync() {
 async fn webdav_supports_collections_moves_deletes_and_locks() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
 
@@ -884,7 +892,7 @@ async fn webdav_supports_collections_moves_deletes_and_locks() {
         Vec::new(),
     )
     .await;
-    assert_eq!(move_outside.status(), StatusCode::FORBIDDEN);
+    assert_eq!(move_outside.status(), StatusCode::NOT_FOUND);
 
     let copied = dav(
         &app,
@@ -968,7 +976,7 @@ async fn webdav_supports_collections_moves_deletes_and_locks() {
 async fn webdav_throttles_repeated_failed_logins_per_client() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet").await;
     let good = basic("alice", created["password"].as_str().unwrap());
     let bad = basic("alice", "nope-nope-nope-nope-nope");
@@ -1024,7 +1032,7 @@ async fn webdav_throttles_repeated_failed_logins_per_client() {
 async fn webdav_rejects_uploads_over_the_configured_limit() {
     let root = tempfile::tempdir().unwrap();
     let app = router_with_webdav_limit(state(root.path()), 1024 * 1024, 64, Vec::new());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
 
@@ -1061,10 +1069,17 @@ async fn webdav_rejects_uploads_over_the_configured_limit() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     // Nothing is left behind in the staging area after a rejected upload.
-    let mut uploads =
-        tokio::fs::read_dir(root.path().join("data/users/alice/vaults/notes/uploads"))
-            .await
+    let publication =
+        obsidian_git_sync_server::publication::Publication::load(&root.path().join("data"))
             .unwrap();
+    let mut uploads = tokio::fs::read_dir(
+        root.path()
+            .join("data/shares")
+            .join(&publication.mappings[0].share_id)
+            .join("uploads"),
+    )
+    .await
+    .unwrap();
     assert!(uploads.next_entry().await.unwrap().is_none());
 }
 
@@ -1072,7 +1087,7 @@ async fn webdav_rejects_uploads_over_the_configured_limit() {
 async fn webdav_serves_byte_ranges() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
     let content: Vec<u8> = (0..100).collect();
@@ -1160,7 +1175,7 @@ async fn webdav_serves_byte_ranges() {
 async fn sync_reference_mode_returns_metadata_and_blob_endpoint_serves_bytes() {
     let root = tempfile::tempdir().unwrap();
     let app = app(root.path());
-    register(&app).await;
+    register(&app, root.path()).await;
     let created = create_password(&app, "Boox", "Tablet").await;
     let auth = basic("alice", created["password"].as_str().unwrap());
     let pdf: Vec<u8> = (0..=255).cycle().take(70_000).collect();

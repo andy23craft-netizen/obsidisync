@@ -53,7 +53,15 @@ or `read-write`. Local and OIDC identities have a stable principal ID.
 FEAT-02 owns an explicit offline `admin auth import-legacy` command, independent of FEAT-03 storage migration.
 Startup must never automatically import, replace, or discard an account. With a legacy account but no completed
 import, password-mode startup fails with an actionable offline-import diagnostic; it must not treat this as an
-empty installation. OIDC and development startup remain unchanged, apart from acquiring the data-directory lock.
+empty installation. FEAT-02 retained OIDC/development startup and added the data-directory lock; the explicitly
+approved FEAT-03 identity and packaged-default amendments below govern upgrade behavior.
+
+FEAT-03's approved development compatibility amendment adds the distinct typed
+`development(canonical_configured_user)` membership principal. Explicit development mode (or the existing unpackaged
+DEV_TOKEN opt-in) establishes it; local/OIDC modes reject development tokens. Membership and legacy mappings are
+explicit, capabilities/revocation apply normally, and no identity linking or implicit access is introduced. The
+packaged production image defaults explicitly to OIDC rather than allowing DEV_TOKEN presence to select development.
+Token rotation preserves the principal and rejects the old token; changing DEV_USER selects a different principal.
 
 1. Stop the old server and disable automatic restart. Take and verify a protected filesystem-consistent backup
    of the complete data directory. Inspect a redacted import dry run before applying it.
@@ -70,6 +78,8 @@ empty installation. OIDC and development startup remain unchanged, apart from ac
    IDs as refresh subjects and existing account IDs as access subjects; a legacy username subject is invalid.
    Use explicit identity typing/versioning for newly issued local sessions, and reject old local session records
    without that type. Do not translate tokens or rewrite/delete unrelated OIDC sessions in `sessions.json`.
+   FEAT-03's approved OIDC exception rejects issuer-less OIDC sessions/refresh without deleting them or inferring
+   an issuer; fresh OIDC login issues a verified issuer/subject-bound session.
    Legacy token hashes and the old password store remain recoverable from the backup/source.
 5. Restart the upgraded server and log in again using the existing username/password. Old password access tokens
    and refresh tokens return `401`; stale password browser cookies follow the existing sign-in redirect. The
@@ -88,11 +98,15 @@ no vault directory, Git history, binary object, upload, device record, or client
   Preserve an imported namespace exactly. `AuthContext.user` and session `user` remain the v1 namespace, never
   the opaque principal ID. A separate mutable display label must not change authorization or storage routing.
 - Local `AuthContext.subject` is the opaque account ID. Membership keys are typed identities:
-  `local(account_id)` or `oidc(verified_issuer, verified_sub)`. OIDC `AuthContext.subject` remains verified `sub`;
+  `local(account_id)`, `oidc(verified_issuer, verified_sub)`, or the approved FEAT-03 development-only
+  `development(canonical_configured_user)`. OIDC `AuthContext.subject` remains verified `sub`;
   derive its typed key from verifier provenance, not a caller-supplied kind or normalized username. Do not
   normalize `sub`. Distinct kinds/issuers cannot collide even when their string identifiers match.
 - Persist OIDC membership identities through host-local grant commands with explicit issuer/subject. Preserve
-  OIDC token validation, discovery, exchange, PKCE, device login, refresh, and existing session compatibility.
+  OIDC token validation, discovery, exchange, PKCE, device login, and rotating refresh. The approved FEAT-03
+  identity correction requires re-login for legacy issuer-less OIDC sessions. New records preserve verified
+  issuer/subject; membership never reconstructs issuer from current configuration. Provider changes cannot
+  reinterpret another issuer's session, even with identical subjects. Bound sessions survive restart.
   Do not require local account creation or a new identity provider for OIDC. Runtime auth modes remain exclusive;
   this ticket does not introduce simultaneous local/OIDC login or identity linking.
 - Disabled accounts cannot log in or refresh. Existing typed access tokens may remain usable until their original
@@ -209,7 +223,7 @@ material. No database, groups, invitation flow, reset email, or public admin API
 Affected components:
 
 - `rust-server/src/password_auth.rs`, `auth.rs`, `app_session.rs`: multi-account lookup, stable/typed identity,
-  explicit legacy import and session rejection, disabled refresh, preserved OIDC sessions.
+  explicit legacy import and session rejection, disabled refresh, issuer-bound OIDC sessions.
 - `http.rs`, `auth_throttle.rs`, `main.rs`: discovery/login-only browser behavior, retired setup, mode selection,
   admin dispatch and lifetime lock before runtime initialization. Preserve generic auth error/status handling.
 - New account/share/access, admin/import, and data-directory lock modules: persistence and local command lifecycle.
@@ -232,7 +246,8 @@ Affected components:
 - Legacy import preserves the exact password hash/namespace, retains recovery material, is repeatable without
   duplicate accounts, and rejects corrupt/colliding state without replacement. No vault/client sync state changes.
 - Pre-import password sessions require re-login with `401`/browser redirect behavior; fresh sessions refresh once
-  and survive restart. OIDC sessions remain compatible. Disable blocks login/refresh with bounded access expiry.
+  and survive restart. Issuer-bound OIDC sessions remain compatible; legacy issuer-less sessions require re-login
+  under the approved FEAT-03 exception. Disable blocks login/refresh with bounded access expiry.
 - Empty/all-disabled stores provide operator guidance, no setup UI, and no public account creation. Old plugins
   choose login; updated plugins retain compatibility with old servers. Password and OIDC browser flows work.
 - Two accounts keep stable distinct subjects/namespaces and cannot use v1 content, metadata, or credentials in

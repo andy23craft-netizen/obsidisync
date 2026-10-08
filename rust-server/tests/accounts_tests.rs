@@ -70,7 +70,7 @@ fn provision(root: &Path) -> (String, String) {
 fn password_router(root: &Path) -> axum::Router {
     router(
         AppState::new(
-            VaultService::new(root.to_path_buf()),
+            VaultService::legacy_for_fixture(root.to_path_buf()),
             AuthVerifier::password(String::new(), root).unwrap(),
             PublicAuthConfig::Password,
         ),
@@ -607,6 +607,7 @@ fn typed_memberships_cannot_collide_and_read_cannot_issue_writes() {
     let ctx = AuthContext {
         user: "mutable-name".into(),
         subject: oidc_subject(&oidc),
+        oidc_issuer: Some("https://issuer.example.test".into()),
     };
     assert_eq!(verifier.membership_principal(&ctx).unwrap(), oidc);
 }
@@ -618,7 +619,7 @@ fn oidc_subject(p: &Principal) -> String {
 }
 
 #[tokio::test]
-async fn oidc_verified_login_discovery_exchange_and_legacy_refresh_remain_compatible() {
+async fn oidc_verified_login_discovery_exchange_rejects_issuerless_sessions() {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     let root = fixture();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -653,15 +654,8 @@ async fn oidc_verified_login_discovery_exchange_and_legacy_refresh_remain_compat
     assert!(verifier
         .verify_bearer_token(&old.access_token)
         .await
-        .is_ok());
-    assert_eq!(
-        verifier
-            .refresh_session(&old.refresh_token)
-            .await
-            .unwrap()
-            .subject,
-        "verified-sub"
-    );
+        .is_err());
+    assert!(verifier.refresh_session(&old.refresh_token).await.is_err());
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("fixture".into());
     let claims = json!({"iss":issuer,"aud":"fixture-audience","sub":"verified-sub","preferred_username":"Alice@example.test",
@@ -670,7 +664,7 @@ async fn oidc_verified_login_discovery_exchange_and_legacy_refresh_remain_compat
     let token = encode(&header, &claims, &key).unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(root.path().to_path_buf()),
+            VaultService::legacy_for_fixture(root.path().to_path_buf()),
             verifier.clone(),
             PublicAuthConfig::Oidc {
                 issuer: issuer.clone(),
@@ -698,13 +692,88 @@ async fn oidc_verified_login_discovery_exchange_and_legacy_refresh_remain_compat
         .verify_bearer_token(body["accessToken"].as_str().unwrap())
         .await
         .unwrap();
+    let restarted = AuthVerifier::oidc(
+        issuer.clone(),
+        "fixture-audience".into(),
+        None,
+        "preferred_username".into(),
+        root.path(),
+        None,
+    )
+    .unwrap();
+    assert!(restarted
+        .verify_bearer_token(body["accessToken"].as_str().unwrap())
+        .await
+        .is_ok());
+    let changed = AuthVerifier::oidc(
+        "https://other.example.test".into(),
+        "fixture-audience".into(),
+        None,
+        "preferred_username".into(),
+        root.path(),
+        None,
+    )
+    .unwrap();
+    assert!(changed
+        .verify_bearer_token(body["accessToken"].as_str().unwrap())
+        .await
+        .is_err());
+    assert!(changed
+        .refresh_session(body["refreshToken"].as_str().unwrap())
+        .await
+        .is_err());
+    let refreshed = restarted
+        .refresh_session(body["refreshToken"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert!(restarted
+        .refresh_session(body["refreshToken"].as_str().unwrap())
+        .await
+        .is_err());
+    assert!(restarted
+        .verify_bearer_token(&refreshed.access_token)
+        .await
+        .is_ok());
+    assert!(changed
+        .verify_bearer_token(&refreshed.access_token)
+        .await
+        .is_err());
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(root.path().join("auth/sessions.json")).unwrap()).unwrap();
+    assert!(persisted["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["identity_version"] == "oidc-v1"
+            && r["oidc_issuer"] == issuer
+            && r["subject"] == "verified-sub"));
     assert_eq!(
         verifier.membership_principal(&auth).unwrap(),
         Principal::Oidc {
-            issuer,
+            issuer: issuer.clone(),
             subject: "verified-sub".into()
         }
     );
+    let other_session = AppSessionStore::new(root.path())
+        .issue_oidc(
+            "alice".into(),
+            "verified-sub".into(),
+            "https://other.example.test".into(),
+        )
+        .await
+        .unwrap();
+    let other_auth = changed
+        .verify_bearer_token(&other_session.access_token)
+        .await
+        .unwrap();
+    assert_ne!(
+        changed.membership_principal(&other_auth).unwrap(),
+        verifier.membership_principal(&auth).unwrap()
+    );
+    assert!(verifier
+        .verify_bearer_token(&other_session.access_token)
+        .await
+        .is_err());
     let mut wrong = claims.clone();
     wrong["aud"] = json!("wrong");
     let wrong_token = encode(&header, &wrong, &key).unwrap();
@@ -891,6 +960,7 @@ fn pending_admin_excludes_another_admin_and_server_without_writing() {
 #[test]
 fn running_server_excludes_admin_and_other_server_and_crash_releases_lock() {
     let root = fixture();
+    cli(root.path(), &["publication", "initialize"], None);
     let start = || {
         let mut c = Command::new(env!("CARGO_BIN_EXE_obsidian-git-sync-server"));
         c.env_clear()

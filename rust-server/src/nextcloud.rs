@@ -291,7 +291,8 @@ async fn login_flow_page(
                 .into_response();
         }
     }
-    let session_user = session_user(&state, &headers).await;
+    let session = session_auth(&state, &headers).await;
+    let session_user = session.as_ref().map(|auth| auth.user.clone());
     if session_user.is_none() {
         let next = format!("/index.php/login/v2/flow/{token}");
         match &state.public_auth {
@@ -305,10 +306,13 @@ async fn login_flow_page(
         }
     }
     let (vaults, default_vault) = match &session_user {
-        Some(user) => (
-            state.vaults.list_vaults(user).await.unwrap_or_default(),
-            state.vaults.default_vault(user).await.ok().flatten(),
-        ),
+        Some(_) => {
+            let vaults = authorized_legacy_vaults(&state, session.as_ref().unwrap())
+                .await
+                .unwrap_or_default();
+            let default = vaults.first().cloned();
+            (vaults, default)
+        }
         None => (Vec::new(), None),
     };
     if session_user.is_some() && vaults.is_empty() {
@@ -361,36 +365,34 @@ async fn login_flow_submit(
         )
             .into_response();
     }
-    let user = match session_user(&state, &headers).await {
-        Some(user) => Some(user),
+    let auth = match session_auth(&state, &headers).await {
+        Some(auth) => Some(auth),
         None if !form.access_token.trim().is_empty() => state
             .auth
             .verify_bearer_token(form.access_token.trim())
             .await
-            .ok()
-            .map(|auth| auth.user),
+            .ok(),
         None => None,
     };
-    let Some(user) = user else {
+    let Some(auth) = auth else {
         tracing::warn!(flow = %&token[..token.len().min(8)], "saber connect form submitted without a session");
         return flow_error(
             &token,
             "Not signed in. Log in first, or paste a valid access token.",
         );
     };
+    let user = auth.user.clone();
+    let vaults = match authorized_legacy_vaults(&state, &auth).await {
+        Ok(vaults) => vaults,
+        Err(_) => return flow_error(&token, "No authorized legacy vault."),
+    };
 
     // The user's default vault unless the form explicitly named another registered one.
     let vault = match form.vault.trim() {
-        "" => state
-            .vaults
-            .default_vault(&user)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
+        "" => vaults.first().cloned().unwrap_or_default(),
         named => named.to_string(),
     };
-    if vault.is_empty() || !state.vaults.is_registered(&user, &vault).await {
+    if !vaults.contains(&vault) || !state.vaults.is_registered(&user, &vault).await {
         return flow_error(
             &token,
             "Unknown vault. Sync the vault from Obsidian once before connecting Saber.",
@@ -449,14 +451,38 @@ fn flow_error(token: &str, message: &str) -> Response {
     .into_response()
 }
 
-async fn session_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
+async fn session_auth(state: &AppState, headers: &HeaderMap) -> Option<crate::auth::AuthContext> {
     let token = site_session_token(headers)?;
-    state
-        .auth
-        .verify_bearer_token(&token)
-        .await
-        .ok()
-        .map(|auth| auth.user)
+    state.auth.verify_bearer_token(&token).await.ok()
+}
+
+async fn authorized_legacy_vaults(
+    state: &AppState,
+    auth: &crate::auth::AuthContext,
+) -> Result<Vec<String>> {
+    if !state.vaults.uses_published_storage() {
+        return state.vaults.list_vaults(&auth.user).await;
+    }
+    let principal = state.auth.membership_principal(auth)?;
+    let publication = state.vaults.publication()?;
+    Ok(publication
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.user == auth.user
+                && mapping.dav_enabled
+                && publication
+                    .authorize_legacy(
+                        &state.vaults.data_dir,
+                        &mapping.user,
+                        &mapping.vault,
+                        &principal,
+                        crate::accounts::Capability::ReadWrite,
+                    )
+                    .is_ok()
+        })
+        .map(|mapping| mapping.vault.clone())
+        .collect())
 }
 
 async fn ocs_user(

@@ -12,7 +12,7 @@ use crate::remote::RemotePolicy;
 use crate::time_format::unix_now;
 use crate::version_registry::{
     read_devices, read_version_metadata, version_metadata_key, write_devices,
-    write_version_metadata, DEVICES_FILE_NAME, VERSION_METADATA_FILE_NAME,
+    write_version_metadata,
 };
 use anyhow::{anyhow, bail, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -39,6 +39,9 @@ pub const DEFAULT_INCOMPLETE_UPLOAD_TTL_SECONDS: u64 = 24 * 60 * 60;
 #[derive(Debug, Clone)]
 pub struct VaultService {
     pub data_dir: PathBuf,
+    /// Legacy storage is only used to build disposable pre-migration fixtures.
+    published_storage: bool,
+    resolved_share: Option<String>,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     remote_policy: RemotePolicy,
     upload_limits: UploadLimits,
@@ -90,6 +93,26 @@ struct UploadState {
     #[serde(default)]
     updated_at: u64,
 }
+pub(crate) fn validate_migration_upload(path: &Path) -> Result<()> {
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("invalid upload identifier"))?;
+    validate_upload_id(id)?;
+    let state: UploadState = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_vault_path(&state.path)?;
+    validate_sha256_hex(&state.sha256)?;
+    if state.received > state.size || (state.complete && state.received != state.size) {
+        bail!("invalid upload progress");
+    }
+    let bytes = std::fs::read(path.with_extension("bin"))?;
+    if bytes.len() as u64 != state.received
+        || (state.complete && sha256_hex(&bytes) != state.sha256)
+    {
+        bail!("upload payload mismatch");
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct TouchedPaths {
@@ -123,7 +146,7 @@ impl VaultService {
     }
 
     pub fn new_for_tests(data_dir: PathBuf) -> Self {
-        Self::new_with_options(VaultServiceOptions {
+        Self::legacy_with_options_for_tests(VaultServiceOptions {
             data_dir,
             remote_policy: RemotePolicy {
                 allow_local_remotes: true,
@@ -136,10 +159,120 @@ impl VaultService {
     pub fn new_with_options(options: VaultServiceOptions) -> Self {
         Self {
             data_dir: options.data_dir,
+            published_storage: true,
+            resolved_share: None,
             locks: Arc::new(Mutex::new(HashMap::new())),
             remote_policy: options.remote_policy,
             upload_limits: options.upload_limits,
         }
+    }
+
+    pub fn published(options: VaultServiceOptions) -> Self {
+        Self::new_with_options(options)
+    }
+
+    /// Only for constructing disposable pre-migration fixtures. Never selected by the server.
+    #[doc(hidden)]
+    pub fn legacy_with_options_for_tests(options: VaultServiceOptions) -> Self {
+        let mut service = Self::new_with_options(options);
+        service.published_storage = false;
+        service
+    }
+    #[doc(hidden)]
+    pub fn legacy_for_fixture(data_dir: PathBuf) -> Self {
+        Self::legacy_with_options_for_tests(VaultServiceOptions {
+            data_dir,
+            remote_policy: RemotePolicy::default(),
+            upload_limits: UploadLimits::default(),
+        })
+    }
+
+    pub fn publication(&self) -> Result<crate::publication::Publication> {
+        crate::publication::Publication::load(&self.data_dir)
+    }
+
+    pub fn uses_published_storage(&self) -> bool {
+        self.published_storage
+    }
+
+    pub fn for_share(&self, id: &str) -> Result<Self> {
+        if !self.publication()?.available(id) {
+            bail!("not found: share");
+        }
+        let mut service = self.clone();
+        service.published_storage = true;
+        service.resolved_share = Some(id.into());
+        Ok(service)
+    }
+
+    pub fn storage_root(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        self.vault_dir(user, vault)
+    }
+
+    /// Offline setup only: prepare an absent share root without making it servable.
+    /// The caller must hold DataDirectoryLock and publish after successful validation.
+    pub async fn prepare_share(&self, id: &str, request: RegisterRequest) -> Result<()> {
+        crate::accounts::validate_id(id, "s_")?;
+        if self.data_dir.join("shares").join(id).exists() {
+            bail!("share setup target already exists");
+        }
+        let mut service = self.clone();
+        service.published_storage = false;
+        service.resolved_share = Some(id.into());
+        service.register("share", id, request).await?;
+        Ok(())
+    }
+
+    pub async fn sync_state(&self, user: &str, vault: &str) -> Result<RegisterResponse> {
+        self.with_read_lock(user, vault, || async {
+            let state = self.read_state(user, vault).await?;
+            Ok(RegisterResponse {
+                user: user.into(),
+                vault: vault.into(),
+                branch: state.branch,
+                server_head: self.head_from_repo(&self.repo_dir(user, vault)?).await?,
+            })
+        })
+        .await
+    }
+
+    pub async fn read_sync(
+        &self,
+        user: &str,
+        vault: &str,
+        request: SyncRequest,
+        sources: bool,
+    ) -> Result<SyncResponse> {
+        if !request.changes.is_empty() {
+            bail!("forbidden: read synchronization cannot write");
+        }
+        self.with_read_lock(user, vault, || async {
+            let repo = self.repo_dir(user, vault)?;
+            let pending = self
+                .vault_dir(user, vault)?
+                .join("inkvault-publication.json");
+            if pending.exists() {
+                bail!("share recovery required before read synchronization");
+            }
+            let head = self.head_from_repo(&repo).await?;
+            let files = self
+                .changed_files_since(
+                    &repo,
+                    &self.binary_dir(user, vault)?,
+                    validate_optional_commit_id(request.base_head.as_deref())?.as_deref(),
+                    &request.client_manifest,
+                    request.file_content.is_inline(),
+                    sources,
+                )
+                .await?;
+            Ok(SyncResponse {
+                status: SyncStatus::Ok,
+                server_head: head,
+                files,
+                conflicts: vec![],
+            })
+        })
+        .await
     }
 
     pub async fn register(
@@ -168,7 +301,7 @@ impl VaultService {
                 user: user.clone(),
                 vault: vault.clone(),
                 server_head: self
-                    .head_from_repo(&self.repo_dir(&state.user, &state.vault))
+                    .head_from_repo(&self.repo_dir(&state.user, &state.vault)?)
                     .await?,
                 branch,
             })
@@ -194,7 +327,7 @@ impl VaultService {
                 bail!("upload exceeds the configured maximum size");
             }
 
-            let upload_dir = self.upload_dir(&user, &vault);
+            let upload_dir = self.upload_dir(&user, &vault)?;
             fs::create_dir_all(&upload_dir).await?;
             self.cleanup_stale_incomplete_uploads(&user, &vault).await?;
             let retained = self.incomplete_upload_bytes(&user, &vault).await?;
@@ -210,7 +343,7 @@ impl VaultService {
                 complete: false,
                 updated_at: unix_now(),
             };
-            fs::write(self.upload_content_path(&user, &vault, &upload_id), []).await?;
+            fs::write(self.upload_content_path(&user, &vault, &upload_id)?, []).await?;
             self.write_upload_state(&user, &vault, &upload_id, &state)
                 .await?;
             Ok(UploadInitResponse {
@@ -254,7 +387,7 @@ impl VaultService {
 
             let mut file = fs::OpenOptions::new()
                 .append(true)
-                .open(self.upload_content_path(&user, &vault, &upload_id))
+                .open(self.upload_content_path(&user, &vault, &upload_id)?)
                 .await?;
             file.write_all(&content).await?;
             state.received = received;
@@ -283,7 +416,7 @@ impl VaultService {
             if state.received != state.size {
                 bail!("upload is incomplete");
             }
-            let actual = sha256_file(&self.upload_content_path(&user, &vault, &upload_id)).await?;
+            let actual = sha256_file(&self.upload_content_path(&user, &vault, &upload_id)?).await?;
             if actual != state.sha256 {
                 bail!("upload checksum mismatch");
             }
@@ -321,10 +454,10 @@ impl VaultService {
             let state = self.read_state(&user, &vault).await?;
             self.validate_remote_url(&state.remote_url)?;
             let base_head = validate_optional_commit_id(request.base_head.as_deref())?;
-            let repo = self.repo_dir(&user, &vault);
-            let binary_root = self.binary_dir(&user, &vault);
-            let upload_root = self.upload_dir(&user, &vault);
-            let device_paths = read_devices(&self.devices_path(&user, &vault))
+            let repo = self.repo_dir(&user, &vault)?;
+            let binary_root = self.binary_dir(&user, &vault)?;
+            let upload_root = self.upload_dir(&user, &vault)?;
+            let device_paths = read_devices(&self.devices_path(&user, &vault)?)
                 .await?
                 .devices
                 .remove(&request.client_id)
@@ -502,7 +635,7 @@ impl VaultService {
         head: &str,
         touched: &TouchedPaths,
     ) -> Result<()> {
-        let path = self.devices_path(user, vault);
+        let path = self.devices_path(user, vault)?;
         let mut registry = read_devices(&path).await?;
         let mut entry = registry.devices.remove(client_id).unwrap_or(DeviceEntry {
             client_id: client_id.to_string(),
@@ -533,7 +666,7 @@ impl VaultService {
     ) -> Result<Vec<HistoryEntry>> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
-        let repo = self.repo_dir(&user, &vault);
+        let repo = self.repo_dir(&user, &vault)?;
         let mut entries = if let Some(path) = file_path {
             let safe_path = validate_vault_path(path)?;
             if !is_text_or_code_path(&safe_path) {
@@ -574,7 +707,7 @@ impl VaultService {
         file_path: Option<&str>,
         entries: &mut [HistoryEntry],
     ) -> Result<()> {
-        let metadata = read_version_metadata(&self.version_metadata_path(user, vault))
+        let metadata = read_version_metadata(&self.version_metadata_path(user, vault)?)
             .await
             .unwrap_or_default();
         let total = entries.len() as u32;
@@ -595,7 +728,7 @@ impl VaultService {
     pub async fn list_devices(&self, user: &str, vault: &str) -> Result<Vec<DeviceEntry>> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
-        let registry = read_devices(&self.devices_path(&user, &vault)).await?;
+        let registry = read_devices(&self.devices_path(&user, &vault)?).await?;
         Ok(registry
             .devices
             .into_values()
@@ -615,8 +748,8 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let safe_path = validate_vault_path(file_path)?;
-        let repo = self.repo_dir(&user, &vault);
-        let registry = read_devices(&self.devices_path(&user, &vault)).await?;
+        let repo = self.repo_dir(&user, &vault)?;
+        let registry = read_devices(&self.devices_path(&user, &vault)?).await?;
         let history = self.history(&user, &vault, Some(&safe_path)).await?;
 
         let mut out = Vec::new();
@@ -669,7 +802,7 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         self.with_lock(&user, &vault, || async {
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let safe_path = validate_vault_path(&request.path)?;
             let hash = validate_commit_id(&request.hash)?;
             if !self.valid_commit(&repo, &hash).await? {
@@ -686,7 +819,7 @@ impl VaultService {
                 None => None,
             };
 
-            let metadata_path = self.version_metadata_path(&user, &vault);
+            let metadata_path = self.version_metadata_path(&user, &vault)?;
             let mut store = read_version_metadata(&metadata_path).await?;
             let key = version_metadata_key(&safe_path, &hash);
             let entry = store.entries.entry(key).or_default();
@@ -707,6 +840,19 @@ impl VaultService {
     /// Names of the vaults a user has registered on this server, sorted.
     pub async fn list_vaults(&self, user: &str) -> Result<Vec<String>> {
         let user = validate_slug(user, "user")?;
+        if self.published_storage {
+            let publication = self.publication()?;
+            let mut names: Vec<String> = publication
+                .mappings
+                .iter()
+                .filter(|m| {
+                    m.user == user && publication.available(&m.share_id) && m.native_enabled
+                })
+                .map(|m| m.vault.clone())
+                .collect();
+            names.sort();
+            return Ok(names);
+        }
         let vaults_dir = self.data_dir.join("users").join(&user).join("vaults");
         let mut names = Vec::new();
         let mut vaults = match fs::read_dir(vaults_dir).await {
@@ -740,6 +886,14 @@ impl VaultService {
     pub async fn activity_feed(&self, user: &str, limit: usize) -> Result<Vec<ActivityFeedEntry>> {
         let user = validate_slug(user, "user")?;
         let mut entries = Vec::new();
+        if self.published_storage {
+            for vault in self.list_vaults(&user).await? {
+                entries.extend(self.vault_activity(&user, &vault, limit).await?);
+            }
+            entries.sort_by(|l, r| r.date.cmp(&l.date).then_with(|| r.hash.cmp(&l.hash)));
+            entries.truncate(limit);
+            return Ok(entries);
+        }
         let vaults_dir = self.data_dir.join("users").join(&user).join("vaults");
         let mut vaults = match fs::read_dir(vaults_dir).await {
             Ok(vaults) => vaults,
@@ -773,13 +927,13 @@ impl VaultService {
         Ok(entries)
     }
 
-    async fn vault_activity(
+    pub(crate) async fn vault_activity(
         &self,
         user: &str,
         vault: &str,
         limit: usize,
     ) -> Result<Vec<ActivityFeedEntry>> {
-        let repo = self.repo_dir(user, vault);
+        let repo = self.repo_dir(user, vault)?;
         if fs::metadata(repo.join(".git")).await.is_err() {
             return Ok(Vec::new());
         }
@@ -928,7 +1082,7 @@ impl VaultService {
         let vault = validate_slug(vault, "vault")?;
         let safe_path = validate_vault_path(file_path)?;
         let hash = validate_commit_id(hash)?;
-        let repo = self.repo_dir(&user, &vault);
+        let repo = self.repo_dir(&user, &vault)?;
         let repo_str = path_to_str(&repo)?;
         let content = if is_text_or_code_path(&safe_path) {
             let spec = format!("{hash}:{safe_path}");
@@ -946,7 +1100,7 @@ impl VaultService {
                 .files
                 .get(&safe_path)
                 .ok_or_else(|| anyhow!("binary file not present at requested version"))?;
-            read_binary_object(&self.binary_dir(&user, &vault), entry).await?
+            read_binary_object(&self.binary_dir(&user, &vault)?, entry).await?
         };
         Ok((safe_path, content))
     }
@@ -971,9 +1125,9 @@ impl VaultService {
         self.with_lock(&user, &vault, || async {
             let state = self.read_state(&user, &vault).await?;
             self.validate_remote_url(&state.remote_url)?;
-            let repo = self.repo_dir(&user, &vault);
-            let binary_root = self.binary_dir(&user, &vault);
-            let upload_root = self.upload_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
+            let binary_root = self.binary_dir(&user, &vault)?;
+            let upload_root = self.upload_dir(&user, &vault)?;
             let inline = request.file_content.is_inline();
             self.guard_inkvault_paths(
                 &repo,
@@ -1091,10 +1245,10 @@ impl VaultService {
     async fn ensure_repo(&self, state: &VaultState) -> Result<()> {
         self.validate_remote_url(&state.remote_url)?;
         validate_git_branch(&state.branch)?;
-        let vault_dir = self.vault_dir(&state.user, &state.vault);
-        let repo = self.repo_dir(&state.user, &state.vault);
+        let vault_dir = self.vault_dir(&state.user, &state.vault)?;
+        let repo = self.repo_dir(&state.user, &state.vault)?;
         fs::create_dir_all(&vault_dir).await?;
-        fs::create_dir_all(self.binary_dir(&state.user, &state.vault)).await?;
+        fs::create_dir_all(self.binary_dir(&state.user, &state.vault)?).await?;
         if fs::metadata(repo.join(".git")).await.is_err() {
             if state.uses_remote() {
                 let _ = fs::remove_dir_all(&repo).await;
@@ -1698,59 +1852,63 @@ impl VaultService {
 
     async fn read_state(&self, user: &str, vault: &str) -> Result<VaultState> {
         Ok(serde_json::from_slice(
-            &fs::read(self.vault_dir(user, vault).join("state.json")).await?,
+            &fs::read(self.vault_dir(user, vault)?.join("state.json")).await?,
         )?)
     }
 
     async fn write_state(&self, state: &VaultState) -> Result<()> {
         fs::write(
-            self.vault_dir(&state.user, &state.vault).join("state.json"),
+            self.vault_dir(&state.user, &state.vault)?
+                .join("state.json"),
             serde_json::to_vec_pretty(state)?,
         )
         .await?;
         Ok(())
     }
 
-    fn vault_dir(&self, user: &str, vault: &str) -> PathBuf {
-        self.data_dir
-            .join("users")
-            .join(user)
-            .join("vaults")
-            .join(vault)
+    fn vault_dir(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        if let Some(id) = &self.resolved_share {
+            if self.published_storage && !self.publication()?.available(id) {
+                bail!("not found: share");
+            }
+            let root = self.data_dir.join("shares").join(id);
+            crate::publication::reject_symlink(&root)?;
+            return Ok(root);
+        }
+        if self.published_storage {
+            self.publication()?.root(&self.data_dir, user, vault)
+        } else {
+            Ok(self
+                .data_dir
+                .join("users")
+                .join(user)
+                .join("vaults")
+                .join(vault))
+        }
     }
-
-    fn repo_dir(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join("repo")
+    fn repo_dir(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join("repo"))
     }
-
-    fn binary_dir(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join("binary")
+    fn binary_dir(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join("binary"))
     }
-
-    fn upload_dir(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join("uploads")
+    fn upload_dir(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join("uploads"))
     }
-
-    fn upload_state_path(&self, user: &str, vault: &str, upload_id: &str) -> PathBuf {
-        self.upload_dir(user, vault)
-            .join(format!("{upload_id}.json"))
+    fn pending_conflicts_path(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join(PENDING_CONFLICTS_PATH))
     }
-
-    fn upload_content_path(&self, user: &str, vault: &str, upload_id: &str) -> PathBuf {
-        self.upload_dir(user, vault)
-            .join(format!("{upload_id}.bin"))
+    fn devices_path(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join("devices.json"))
     }
-
-    fn pending_conflicts_path(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join(PENDING_CONFLICTS_PATH)
+    fn version_metadata_path(&self, user: &str, vault: &str) -> Result<PathBuf> {
+        Ok(self.vault_dir(user, vault)?.join("version-metadata.json"))
     }
-
-    fn devices_path(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join(DEVICES_FILE_NAME)
+    fn upload_state_path(&self, user: &str, vault: &str, id: &str) -> Result<PathBuf> {
+        Ok(self.upload_dir(user, vault)?.join(format!("{id}.json")))
     }
-
-    fn version_metadata_path(&self, user: &str, vault: &str) -> PathBuf {
-        self.vault_dir(user, vault).join(VERSION_METADATA_FILE_NAME)
+    fn upload_content_path(&self, user: &str, vault: &str, id: &str) -> Result<PathBuf> {
+        Ok(self.upload_dir(user, vault)?.join(format!("{id}.bin")))
     }
 
     /// Pending conflicts are keyed by path and remember which client produced them, so that
@@ -1762,7 +1920,7 @@ impl VaultService {
         user: &str,
         vault: &str,
     ) -> Result<BTreeMap<String, Option<String>>> {
-        let path = self.pending_conflicts_path(user, vault);
+        let path = self.pending_conflicts_path(user, vault)?;
         let bytes = match fs::read(path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1798,7 +1956,7 @@ impl VaultService {
         pending: &BTreeMap<String, Option<String>>,
     ) -> Result<()> {
         fs::write(
-            self.pending_conflicts_path(user, vault),
+            self.pending_conflicts_path(user, vault)?,
             serde_json::to_vec_pretty(pending)?,
         )
         .await?;
@@ -1835,7 +1993,7 @@ impl VaultService {
             pending.remove(path);
         }
         if pending.is_empty() {
-            let _ = fs::remove_file(self.pending_conflicts_path(user, vault)).await;
+            let _ = fs::remove_file(self.pending_conflicts_path(user, vault)?).await;
             return Ok(());
         }
         self.write_pending_conflicts(user, vault, &pending).await
@@ -1875,7 +2033,7 @@ impl VaultService {
         upload_id: &str,
     ) -> Result<UploadState> {
         let state: UploadState = serde_json::from_slice(
-            &fs::read(self.upload_state_path(user, vault, upload_id)).await?,
+            &fs::read(self.upload_state_path(user, vault, upload_id)?).await?,
         )?;
         validate_vault_path(&state.path)?;
         validate_sha256_hex(&state.sha256)?;
@@ -1887,7 +2045,7 @@ impl VaultService {
 
     async fn incomplete_upload_bytes(&self, user: &str, vault: &str) -> Result<u64> {
         let mut total = 0_u64;
-        let mut entries = match fs::read_dir(self.upload_dir(user, vault)).await {
+        let mut entries = match fs::read_dir(self.upload_dir(user, vault)?).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(error.into()),
@@ -1912,7 +2070,7 @@ impl VaultService {
     async fn cleanup_stale_incomplete_uploads(&self, user: &str, vault: &str) -> Result<()> {
         let now = unix_now();
         let ttl = self.upload_limits.incomplete_ttl_seconds;
-        let upload_dir = self.upload_dir(user, vault);
+        let upload_dir = self.upload_dir(user, vault)?;
         let mut entries = fs::read_dir(&upload_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -1945,7 +2103,7 @@ impl VaultService {
         validate_vault_path(&state.path)?;
         validate_sha256_hex(&state.sha256)?;
         fs::write(
-            self.upload_state_path(user, vault, upload_id),
+            self.upload_state_path(user, vault, upload_id)?,
             serde_json::to_vec_pretty(state)?,
         )
         .await?;
@@ -1971,7 +2129,35 @@ impl VaultService {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let key = format!("{user}/{vault}");
+        self.with_storage_lock(user, vault, true, operation).await
+    }
+
+    async fn with_read_lock<F, Fut, T>(&self, user: &str, vault: &str, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.with_storage_lock(user, vault, false, operation).await
+    }
+
+    async fn with_storage_lock<F, Fut, T>(
+        &self,
+        user: &str,
+        vault: &str,
+        recover: bool,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let key = if let Some(id) = &self.resolved_share {
+            id.clone()
+        } else if self.published_storage {
+            self.publication()?.resolve_storage(user, vault)?
+        } else {
+            format!("{user}/{vault}")
+        };
         let lock = {
             let mut locks = self.locks.lock().await;
             locks
@@ -1980,7 +2166,15 @@ impl VaultService {
                 .clone()
         };
         let _guard = lock.lock().await;
-        self.recover_inkvault(user, vault).await?;
+        if recover {
+            self.recover_inkvault(user, vault).await?;
+        } else if self
+            .vault_dir(user, vault)?
+            .join("inkvault-publication.json")
+            .exists()
+        {
+            bail!("share recovery required before read access");
+        }
         operation().await
     }
 }
@@ -2406,7 +2600,7 @@ mod upload_limit_tests {
     }
 
     fn service(root: &Path, limits: UploadLimits) -> VaultService {
-        VaultService::new_with_options(VaultServiceOptions {
+        VaultService::legacy_with_options_for_tests(VaultServiceOptions {
             data_dir: root.to_path_buf(),
             remote_policy: RemotePolicy::default(),
             upload_limits: limits,

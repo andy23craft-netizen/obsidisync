@@ -1,5 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use obsidian_git_sync_server::{binary_store::sha256_hex, protocol::*, vault::VaultService};
+use obsidian_git_sync_server::{
+    binary_store::sha256_hex,
+    protocol::*,
+    vault::{UploadLimits, VaultService, VaultServiceOptions},
+};
 use serde_json::{json, Value};
 const ROOT: &str = ".inkvault/notes/11111111-1111-4111-8111-111111111111";
 const PAGE: &str = "22222222-2222-4222-8222-222222222222";
@@ -69,21 +73,40 @@ fn request(head: Option<String>, changes: Vec<ClientChange>) -> SyncRequest {
 }
 async fn setup() -> (tempfile::TempDir, VaultService, Option<String>) {
     let dir = tempfile::tempdir().unwrap();
-    let service = VaultService::new_for_tests(dir.path().into());
-    let r = service
-        .register(
-            "alice",
-            "notes",
-            RegisterRequest {
-                remote_url: "".into(),
-                branch: "main".into(),
-                author_name: "Tester".into(),
-                author_email: "test@example.com".into(),
-            },
-        )
-        .await
+    use obsidian_git_sync_server::accounts::{AccountStore, Capability, Membership, Principal};
+    let mut accounts = AccountStore::default();
+    let account = accounts
+        .create_account("alice", "synthetic-inkvault-password-123")
         .unwrap();
+    let share = accounts.create_share("Synthetic InkVault").unwrap();
+    let principal = Principal::Local {
+        account_id: account,
+    };
+    accounts.shares[0].members.push(Membership {
+        principal: principal.clone(),
+        capability: Capability::ReadWrite,
+    });
+    accounts.save(dir.path()).unwrap();
+    obsidian_git_sync_server::migration::initialize(dir.path()).unwrap();
+    let setup = dir.path().join("synthetic-setup.json");
+    std::fs::write(&setup,serde_json::to_vec(&json!({"registration":{"remoteUrl":"","branch":"main","authorName":"Tester","authorEmail":"fixture@example.invalid"},
+        "mapping":obsidian_git_sync_server::publication::Mapping {user:"alice".into(),vault:"notes".into(),share_id:share.clone(),principals:vec![principal],native_enabled:true,dav_enabled:true}})).unwrap()).unwrap();
+    obsidian_git_sync_server::admin::execute(
+        dir.path(),
+        &["share", "setup", &share, setup.to_str().unwrap()].map(String::from),
+    )
+    .await
+    .unwrap();
+    let service = published_service(dir.path());
+    let r = service.sync_state("alice", "notes").await.unwrap();
     (dir, service, r.server_head)
+}
+fn published_service(root: &std::path::Path) -> VaultService {
+    VaultService::published(VaultServiceOptions {
+        data_dir: root.into(),
+        remote_policy: Default::default(),
+        upload_limits: UploadLimits::default(),
+    })
 }
 #[tokio::test]
 async fn publication_is_paired_replayable_and_conflict_safe() {
@@ -262,7 +285,7 @@ async fn recovers_publication_before_and_after_git_ref_update() {
         )
         .await
         .unwrap();
-    let vault = dir.path().join("users/alice/vaults/notes");
+    let vault = service.storage_root("alice", "notes").unwrap();
     let repo = vault.join("repo");
     let ledger = read_manifest(&repo).await.unwrap();
     let journal =
@@ -289,7 +312,7 @@ async fn recovers_publication_before_and_after_git_ref_update() {
             serde_json::to_vec(&journal).unwrap(),
         )
         .unwrap();
-        let restarted = VaultService::new_for_tests(dir.path().into());
+        let restarted = published_service(dir.path());
         let response = restarted
             .sync_inkvault("alice", "notes", request(None, vec![]))
             .await
@@ -363,15 +386,16 @@ async fn native_visibility_dav_guards_and_compare_and_swap_resolution() {
             .status,
         SyncStatus::Ok
     );
+    let auth = AuthVerifier::password(String::new(), &service.data_dir).unwrap();
+    let bearer = format!(
+        "Bearer {}",
+        auth.login_password("alice", "synthetic-inkvault-password-123")
+            .await
+            .unwrap()
+            .access_token
+    );
     let app = router(
-        AppState::new(
-            service,
-            AuthVerifier::StaticTokenForDev {
-                token: "secret".into(),
-                user: "alice".into(),
-            },
-            PublicAuthConfig::Token,
-        ),
+        AppState::new(service, auth, PublicAuthConfig::Password),
         1024 * 1024,
         vec![],
     );
@@ -379,7 +403,7 @@ async fn native_visibility_dav_guards_and_compare_and_swap_resolution() {
         let mut req = Request::builder()
             .method("POST")
             .uri("/v1/users/alice/vaults/notes/sync")
-            .header("authorization", "Bearer secret")
+            .header("authorization", &bearer)
             .header("content-type", "application/json");
         if native {
             req = req.header("x-obsidisync-client-features", "inkVaultNotesV1");

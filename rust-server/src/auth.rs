@@ -18,6 +18,7 @@ use url::Url;
 pub struct AuthContext {
     pub subject: String,
     pub user: String,
+    pub oidc_issuer: Option<String>,
 }
 
 #[derive(Clone)]
@@ -113,12 +114,25 @@ impl AuthVerifier {
             Self::Password(_) => Ok(crate::accounts::Principal::Local {
                 account_id: auth.subject.clone(),
             }),
-            Self::Oidc(verifier) => Ok(crate::accounts::Principal::Oidc {
-                issuer: verifier.issuer.clone(),
-                subject: auth.subject.clone(),
-            }),
-            Self::StaticTokenForDev { .. } => {
-                bail!("development identities have no production share membership")
+            Self::Oidc(verifier) => {
+                let issuer = auth
+                    .oidc_issuer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("unauthorized: OIDC issuer missing; log in again"))?;
+                if issuer != &verifier.issuer {
+                    bail!("unauthorized: OIDC issuer mismatch");
+                }
+                Ok(crate::accounts::Principal::Oidc {
+                    issuer: issuer.clone(),
+                    subject: auth.subject.clone(),
+                })
+            }
+            Self::StaticTokenForDev { user, .. } => {
+                let user = normalize_user_claim(user)?;
+                if auth.subject != user || auth.user != user || auth.oidc_issuer.is_some() {
+                    bail!("unauthorized: development identity mismatch");
+                }
+                Ok(crate::accounts::Principal::Development { user })
             }
         }
     }
@@ -247,6 +261,7 @@ impl AuthVerifier {
                 Ok(AuthContext {
                     subject: session.subject,
                     user: session.user,
+                    oidc_issuer: None,
                 })
             }
             AuthVerifier::StaticTokenForDev {
@@ -258,6 +273,7 @@ impl AuthVerifier {
                     Ok(AuthContext {
                         subject: user.clone(),
                         user,
+                        oidc_issuer: None,
                     })
                 } else {
                     bail!("invalid bearer token")
@@ -273,23 +289,31 @@ impl OidcVerifier {
             .verify_oidc_token(oidc_access_token)
             .await
             .map_err(|_| anyhow!("unauthorized: invalid OIDC token"))?;
-        self.sessions.issue(auth.user, auth.subject).await
+        self.sessions
+            .issue_oidc(
+                auth.user,
+                auth.subject,
+                auth.oidc_issuer
+                    .ok_or_else(|| anyhow!("verified issuer missing"))?,
+            )
+            .await
     }
 
     async fn verify_session_token(&self, token: &str) -> Result<AuthContext> {
         let session = self.sessions.verify_access_token(token).await?;
-        if session.local_v1 {
+        if session.local_v1 || session.oidc_issuer.as_deref() != Some(self.issuer.as_str()) {
             bail!("invalid bearer token identity");
         }
         Ok(AuthContext {
             subject: session.subject,
             user: session.user,
+            oidc_issuer: session.oidc_issuer,
         })
     }
 
     async fn refresh_session(&self, refresh_token: &str) -> Result<AppSession> {
         self.sessions
-            .refresh(refresh_token, |user, subject| async move {
+            .refresh_oidc(refresh_token, &self.issuer, |user, subject| async move {
                 self.ensure_subject_still_authorized(&user, &subject).await
             })
             .await
@@ -355,6 +379,7 @@ impl OidcVerifier {
         Ok(AuthContext {
             subject: claims.sub,
             user: normalize_user_claim(&user)?,
+            oidc_issuer: Some(claims.iss),
         })
     }
 

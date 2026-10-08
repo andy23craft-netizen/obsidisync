@@ -61,8 +61,15 @@ async fn async_main() -> Result<()> {
         )
         .init();
 
+    // Fail before constructing workers or listeners. Installed staged roots are never
+    // served until the single authority is complete and its recovery journal is cleared.
+    let data = PathBuf::from(
+        std::env::var("OBSIDIAN_GIT_SYNC_DATA_DIR").unwrap_or_else(|_| "data".into()),
+    );
+    let publication = obsidian_git_sync_server::publication::Publication::load(&data)?;
+    publication.validate(&data)?;
     let config = RuntimeConfig::from_env()?;
-    let vaults = VaultService::new_with_options(VaultServiceOptions {
+    let vaults = VaultService::published(VaultServiceOptions {
         data_dir: config.data_dir,
         remote_policy: config.remote_policy,
         upload_limits: config.upload_limits,
@@ -121,8 +128,11 @@ impl RuntimeConfig {
         let (auth, public_auth) = if development {
             let token = required_env("OBSIDIAN_GIT_SYNC_DEV_TOKEN")?;
             let token = non_empty_env_value("OBSIDIAN_GIT_SYNC_DEV_TOKEN", token)?;
-            let user =
-                std::env::var("OBSIDIAN_GIT_SYNC_DEV_USER").unwrap_or_else(|_| "dev".to_string());
+            let user = obsidian_git_sync_server::auth::normalize_user_claim(
+                &std::env::var("OBSIDIAN_GIT_SYNC_DEV_USER").unwrap_or_else(|_| "dev".to_string()),
+            )?;
+            obsidian_git_sync_server::paths::validate_slug(&user, "development user")?;
+            tracing::warn!("development-token authentication explicitly enabled; use only for local development");
             (
                 AuthVerifier::StaticTokenForDev { token, user },
                 PublicAuthConfig::Token,
@@ -251,7 +261,7 @@ fn non_empty_env_value(name: &str, value: String) -> Result<String> {
 fn required_env(name: &str) -> Result<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),
-        _ => bail!("{name} is required unless OBSIDIAN_GIT_SYNC_DEV_TOKEN or OBSIDIAN_GIT_SYNC_PASSWORD_USER is set"),
+        _ => bail!("{name} is required for the selected authentication mode"),
     }
 }
 

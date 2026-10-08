@@ -29,6 +29,8 @@ const SERVER_FEATURES: &[&str] = &[
     "webdavDevicePasswords",
     "syncFileReferences",
     "saberNextcloud",
+    "shareSyncV2",
+    "readOnlyShareSync",
 ];
 /// PDFs exported from note-taking tablets are routinely larger than the JSON sync payload limit.
 pub const DEFAULT_WEBDAV_MAX_BODY_BYTES: usize = 200 * 1024 * 1024;
@@ -193,6 +195,8 @@ fn status_for_error(message: &str) -> StatusCode {
         StatusCode::UNAUTHORIZED
     } else if message.starts_with("InkNote changed since conflict") {
         StatusCode::CONFLICT
+    } else if message.starts_with("gone:") {
+        StatusCode::GONE
     } else if message.contains("forbidden") {
         StatusCode::FORBIDDEN
     } else if message.contains("not found") || message.contains("Unknown vault") {
@@ -283,6 +287,7 @@ pub fn router_with_webdav_limit(
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .merge(webdav)
         .merge(crate::nextcloud::router())
+        .merge(crate::v2::router())
         .merge(crate::oidc_login::router())
         .with_state(Arc::new(state));
 
@@ -486,7 +491,7 @@ async fn change_feed_page(
         Ok(auth) => auth,
         Err(_) => return Ok(redirect_to_login()),
     };
-    let feed = state.vaults.activity_feed(&auth.user, 50).await?;
+    let feed = authorized_feed(&state, &auth, false).await?;
     Ok(Html(render_change_feed_page(&auth.user, &feed)).into_response())
 }
 
@@ -844,7 +849,14 @@ async fn register(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     Ok(Json(state.vaults.register(&user, &vault, request).await?))
 }
 
@@ -853,8 +865,15 @@ async fn feed(
     headers: HeaderMap,
     Path(user): Path<String>,
 ) -> Result<Json<Vec<ActivityFeedEntry>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
-    Ok(Json(state.vaults.activity_feed(&user, 50).await?))
+    let auth = state.auth.verify_headers(&headers).await?;
+    if state.vaults.uses_published_storage() {
+        if auth.user != user {
+            return Err(anyhow::anyhow!("not found: share").into());
+        }
+    } else {
+        authorize(&state, &headers, &user).await?;
+    }
+    Ok(Json(authorized_feed(&state, &auth, true).await?))
 }
 
 async fn sync(
@@ -863,7 +882,15 @@ async fn sync(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<SyncRequest>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault_client(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+        Some(&request.client_id),
+    )
+    .await?;
     let changed: Vec<String> = request
         .changes
         .iter()
@@ -900,7 +927,14 @@ async fn init_upload(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<UploadInitRequest>,
 ) -> Result<Json<UploadInitResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     Ok(Json(
         state.vaults.init_upload(&user, &vault, request).await?,
     ))
@@ -912,7 +946,14 @@ async fn upload_chunk(
     Path((user, vault, upload)): Path<(String, String, String)>,
     Json(request): Json<UploadChunkRequest>,
 ) -> Result<Json<UploadChunkResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     Ok(Json(
         state
             .vaults
@@ -926,7 +967,14 @@ async fn complete_upload(
     headers: HeaderMap,
     Path((user, vault, upload)): Path<(String, String, String)>,
 ) -> Result<Json<UploadCompleteResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     Ok(Json(
         state.vaults.complete_upload(&user, &vault, &upload).await?,
     ))
@@ -938,7 +986,14 @@ async fn history(
     Path((user, vault)): Path<(String, String)>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<HistoryEntry>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     if let Some(path) = &query.path {
         authorize_inkvault_path(&headers, path)?;
     }
@@ -956,7 +1011,14 @@ async fn file_at_version(
     Path((user, vault)): Path<(String, String)>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<VersionFileResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     authorize_inkvault_path(&headers, &query.path)?;
     Ok(Json(
         state
@@ -974,7 +1036,14 @@ async fn blob_at_version(
     Path((user, vault)): Path<(String, String)>,
     Query(query): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     authorize_inkvault_path(&headers, &query.path)?;
     let (path, content) = state
         .vaults
@@ -1004,7 +1073,15 @@ async fn resolve(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault_client(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+        Some(&request.client_id),
+    )
+    .await?;
     Ok(Json(
         state
             .vaults
@@ -1018,7 +1095,14 @@ async fn devices(
     headers: HeaderMap,
     Path((user, vault)): Path<(String, String)>,
 ) -> Result<Json<Vec<DeviceEntry>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     Ok(Json(state.vaults.list_devices(&user, &vault).await?))
 }
 
@@ -1034,7 +1118,14 @@ async fn pending_conflicts(
     Path((user, vault)): Path<(String, String)>,
     Query(query): Query<PendingConflictsQuery>,
 ) -> Result<Json<Vec<SyncConflict>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     Ok(Json(
         state
             .vaults
@@ -1054,7 +1145,14 @@ async fn device_versions(
     Path((user, vault)): Path<(String, String)>,
     Query(query): Query<DeviceVersionsQuery>,
 ) -> Result<Json<Vec<DeviceVersionEntry>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     Ok(Json(
         state
             .vaults
@@ -1069,7 +1167,14 @@ async fn set_version_metadata(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<VersionMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     state
         .vaults
         .set_version_metadata(&user, &vault, request)
@@ -1088,7 +1193,14 @@ async fn list_device_passwords(
     headers: HeaderMap,
     Path((user, vault)): Path<(String, String)>,
 ) -> Result<Json<Vec<DevicePasswordEntry>>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::Read,
+    )
+    .await?;
     Ok(Json(state.device_passwords.list(&user, &vault).await?))
 }
 
@@ -1098,7 +1210,14 @@ async fn create_device_password(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<CreateDevicePasswordRequest>,
 ) -> Result<Json<CreatedDevicePassword>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     if !state.vaults.is_registered(&user, &vault).await {
         return Err(ApiError(anyhow::anyhow!(
             "invalid vault: sync this vault from Obsidian once before creating device passwords"
@@ -1117,7 +1236,14 @@ async fn revoke_device_password(
     headers: HeaderMap,
     Path((user, vault, id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await?;
     if !state.device_passwords.revoke(&user, &vault, &id).await? {
         return Err(ApiError(anyhow::anyhow!("not found: device password")));
     }
@@ -1139,6 +1265,107 @@ async fn authorize(
         )));
     }
     Ok(())
+}
+
+pub(crate) async fn authorize_vault(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &str,
+    vault: &str,
+    capability: crate::accounts::Capability,
+) -> Result<(), ApiError> {
+    authorize_vault_client(state, headers, user, vault, capability, None).await
+}
+async fn authorize_vault_client(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &str,
+    vault: &str,
+    capability: crate::accounts::Capability,
+    client: Option<&str>,
+) -> Result<(), ApiError> {
+    if !state.vaults.uses_published_storage() {
+        return authorize(state, headers, user).await;
+    }
+    let auth = state.auth.verify_headers(headers).await?;
+    if auth.user != user {
+        return Err(ApiError(anyhow::anyhow!("not found: share")));
+    }
+    let principal = state.auth.membership_principal(&auth)?;
+    let publication = state.vaults.publication()?;
+    if let Some(mapping) = publication
+        .mappings
+        .iter()
+        .find(|m| m.user == user && m.vault == vault)
+    {
+        let client = client
+            .or_else(|| {
+                headers
+                    .get("x-obsidisync-client-id")
+                    .and_then(|value| value.to_str().ok())
+            })
+            .unwrap_or("namespace");
+        crate::compatibility::record(
+            &state.vaults.data_dir,
+            mapping,
+            "native",
+            &crate::compatibility::client_id(client),
+        )?;
+    }
+    publication.authorize_legacy(&state.vaults.data_dir, user, vault, &principal, capability)?;
+    Ok(())
+}
+
+async fn authorized_feed(
+    state: &AppState,
+    auth: &crate::auth::AuthContext,
+    legacy: bool,
+) -> Result<Vec<ActivityFeedEntry>, ApiError> {
+    if !state.vaults.uses_published_storage() {
+        return Ok(state.vaults.activity_feed(&auth.user, 50).await?);
+    }
+    let publication = state.vaults.publication()?;
+    let accounts = crate::accounts::AccountStore::load(&state.vaults.data_dir)?;
+    let principal = state.auth.membership_principal(auth)?;
+    let mut feed = vec![];
+    for share in &accounts.shares {
+        if !publication.available(&share.id) || accounts.capability(&share.id, &principal).is_none()
+        {
+            continue;
+        }
+        if legacy {
+            let Some(mapping) = publication.mappings.iter().find(|m| {
+                m.user == auth.user
+                    && m.share_id == share.id
+                    && m.native_enabled
+                    && m.principals.contains(&principal)
+            }) else {
+                continue;
+            };
+            crate::compatibility::record(
+                &state.vaults.data_dir,
+                mapping,
+                "native",
+                &crate::compatibility::client_id("namespace"),
+            )?;
+        }
+        let service = state.vaults.for_share(&share.id)?;
+        let mut entries = service.vault_activity("share", &share.id, 50).await?;
+        if legacy {
+            let mapping = publication
+                .mappings
+                .iter()
+                .find(|m| m.user == auth.user && m.share_id == share.id)
+                .unwrap();
+            for e in &mut entries {
+                e.vault = mapping.vault.clone();
+            }
+        }
+        feed.extend(entries);
+    }
+    feed.sort_by(|l, r| r.date.cmp(&l.date));
+    feed.truncate(50);
+    Ok(feed)
 }
 
 pub(crate) fn redirect_with_site_session(
@@ -1242,7 +1469,7 @@ fn inkvault_client(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|f| f.trim() == crate::inkvault::FEATURE))
 }
-fn authorize_inkvault_path(headers: &HeaderMap, path: &str) -> Result<(), ApiError> {
+pub(crate) fn authorize_inkvault_path(headers: &HeaderMap, path: &str) -> Result<(), ApiError> {
     if crate::inkvault::is_source(path) && !inkvault_client(headers) {
         return Err(anyhow::anyhow!("InkNote source requires inkVaultNotesV1").into());
     }
@@ -1255,7 +1482,15 @@ async fn resolve_inkvault(
     Path((user, vault)): Path<(String, String)>,
     Json(request): Json<SyncRequest>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    authorize(&state, &headers, &user).await?;
+    authorize_vault_client(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+        Some(&request.client_id),
+    )
+    .await?;
     if !inkvault_client(&headers) {
         return Err(anyhow::anyhow!("paired resolution requires inkVaultNotesV1").into());
     }

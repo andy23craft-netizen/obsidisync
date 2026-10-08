@@ -9,6 +9,25 @@ pub struct RemotePolicy {
 }
 
 impl RemotePolicy {
+    pub fn from_env() -> Self {
+        Self {
+            allow_local_remotes: std::env::var("OBSIDIAN_GIT_SYNC_ALLOW_LOCAL_REMOTES").is_ok_and(
+                |value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                },
+            ),
+            allowed_hosts: std::env::var("OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+                .collect(),
+        }
+    }
     pub fn validate(&self, remote_url: &str) -> Result<()> {
         let remote = remote_url.trim();
         if remote.is_empty()

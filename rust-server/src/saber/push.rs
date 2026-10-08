@@ -51,6 +51,24 @@ struct PushState {
     #[serde(default)]
     pushed: BTreeMap<String, BTreeMap<String, String>>,
 }
+pub(crate) fn validate_state(path: &std::path::Path) -> Result<()> {
+    let state: PushState = serde_json::from_slice(&std::fs::read(path)?)?;
+    for (note, pdfs) in &state.notes {
+        crate::paths::validate_vault_path(note)?;
+        for pdf in pdfs {
+            crate::paths::validate_vault_path(pdf)?;
+        }
+    }
+    for (pdf, devices) in &state.pushed {
+        crate::paths::validate_vault_path(pdf)?;
+        for hash in devices.values() {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("invalid Saber push hash");
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct TabletPusher {
@@ -141,11 +159,31 @@ impl TabletPusher {
         vault: &str,
         changed_notes: &[String],
     ) -> Result<PushReport> {
-        let grants = self.device_passwords.saber_grants(user, vault).await?;
+        let mut grants = self.device_passwords.saber_grants(user, vault).await?;
+        if self.vaults.uses_published_storage() {
+            let publication = self.vaults.publication()?;
+            grants.retain(|grant| {
+                publication
+                    .legacy_device(user, vault, &grant.id, "saber")
+                    .is_ok()
+            });
+        }
         if grants.is_empty() {
             return Ok(PushReport::default());
         }
-        let all_paths = self.vaults.list_tracked_paths(user, vault).await?;
+        for grant in &grants {
+            crate::grants::recheck_legacy(&self.vaults, grant).await?;
+        }
+        if self.vaults.uses_published_storage() {
+            let publication = self.vaults.publication()?;
+            let mapping = publication.mapping(user, vault)?;
+            for grant in &grants {
+                crate::compatibility::record(&self.vaults.data_dir, mapping, "saber", &grant.id)?;
+            }
+        }
+        let all_paths = self
+            .with_export(user, vault, self.vaults.list_tracked_paths(user, vault))
+            .await?;
         // PDF folders hold Saber's own rendered output; never push those back.
         let list_folders: Vec<String> = grants
             .iter()
@@ -173,15 +211,10 @@ impl TabletPusher {
         };
 
         let _guard = self.state_lock.lock().await;
-        let state_path = self
-            .vaults
-            .data_dir
-            .join("users")
-            .join(user)
-            .join("vaults")
-            .join(vault)
-            .join(STATE_FILE);
-        let mut state = read_state(&state_path).await?;
+        let state_path = self.vaults.storage_root(user, vault)?.join(STATE_FILE);
+        let mut state = self
+            .with_export(user, vault, read_state(&state_path))
+            .await?;
         let mut report = PushReport::default();
 
         for note in &notes {
@@ -222,7 +255,8 @@ impl TabletPusher {
             }
         }
 
-        write_state(&state_path, &state).await?;
+        self.with_export(user, vault, write_state(&state_path, &state))
+            .await?;
         Ok(report)
     }
 
@@ -235,8 +269,7 @@ impl TabletPusher {
         state: &mut PushState,
     ) -> Result<PushOutcome> {
         let entry = self
-            .vaults
-            .dav_stat(user, vault, pdf)
+            .with_export(user, vault, self.vaults.dav_stat(user, vault, pdf))
             .await?
             .ok_or_else(|| anyhow!("PDF is missing from the vault"))?;
         if entry.size > MAX_PDF_BYTES {
@@ -252,7 +285,9 @@ impl TabletPusher {
             return Ok(PushOutcome::Unchanged);
         }
 
-        let (_, bytes) = self.vaults.dav_read(user, vault, pdf).await?;
+        let (_, bytes) = self
+            .with_export(user, vault, self.vaults.dav_read(user, vault, pdf))
+            .await?;
         // PDF parsing is CPU work with deep frames; keep it off the async worker stack.
         let (bytes, note_bytes) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>)> {
@@ -268,6 +303,7 @@ impl TabletPusher {
 
         let mut count = 0;
         for grant in targets {
+            crate::grants::recheck_legacy(&self.vaults, grant).await?;
             let settings = grant
                 .saber_rendering()
                 .ok_or_else(|| anyhow!("device {} has no encryption password", grant.label))?;
@@ -298,6 +334,9 @@ impl TabletPusher {
         saber_path: &str,
         plaintext: &[u8],
     ) -> Result<()> {
+        let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+        let _operation = operations.read().await;
+        crate::grants::recheck_legacy(&self.vaults, grant).await?;
         let vault_path = format!("{}/{}", grant.folder, cipher.encrypt_file_name(saber_path));
         self.vaults
             .dav_write(
@@ -313,12 +352,48 @@ impl TabletPusher {
     }
 
     async fn read_optional(&self, user: &str, vault: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+        let _operation = operations.read().await;
+        self.recheck_export(user, vault).await?;
         match self.vaults.dav_stat(user, vault, path).await? {
             Some(entry) if !entry.is_dir => {
+                self.recheck_export(user, vault).await?;
                 Ok(Some(self.vaults.dav_read(user, vault, path).await?.1))
             }
             _ => Ok(None),
         }
+    }
+
+    async fn with_export<T, F>(&self, user: &str, vault: &str, operation: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+        let _operation = operations.read().await;
+        self.recheck_export(user, vault).await?;
+        operation.await
+    }
+
+    async fn recheck_export(&self, user: &str, vault: &str) -> Result<()> {
+        if self.vaults.uses_published_storage() {
+            self.vaults.publication()?.legacy_grant(user, vault)?;
+        }
+        let mut grants = self.device_passwords.saber_grants(user, vault).await?;
+        if self.vaults.uses_published_storage() {
+            let publication = self.vaults.publication()?;
+            grants.retain(|grant| {
+                publication
+                    .legacy_device(user, vault, &grant.id, "saber")
+                    .is_ok()
+            });
+        }
+        if grants.is_empty() {
+            bail!("unauthorized: Saber grants revoked");
+        }
+        for g in &grants {
+            crate::grants::recheck_legacy(&self.vaults, g).await?;
+        }
+        Ok(())
     }
 }
 
@@ -328,6 +403,7 @@ enum PushOutcome {
 }
 
 async fn read_state(path: &std::path::Path) -> Result<PushState> {
+    crate::paths::reject_storage_links(path)?;
     match tokio::fs::read(path).await {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PushState::default()),
@@ -336,10 +412,12 @@ async fn read_state(path: &std::path::Path) -> Result<PushState> {
 }
 
 async fn write_state(path: &std::path::Path, state: &PushState) -> Result<()> {
+    crate::paths::reject_storage_links(path)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let temp = path.with_extension("json.tmp");
+    crate::paths::reject_storage_links(&temp)?;
     tokio::fs::write(&temp, serde_json::to_vec_pretty(state)?).await?;
     tokio::fs::rename(temp, path).await?;
     Ok(())
@@ -537,6 +615,29 @@ fn link_targets(markdown: &str) -> Vec<String> {
 }
 
 fn resolve_target(target: &str, note_dir: &str, vault_pdfs: &[String]) -> Option<String> {
+    // Relative parent links may stay inside this vault, but an escape must never fall
+    // back to a basename search and accidentally export a different document.
+    if target.split('/').any(|part| part == "..") {
+        let mut parts: Vec<&str> = if target.starts_with('/') {
+            vec![]
+        } else {
+            note_dir.split('/').filter(|p| !p.is_empty()).collect()
+        };
+        for part in target.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                other => parts.push(other),
+            }
+        }
+        let resolved = parts.join("/");
+        return vault_pdfs
+            .iter()
+            .find(|path| path.eq_ignore_ascii_case(&resolved))
+            .cloned();
+    }
     let cleaned = target
         .trim()
         .trim_start_matches("./")
@@ -753,6 +854,16 @@ mod tests {
             "/Uni/Slides/Lecture 1.sbn2"
         );
         assert_eq!(saber_note_path("x.PDF"), "/x.sbn2");
+    }
+    #[test]
+    fn parent_links_resolve_only_inside_the_original_vault() {
+        let pdfs = vec!["Inside.pdf".to_string()];
+        assert_eq!(
+            resolve_pdf_links("[[../Inside.pdf]]", "Notes/export.md", &pdfs),
+            pdfs
+        );
+        assert!(resolve_pdf_links("[[../../Inside.pdf]]", "Notes/export.md", &pdfs).is_empty());
+        assert!(resolve_pdf_links("[[../Inside.pdf]]", "export.md", &pdfs).is_empty());
     }
 
     pub fn two_page_pdf() -> Vec<u8> {

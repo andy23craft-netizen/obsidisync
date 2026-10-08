@@ -1,4 +1,4 @@
-//! Staged credentials. No network authenticator imports or consults this store.
+//! Immutable share grants; publication owns the separate, explicit activated-ID set.
 use crate::accounts::{
     opaque_id, validate_id, validate_label, AccountStore, Capability, Principal,
 };
@@ -24,6 +24,8 @@ pub struct Credential {
     pub created_at: u64,
     pub kind: String,
     pub lifecycle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_actor: Option<Principal>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +71,9 @@ impl Store {
                 bail!("invalid staged credential record");
             }
             accounts.validate_principal(&c.creator)?;
+            if let Some(actor) = &c.rotation_actor {
+                accounts.validate_principal(actor)?;
+            }
             validate_device_folder(&c.folder)?;
             validate_label(&c.label)?;
         }
@@ -104,6 +109,7 @@ impl Store {
             created_at: unix_now(),
             kind: "webdav".into(),
             lifecycle: "staged".into(),
+            rotation_actor: None,
         });
         Ok((id, secret))
     }
@@ -124,6 +130,15 @@ impl Store {
             bail!("credential not found");
         }
         Ok(())
+    }
+    pub fn rotate_as(&mut self, id: &str, actor: Principal) -> Result<String> {
+        let secret = self.rotate(id)?;
+        self.credentials
+            .iter_mut()
+            .find(|c| c.id == id)
+            .unwrap()
+            .rotation_actor = Some(actor);
+        Ok(secret)
     }
 }
 fn generate_secret() -> Result<String> {

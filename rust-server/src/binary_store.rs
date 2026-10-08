@@ -60,6 +60,7 @@ pub async fn store_binary(
     let sha = sha256_hex(content);
     let object_path = format!("{}/{}", &sha[0..2], sha);
     let absolute = binary_root.join(&object_path);
+    crate::paths::reject_storage_links(&absolute)?;
     if let Some(parent) = absolute.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -75,6 +76,7 @@ pub async fn store_binary(
 }
 
 pub async fn read_binary_object(binary_root: &Path, entry: &BinaryEntry) -> Result<Vec<u8>> {
+    crate::paths::reject_storage_links(&binary_root.join(&entry.object_path))?;
     validate_binary_entry("binary object", entry)?;
     Ok(fs::read(binary_root.join(&entry.object_path)).await?)
 }

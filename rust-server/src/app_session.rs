@@ -27,6 +27,7 @@ pub struct VerifiedSession {
     pub user: String,
     pub subject: String,
     pub local_v1: bool,
+    pub oidc_issuer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,8 @@ struct SessionRecord {
     subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oidc_issuer: Option<String>,
     access_token_hash: String,
     refresh_token_hash: String,
     access_expires_at: u64,
@@ -65,11 +68,26 @@ impl AppSessionStore {
     }
 
     pub async fn issue(&self, user: String, subject: String) -> Result<AppSession> {
-        self.issue_inner(user, subject, None).await
+        self.issue_inner(user, subject, None, None).await
     }
 
     pub async fn issue_local(&self, user: String, subject: String) -> Result<AppSession> {
-        self.issue_inner(user, subject, Some("local-v1".to_string()))
+        self.issue_inner(user, subject, Some("local-v1".to_string()), None)
+            .await
+    }
+
+    /// Only call after verifying the provider token's issuer and subject.
+    pub async fn issue_oidc(
+        &self,
+        user: String,
+        subject: String,
+        issuer: String,
+    ) -> Result<AppSession> {
+        validate_issuer(&issuer)?;
+        if subject.trim().is_empty() {
+            bail!("invalid OIDC subject");
+        }
+        self.issue_inner(user, subject, Some("oidc-v1".into()), Some(issuer))
             .await
     }
 
@@ -78,10 +96,11 @@ impl AppSessionStore {
         user: String,
         subject: String,
         identity_version: Option<String>,
+        oidc_issuer: Option<String>,
     ) -> Result<AppSession> {
         let _guard = self.lock.lock().await;
         let mut store = self.read_store().await?;
-        let session = new_session(user, subject, identity_version)?;
+        let session = new_session(user, subject, identity_version, oidc_issuer)?;
         store.sessions.push(session.record.clone());
         prune_sessions(&mut store);
         self.write_store(&store).await?;
@@ -104,6 +123,7 @@ impl AppSessionStore {
             user: record.user.clone(),
             subject: record.subject.clone(),
             local_v1: record.identity_version.as_deref() == Some("local-v1"),
+            oidc_issuer: record.oidc_issuer.clone(),
         })
     }
 
@@ -112,7 +132,22 @@ impl AppSessionStore {
         F: FnOnce(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        self.refresh_inner(refresh_token, None, authorize).await
+        self.refresh_inner(refresh_token, None, None, authorize)
+            .await
+    }
+
+    pub async fn refresh_oidc<F, Fut>(
+        &self,
+        token: &str,
+        issuer: &str,
+        authorize: F,
+    ) -> Result<AppSession>
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.refresh_inner(token, Some("oidc-v1"), Some(issuer), authorize)
+            .await
     }
 
     pub async fn refresh_local<F, Fut>(
@@ -124,7 +159,7 @@ impl AppSessionStore {
         F: FnOnce(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        self.refresh_inner(refresh_token, Some("local-v1"), authorize)
+        self.refresh_inner(refresh_token, Some("local-v1"), None, authorize)
             .await
     }
 
@@ -132,6 +167,7 @@ impl AppSessionStore {
         &self,
         refresh_token: &str,
         required_kind: Option<&str>,
+        required_issuer: Option<&str>,
         authorize: F,
     ) -> Result<AppSession>
     where
@@ -147,7 +183,9 @@ impl AppSessionStore {
             .iter()
             .position(|session| constant_time_eq(&session.refresh_token_hash, &token_hash))
             .ok_or_else(|| anyhow!("invalid refresh token"))?;
-        if store.sessions[index].identity_version.as_deref() != required_kind {
+        if store.sessions[index].identity_version.as_deref() != required_kind
+            || store.sessions[index].oidc_issuer.as_deref() != required_issuer
+        {
             bail!("invalid refresh token identity; log in again");
         }
         let record = store.sessions.remove(index);
@@ -157,7 +195,12 @@ impl AppSessionStore {
         }
         self.write_store(&store).await?;
         authorize(record.user.clone(), record.subject.clone()).await?;
-        let session = new_session(record.user, record.subject, record.identity_version)?;
+        let session = new_session(
+            record.user,
+            record.subject,
+            record.identity_version,
+            record.oidc_issuer,
+        )?;
         store.sessions.push(session.record.clone());
         prune_sessions(&mut store);
         self.write_store(&store).await?;
@@ -173,9 +216,22 @@ impl AppSessionStore {
             if record
                 .identity_version
                 .as_deref()
-                .is_some_and(|kind| kind != "local-v1")
+                .is_some_and(|kind| !matches!(kind, "local-v1" | "oidc-v1"))
             {
                 bail!("auth store contains an unsupported session identity");
+            }
+            if record.identity_version.as_deref() == Some("oidc-v1") {
+                validate_issuer(
+                    record
+                        .oidc_issuer
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("OIDC session lacks issuer"))?,
+                )?;
+                if record.subject.trim().is_empty() {
+                    bail!("invalid OIDC session subject");
+                }
+            } else if record.oidc_issuer.is_some() {
+                bail!("auth store contains an inconsistent session identity");
             }
         }
         Ok(store)
@@ -195,6 +251,7 @@ fn new_session(
     user: String,
     subject: String,
     identity_version: Option<String>,
+    oidc_issuer: Option<String>,
 ) -> Result<IssuedSession> {
     let access_token = random_token()?;
     let refresh_token = random_token()?;
@@ -214,6 +271,7 @@ fn new_session(
             user,
             subject,
             identity_version,
+            oidc_issuer,
             access_token_hash: hash_token(&access_token),
             refresh_token_hash: hash_token(&refresh_token),
             access_expires_at,
@@ -222,6 +280,17 @@ fn new_session(
             refreshed_at: now,
         },
     })
+}
+
+fn validate_issuer(issuer: &str) -> Result<()> {
+    let url = url::Url::parse(issuer)?;
+    if url.scheme() != "https"
+        && !(url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+    {
+        bail!("invalid OIDC session issuer");
+    }
+    Ok(())
 }
 
 fn prune_sessions(store: &mut SessionStore) {
@@ -273,6 +342,89 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oidc_identity_rejection_preserves_unrelated_records_and_bound_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AppSessionStore::new(root.path());
+        let legacy = store
+            .issue("alice".into(), "same-subject".into())
+            .await
+            .unwrap();
+        let local = store
+            .issue_local("local".into(), "p_fixture".into())
+            .await
+            .unwrap();
+        let bound = store
+            .issue_oidc(
+                "alice".into(),
+                "same-subject".into(),
+                "https://a.example.test".into(),
+            )
+            .await
+            .unwrap();
+        let before = std::fs::read(&store.store_path).unwrap();
+        assert!(store
+            .refresh_oidc(
+                &legacy.refresh_token,
+                "https://a.example.test",
+                |_, _| async { Ok(()) }
+            )
+            .await
+            .is_err());
+        assert!(store
+            .refresh_oidc(
+                &bound.refresh_token,
+                "https://b.example.test",
+                |_, _| async { Ok(()) }
+            )
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&store.store_path).unwrap(), before);
+        let restarted = AppSessionStore::new(root.path());
+        assert!(
+            restarted
+                .verify_access_token(&local.access_token)
+                .await
+                .unwrap()
+                .local_v1
+        );
+        let fresh = restarted
+            .refresh_oidc(
+                &bound.refresh_token,
+                "https://a.example.test",
+                |_, _| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted
+                .verify_access_token(&fresh.access_token)
+                .await
+                .unwrap()
+                .oidc_issuer
+                .as_deref(),
+            Some("https://a.example.test")
+        );
+        assert!(restarted
+            .verify_access_token(&local.access_token)
+            .await
+            .is_ok());
+        assert!(restarted
+            .verify_access_token(&legacy.access_token)
+            .await
+            .unwrap()
+            .oidc_issuer
+            .is_none());
+        assert!(restarted
+            .refresh_oidc(
+                &bound.refresh_token,
+                "https://a.example.test",
+                |_, _| async { Ok(()) }
+            )
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn refresh_token_is_consumed_before_authorization_check() {

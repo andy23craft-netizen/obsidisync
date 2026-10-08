@@ -243,18 +243,31 @@ An empty/all-disabled store shows operator guidance. Password mode no longer req
 Legacy `OBSIDIAN_GIT_SYNC_PASSWORD_USER`/`OBSIDIAN_GIT_SYNC_USER` select password mode when an explicit mode is
 absent; they do not restrict login to one account. Obsolete setup-token configuration is ignored without logging
 its value. Explicit `OBSIDIAN_GIT_SYNC_AUTH_MODE=password|oidc|dev` selects exactly that mode and validates its
-required settings. Without it, precedence remains development token, password-user setting, then OIDC.
+required settings. Outside the packaged image, absent-mode precedence remains development token, password-user
+setting, then OIDC. The Dockerfile explicitly defaults `OBSIDIAN_GIT_SYNC_AUTH_MODE=oidc`; an injected development
+token cannot override that production default. Password containers must explicitly select `AUTH_MODE=password`.
 
 After logging in, the page also shows a recent change feed for the user's synced vaults.
 
 Local development token mode:
 
 ```bash
+export OBSIDIAN_GIT_SYNC_AUTH_MODE="dev"
 export OBSIDIAN_GIT_SYNC_DEV_TOKEN="change-me"
 export OBSIDIAN_GIT_SYNC_DEV_USER="alice"
 export OBSIDIAN_GIT_SYNC_ALLOW_LOCAL_REMOTES="true" # only for local bare test repos
 npm run start:server
 ```
+
+Development authentication resolves only to the distinct typed principal
+`{"kind":"development","user":"alice"}`. Its canonical configured username is stable across token rotation;
+it never aliases a local account or OIDC subject. Provision explicit `membership grant SHARE_ID development alice
+read-write` offline, and explicitly name that principal in the reviewed v1 mapping. Token possession grants no
+global access or implicit membership. Read-only capabilities, membership revocation and share retirement apply
+normally. Changing `DEV_USER` selects another principal; changing the token revokes the previous token. Password
+and OIDC modes never accept development tokens, even if development memberships exist. Device/service credentials
+remain separately revocable independent grants as documented below. Development mode is for disposable local use,
+not household production authentication. Serving also requires explicit publication/setup or offline migration.
 
 Use HTTPS in production, usually by placing the server behind a reverse proxy.
 
@@ -394,6 +407,12 @@ The connection appears in **Settings → ObsidiSync → Device passwords (WebDAV
 The other direction works too. Keep a note inside the PDF folder, for example `Tablet/Tablet.md`, that links every PDF you want on the tablet (`![[Slides.pdf]]`, `[[Slides.pdf]]`, `[slides](Slides.pdf)`); each linked PDF is pushed into Saber on the next sync, as a Saber note whose pages are the PDF pages, ready to be written on. Notes anywhere else do the same when tagged `#tablet` (in the text, or `tags: [tablet]` in the frontmatter). PDFs that live in the PDF folder itself are Saber's rendered output and are never pushed back. The Saber note mirrors the vault path: `Uni/Slides.pdf` becomes `Uni/Slides` in Saber. Once you annotate it, the usual round trip renders the annotated version to `Tablet/Uni/Slides.pdf` in the vault; the original PDF is left untouched.
 
 Each PDF is pushed once per Saber device. If the PDF changes later, the copy in Saber is deliberately left alone so existing strokes stay aligned with the page they were drawn on. To push the current file again, remove the tag, sync, and add it back. Removing the tag never deletes anything in Saber. Links are resolved like Obsidian does: exact vault path, path relative to the note, or a unique file name anywhere in the vault. The server keeps the push record in `saber-push.json` next to the vault; the first sync after a server start scans the whole vault for tagged notes, later syncs only look at changed notes.
+
+Saber's background export intentionally has a broader scope than its direct DAV folder grant: tagged notes can
+send linked PDFs from anywhere in the original vault to its Saber devices. During share migration, this legacy
+behavior must stay inside the explicitly mapped original share and recheck publication/revocation before work.
+New share-scoped WebDAV credentials do not enable Saber. Share-native Saber provisioning and configurable input/
+source/output scope is deferred to a separate future feature. Neither links nor symlinks authorize another share.
 
 What the renderer draws: page background colour and ruling (lined, college, grid, dots, staffs, tablature, Cornell), fountain pen, ballpoint and shape-pen strokes with pressure, pencil strokes (as lighter fills), highlighter strokes (translucent), PNG/JPEG images, and typed text as plain Helvetica. Pages of imported PDFs and SVG images are drawn as labelled placeholders. Notes in Saber's legacy `.sbn` JSON format are stored but not rendered.
 
@@ -538,10 +557,20 @@ create an account offline afterward. Corrupt input, mismatched namespaces, or ex
 without replacement. Repeat import reports the existing mapping and does not retire fresh sessions.
 
 Restart the upgraded server and log in again with the same username/password on each plugin/browser. Old local
-access/refresh tokens return `401`; stale browser cookies redirect to login. OIDC sessions remain compatible.
+access/refresh tokens return `401`; stale browser cookies redirect to login. Correctly issuer-bound OIDC sessions
+remain compatible; legacy issuer-less sessions require the separate re-login described below.
 New local sessions carry immutable account IDs but expose the same username to v1. Re-login retains the client
 vault slug, head, manifest, registration and conflicts; do not reset registration, force-push, or overwrite local.
-Authentication import does not migrate document storage; that belongs to FEAT-03.
+Authentication import does not migrate document storage. Publication requires the separate explicit offline
+[share migration workflow](docs/SHARE_STORAGE_AND_MIGRATION.md); an upgrade never migrates data automatically.
+
+OIDC identity upgrade has an approved compatibility exception: legacy server sessions without a persisted verified
+issuer cannot authenticate or refresh. Sign in again through OIDC on each plugin/browser. No offline issuer binding
+occurs and current provider configuration never supplies a missing issuer. Fresh sessions persist verified issuer
+and subject, retain normal expiration/rotation, and survive restart. Changing the configured issuer rejects sessions
+from the previous issuer rather than reinterpreting their subject. The correction does not delete unrelated sessions,
+move vault data, change memberships, or reset plugin head/manifest/registration/conflicts/recovery state. Old raw
+records remain protected recovery material; never share session stores or token hashes in diagnostics.
 
 Account commands are `create USER`, `disable ID`, and `list`. Usernames cannot be renamed or reused, including
 disabled accounts. Disable rejects fresh login/refresh; existing access tokens may last until their original
@@ -550,9 +579,11 @@ access token. Legacy device credentials remain independent and must be revoked s
 
 Share commands are `create LABEL`, `rename ID LABEL`, and `list`. Membership commands use explicit typed identities:
 `membership grant SHARE local ACCOUNT_ID read|read-write` or
-`membership grant SHARE oidc ISSUER VERIFIED_SUB read|read-write`; use `revoke` without capability or `list SHARE`.
+`membership grant SHARE oidc ISSUER VERIFIED_SUB read|read-write` or
+`membership grant SHARE development CANONICAL_DEV_USER read|read-write`; use `revoke` without capability or `list SHARE`.
 Use the server's verified issuer string and exact subject (not the display username). Share labels do not address
-vaults. These records do not enable sharing on the current v1 API.
+vaults. Publish explicit storage/mappings before serving documents; membership alone does not grant another user's
+legacy namespace. The server also provides a share-scoped v2 API independently of client share selection.
 
 Credential commands require an explicit `legacy` or `share` target. Legacy create/list use `USER VAULT`, rotation
 and revocation additionally identify the credential ID. `create-saber` reads the encryption password separately
@@ -563,9 +594,13 @@ For Harmony, create its share/membership first, then issue a distinct service re
 `credential share create SHARE_ID local ACCOUNT_ID Household read-write "Harmony service"`.
 The creator must have sufficient membership. OIDC creator syntax also accepts explicit issuer/subject.
 Use `credential share rotate ID`, `revoke ID`, and `list`. Newly generated secrets appear only on creation/rotation.
-Share credentials are stored separately in `auth/share-device-passwords.json` and explicitly marked staged:
-**network access unavailable until FEAT-03**. They cannot authenticate against v1, DAV, Nextcloud or Saber, and
-no legacy DAV URL is supplied. Existing legacy hashes/grants/settings are never silently converted or retargeted.
+Share credentials remain stored in `auth/share-device-passwords.json` with staged source records. After publication,
+explicit `credential share activate ID` preserves the ID/hash/scope and makes that selected grant usable on DAV and
+Nextcloud with the exact opaque share ID as Basic/OCS identity. It never becomes a native session or enables Saber.
+Active grants survive creator membership removal/account disable and require explicit revocation; Harmony's service
+credential follows this independent grant model. Upgrade/publication never autoactivates it. Existing legacy
+hashes/grants/Saber settings are never silently converted or retargeted. See the
+[storage, compatibility, activation and recovery runbook](docs/SHARE_STORAGE_AND_MIGRATION.md).
 
 The server and every admin command hold an exclusive lifetime OS lock on the stable `/data/.obsidisync.lock`.
 Competing processes fail before reading stores or starting a listener. Do not delete/replace that lock file.

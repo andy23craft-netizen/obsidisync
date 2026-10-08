@@ -1,6 +1,6 @@
 # FEAT-01: Multi-User Shares and Composite Vault Synchronization
 
-**Status:** Approved for decomposition; implementation not started
+**Status:** Approved for decomposition; FEAT-02 foundation implemented, FEAT-03 through FEAT-05 remain
 **Owner:** Full stack
 **Dependencies:** Implementation tickets FEAT-02 through FEAT-05; Marvin deployment work for the host-local
 administration workflow, production inventory, backup runbook, and maintenance-window migration.
@@ -9,7 +9,7 @@ administration workflow, production inventory, backup runbook, and maintenance-w
 
 ObsidiSync currently isolates data by a URL user namespace and vault slug. It supports multiple vaults
 for one authenticated user, but it cannot safely give two users access to one collection. The built-in
-password login is also a single-account implementation.
+password login supports host-provisioned accounts, but share document routing is not implemented.
 
 The household needs Andy and Liz to use private collections and the shared Harmony collection without
 private filenames, content, history, or metadata becoming visible to the other person. The eventual
@@ -62,9 +62,10 @@ users use an explicit copy/import workflow followed by a separately confirmed de
 - `rust-server/src/nextcloud.rs` provides the limited Nextcloud/Saber compatibility surface. Its login
   flow lists vaults registered in the signed-in user's namespace and its WebDAV routes delegate to the
   same device-password grant handling.
-- `rust-server/src/password_auth.rs` persists exactly one configured username and one Argon2 password
-  hash in `auth/password.json`. Password sessions are issued by `app_session.rs`. OIDC sessions preserve
-  both a normalized display/user name and the OIDC `sub` subject.
+- `rust-server/src/accounts.rs` persists local accounts, shares, and typed membership in `auth/accounts.json`.
+  `password_auth.rs` authenticates those accounts; `app_session.rs` issues typed local-ID sessions while preserving
+  the v1 namespace. OIDC membership uses verified issuer/subject. Share credentials remain staged and unavailable
+  on network routes until explicit activation in FEAT-03.
 - `src/settings.ts` and `src/gitService.ts` persist one `userSlug`, one `vaultSlug`, one `serverHead`, and
   one local manifest for each local Obsidian vault. `src/vaultState.ts` scans and reconciles the whole
   local vault. The current client cannot route prefixes to separate server collections.
@@ -164,6 +165,9 @@ Obsidian clients/configuration, and Harmony integrations. The reviewed mapping, 
 backup, representative fixture rehearsal, stopped-write window, migration validation, one-at-a-time client
 reconciliation, and rollback/recovery procedure are mandatory. This does not block isolated implementation or
 fixture testing. Marvin owns deployment/operations; ObsidiSync owns its application migration behavior/tooling.
+Implement and validate FEAT-03 -> FEAT-04 -> FEAT-05 first, then perform one separately authorized coordinated
+production migration. FEAT-03 defines staged copy, the pending startup barrier, and one publication manifest;
+separate JSON renames are not a multi-file transaction. Unmigrated/excluded vaults remain offline without fallback.
 
 ### Harmony service credential
 
@@ -172,6 +176,9 @@ a dedicated, rotatable and revocable read-write device/service credential for `h
 credential. The credential is limited to the required Harmony folders when the device-password grant supports
 that restriction. Harmony and Marvin own their integration/deployment changes; ObsidiSync provides the
 share-scoped credential and authorization behavior.
+Activation is explicit after publication and preserves staged IDs, hashes, and scopes. Grants are independently
+revocable: creator membership removal/account disable does not revoke them. Inventory surviving grants and revoke
+explicitly; share retirement/deletion always blocks them. Never activate Harmony automatically on upgrade.
 
 ## Proposed Implementation
 
@@ -194,7 +201,7 @@ Proposed records:
 Principal
   id: stable opaque ID
   display/login name: normalized, unique for local accounts
-  kind: local | oidc
+  kind: local | oidc | development
   enabled: boolean
 
 Share
@@ -206,7 +213,10 @@ Share
 ```
 
 For OIDC, verified issuer and `AuthContext.subject` identify the member; the normalized user name remains display data.
-Membership keys distinguish local IDs from OIDC issuer/subject pairs, as specified in FEAT-02. For local
+Membership keys distinguish local IDs from OIDC issuer/subject pairs, as specified in FEAT-02. Every new OIDC
+session stores verified issuer/subject. Legacy issuer-less access/refresh requires fresh OIDC login as an approved
+compatibility exception; never infer its issuer from current configuration. Bound sessions survive restart and
+cannot be reinterpreted after provider changes. Preserve unrelated records, memberships and sync state. For local
 password accounts, create immutable random principal IDs and retain a separately validated login name.
 FEAT-02 imports the legacy password hash and namespace offline without moving vault storage, with a documented
 password-session re-login. It preserves legacy device grants and stages new share credentials without network
@@ -220,6 +230,13 @@ Replace the single-user `PasswordAuth` store with a multi-account store holding 
 state, and no plaintext secrets. Keep generic invalid-login responses and the existing throttling behavior
 to avoid account probing. Do not add password reset or network registration. Preserve OIDC and static
 development token modes, documenting that development tokens are not production household authentication.
+
+Approved development compatibility contract: development authentication resolves to a separate stable
+`development(canonical_configured_user)` principal, never an inferred local/OIDC identity. Only explicitly enabled
+development authentication can establish it. Require explicit share membership/capability and reviewed v1 namespace
+mapping; ordinary revocation, retirement and storage isolation apply. Packaged production defaults explicitly select
+OIDC and cannot select development merely from an injected DEV_TOKEN. Operators may explicitly select dev for local
+fixtures. Preserve mapped writable v1 development sync within these boundaries.
 
 Add an admin binary or explicit server subcommand that operates directly on `OBSIDIAN_GIT_SYNC_DATA_DIR`
 without starting HTTP. It needs account create/disable/list, share create/rename/list, membership grant/
@@ -282,8 +299,8 @@ separate this concern. Shares are created/configured by host-local administratio
 negotiation is a read-capable, non-mutating operation, such as `GET /v2/shares/{shareId}/sync-state`, returning
 the current head and protocol/configuration information necessary for download synchronization. A read-only
 sync path must not create a repository, rewrite share configuration, update device/version metadata, queue a
-conflict, consume an upload, or create a Git commit. It may refresh an already configured upstream internally
-only when that refresh does not create a user-visible revision or metadata record.
+conflict, consume an upload, or create a Git commit. Read-only requests serve current state without upstream
+refresh; authorized write synchronization retains the existing remote refresh behavior.
 
 Writes require `read-write`: upload initialization/chunks/completion, content changes/deletes, conflict
 resolution through writes, mutable version/device metadata, share configuration, and write-capable credential
@@ -295,12 +312,21 @@ Share-specific unavailable responses return `404` to a valid caller. Do not use 
 share labels, activity feeds, timing-dependent storage initialization, or response content to reveal an
 inaccessible share. Keep `401` for authentication failures.
 
-Move device-password records to `{share_id, folder, capability, owner/creator, device metadata}`. Validate
+Share device-password records use `{share_id, folder, capability, owner/creator, device metadata}`. Validate
 that creator membership permits issuing the credential and that a read-only issuer cannot mint write
 credentials. The host-local administrator creates, rotates, and revokes Harmony's distinct read-write grant;
 it is scoped to the `harmony` share and the smallest required folders. Authenticate a device password before
 resolving its share. A device grant routes WebDAV to one share and one allowed folder; it never chooses a user
 namespace from the request URL.
+Preserve legacy grants/URLs/Saber settings against explicit published mappings during compatibility. Share Basic/
+OCS identity is the opaque share ID, with share-ID DAV/Nextcloud URLs as defined in FEAT-03; bearer resolves the same
+grant. Staged records become usable only by explicit activation without secret rotation. Active service/device
+grants are independent of later creator membership; revocation and share retirement are separate controls.
+Preserve Saber solely for explicit legacy mappings in this phase, including vault-wide `#tablet` export within
+the original mapped share. Its background export scope historically exceeds direct DAV folder restrictions.
+Recheck publication/revocation/boundaries in workers and reject traversal/symlink/cross-share references. New
+share-native Saber provisioning and input/source/output scope configuration is deferred to a future feature;
+ordinary share WebDAV grants never implicitly enable Saber.
 
 Update `/dav` and Nextcloud-compatible routes so PROPFIND, GET/HEAD/ranges, PUT, DELETE, MKCOL, MOVE,
 COPY, locks, virtual folders, OCS user lookup, and Saber login flow all operate from that grant. Explicitly
@@ -308,9 +334,12 @@ reject destination shares other than the grant share. The primary API, direct We
 WebDAV must have equivalent authorization behavior.
 
 Version the server capability/API response so upgraded clients know when to use v2. During migration,
-place v1 behind a clearly bounded compatibility mode. Either authorize its `(user, vault)` mapping through
-the new share store or make it read-only; it may not continue to access legacy directories independently.
-Remove v1 write access only after all supported clients and migrations are complete.
+preserve fully writable v1 through reviewed `(user, vault) -> share_id` mappings and the same share storage/locks.
+Native v1 also enforces the original namespace, explicitly authorized typed principal, and current membership;
+membership alone never grants another user's legacy namespace. Preserve registration and existing protocol/client
+state, never infer a label mapping or fall back to old directories. Cutoff requires migrated/reconciled client and
+consumer inventory, verified absence of required v1 activity over a recorded observation interval, and explicit
+operator action. Named exceptions retain their declared scope; no upgrade or timer silently disables v1.
 
 ### Phase 3 / Subtask C: Client share selection and migration
 
@@ -411,8 +440,8 @@ single-user/v1 fixtures must be either migrated or deliberately retained as comp
 #### `README.md`, deployment/migration runbook, and Marvin/Harmony integration documentation
 
 Document account bootstrap, host-local administration, client upgrade order, v1 cutoff, data backup and
-rollback, remote-repository privacy, share creation, device credential reissue, and the authorized Harmony
-access contract. Marvin owns actual deployment edits; Harmony owns document semantics and any consumer
+rollback, remote-repository privacy, share creation, explicit credential activation/reconfiguration, and the
+authorized Harmony access contract. Marvin owns actual deployment edits; Harmony owns document semantics and any consumer
 changes.
 
 ## Security Invariants and Negative Authorization Tests
@@ -424,8 +453,9 @@ The implementation is incomplete until all relevant surfaces test both authorize
 - For an inaccessible share, test sync, uploads/chunks/completion, blob, current and historical file,
   history with and without a path, conflicts, device list, device-version metadata, activity/feed, and
   version metadata. None may reveal private names, hashes, sizes, timestamps, deleted paths, or commits.
-- A non-member cannot create, list, revoke, or authenticate a device credential for the share, nor use a
-  credential created for another share.
+- A non-member's user session cannot create, list, or administer credentials for the share. An explicitly active
+  independent device/service grant may authenticate within its own scope after creator membership removal;
+  credentials never authorize another share or membership administration.
 - Direct and Nextcloud-compatible WebDAV tests cover unauthorized `PROPFIND` at roots/ancestors/depth 0/1,
   GET/HEAD/range, PUT, DELETE, MKCOL, COPY/MOVE source and destination, encoded traversal, and virtual
   Saber paths. No operation crosses a share boundary.
@@ -433,10 +463,10 @@ The implementation is incomplete until all relevant surfaces test both authorize
   sync/manifest, inspect permitted history, and download every needed file/blob. Those calls do not create
   share state or require read-write membership.
 - A read-only member cannot mutate via native sync, WebDAV, conflict resolution, metadata, registration/
-  configuration, upload staging, or device-password issuance. The same denial holds when using a stale client
+  configuration, upload staging, or write-capable device-password issuance. The same denial holds when using a stale client
   that attempts the legacy pre-sync registration sequence.
-- Revocation blocks new requests and token refresh as specified; the documentation states that it cannot
-  erase content already synchronized to a former member's device.
+- Membership revocation blocks subsequent user-session share requests; credential revocation independently blocks
+  grant requests. Account-disable/session expiry follows FEAT-02. Neither erases previously synchronized copies.
 - A private file never appears in Harmony's Git repository, binary manifest/object tree, conflict records,
   device registry, version metadata, or external remote configuration.
 
@@ -452,19 +482,22 @@ The migration tool is an explicit host-local command, not a server-start side ef
    intended principals. No automatic inference from matching vault names.
 4. Run a dry-run that validates source state, target IDs, storage capacity, Git readability, binary manifest
    references, and absence of target collisions. Abort before mutation on any discrepancy.
-5. Execute an atomic-per-share move/copy with a journal. Preserve the repository and associated binary,
-   upload, conflict, device, and version files as one unit. Verify the resulting share head, tracked paths,
-   binary hashes, and metadata counts against the source.
+5. Stage complete copies under the exclusive offline lock and durable pending journal. Preserve repository,
+   binaries, uploads, conflicts, devices/versions, InkVault/Saber state and configuration. Validate before installing
+   roots and committing one publication manifest for the reviewed set, as specified in FEAT-03. Pending or
+   inconsistent publication prevents startup; separate root/JSON renames alone do not provide atomic visibility.
 6. Leave the verified backup and legacy data recoverable until upgraded clients have reconciled successfully.
    Do not delete legacy data as part of the initial migration.
-7. Reissue device passwords by default. If a migration tool can preserve one, require an explicit operator
-   mapping and prove it has no broader scope; never silently retarget it.
+7. Preserve legacy grants/hashes/scopes/URLs/Saber configuration through explicit compatibility mappings. Keep staged
+   share grants inactive until explicit activation, preserving IDs/hashes/scopes. Require supported explicit
+   reconfiguration where lossless preservation is impossible; never silently retarget, rotate, or reissue secrets.
 8. Upgrade/configure clients one at a time. Each user selects the mapped share and uses the existing
    reconciliation flow, with local backup before overwrite-local. Resolve discrepancies manually rather
    than force-pushing over unknown state.
-9. Only after a documented observation period should the operator disable v1 writes and separately archive
-   the legacy tree. Rollback before v1 cutoff restores the `/data` backup and pre-upgrade client settings;
-   after any accepted v2 writes, recovery is a deliberate reconcile/restore operation, not an automatic
+9. Only after verified client/consumer migration and an activity-free documented observation period should the
+   operator explicitly disable the applicable v1 compatibility scope and separately archive
+   the legacy tree. Rollback before resumed writes restores the `/data` backup and pre-upgrade client settings;
+   after any accepted v1/v2/DAV/background writes, recovery is a deliberate reconcile/restore operation, not an automatic
    rollback that could lose newer notes.
 
 ## Testing and Validation

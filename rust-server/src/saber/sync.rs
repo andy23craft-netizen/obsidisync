@@ -127,6 +127,16 @@ impl SaberRenderer {
         grant: &DeviceGrant,
         changed_paths: &[String],
     ) -> Result<RenderReport> {
+        crate::grants::recheck_legacy(&self.vaults, grant).await?;
+        if self.vaults.uses_published_storage() {
+            let publication = self.vaults.publication()?;
+            crate::compatibility::record(
+                &self.vaults.data_dir,
+                publication.mapping(&grant.user, &grant.vault)?,
+                "saber",
+                &grant.id,
+            )?;
+        }
         let settings = grant
             .saber_rendering()
             .ok_or_else(|| anyhow!("device {} has no Saber encryption password", grant.label))?;
@@ -209,6 +219,9 @@ impl SaberRenderer {
 
         let encrypted = self.read_optional(grant, &encrypted_path).await?;
         let Some(encrypted) = encrypted.filter(|bytes| !bytes.is_empty()) else {
+            let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+            let _operation = operations.read().await;
+            crate::grants::recheck_legacy(&self.vaults, grant).await?;
             // Deleted in Saber (or never uploaded): drop the PDF if we made one.
             if self
                 .vaults
@@ -216,6 +229,7 @@ impl SaberRenderer {
                 .await?
                 .is_some()
             {
+                crate::grants::recheck_legacy(&self.vaults, grant).await?;
                 self.vaults
                     .dav_delete(&grant.user, &grant.vault, &pdf_path, &device)
                     .await?;
@@ -254,6 +268,9 @@ impl SaberRenderer {
             .await
             .map_err(|error| anyhow!("render task failed: {error}"))?
             .context("rendering PDF")?;
+        let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+        let _operation = operations.read().await;
+        crate::grants::recheck_legacy(&self.vaults, grant).await?;
         self.vaults
             .dav_write(&grant.user, &grant.vault, &pdf_path, pdf, &device)
             .await
@@ -262,12 +279,16 @@ impl SaberRenderer {
     }
 
     async fn read_optional(&self, grant: &DeviceGrant, path: &str) -> Result<Option<Vec<u8>>> {
+        let operations = crate::grants::operation_lock(&self.vaults.data_dir);
+        let _operation = operations.read().await;
+        crate::grants::recheck_legacy(&self.vaults, grant).await?;
         match self
             .vaults
             .dav_stat(&grant.user, &grant.vault, path)
             .await?
         {
             Some(entry) if !entry.is_dir => {
+                crate::grants::recheck_legacy(&self.vaults, grant).await?;
                 let (_, content) = self
                     .vaults
                     .dav_read(&grant.user, &grant.vault, path)
@@ -291,6 +312,9 @@ pub async fn load_cipher(
     grant: &DeviceGrant,
     password: &str,
 ) -> Result<Option<SaberCipher>> {
+    let operations = crate::grants::operation_lock(&vaults.data_dir);
+    let _operation = operations.read().await;
+    crate::grants::recheck_legacy(vaults, grant).await?;
     let config_path = format!("{}/{CONFIG_FILE_NAME}", grant.folder);
     let exists = vaults
         .dav_stat(&grant.user, &grant.vault, &config_path)
@@ -299,6 +323,7 @@ pub async fn load_cipher(
     if !exists {
         return Ok(None);
     }
+    crate::grants::recheck_legacy(vaults, grant).await?;
     let (_, config) = vaults
         .dav_read(&grant.user, &grant.vault, &config_path)
         .await?;

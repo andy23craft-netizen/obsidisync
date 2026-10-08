@@ -104,15 +104,24 @@ pub fn validate_vault_path(input: &str) -> Result<String> {
 
 pub fn repo_path(repo_root: &Path, vault_path: &str) -> Result<PathBuf> {
     let safe = validate_vault_path(vault_path)?;
-    let root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    let absolute = root.join(safe);
-    if absolute.starts_with(&root) || !root.exists() {
-        Ok(absolute)
-    } else {
-        Err(anyhow!("unsafe vault path: {vault_path}"))
+    let absolute = repo_root.join(safe);
+    reject_storage_links(&absolute)?;
+    Ok(absolute)
+}
+
+/// Fail closed even on dangling links and symlinked ancestors of a not-yet-created file.
+pub fn reject_storage_links(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(info) if info.file_type().is_symlink() => {
+                return Err(anyhow!("unsafe storage link"))
+            }
+            Ok(_) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
     }
+    Ok(())
 }
 
 pub fn is_text_or_code_path(path: &str) -> bool {

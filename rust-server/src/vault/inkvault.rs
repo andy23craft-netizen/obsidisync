@@ -96,8 +96,8 @@ impl VaultService {
         resolving: bool,
     ) -> Result<SyncResponse> {
         let _slot = PUBLICATION_SLOT.acquire().await?;
-        let repo = self.repo_dir(user, vault);
-        let binary = self.binary_dir(user, vault);
+        let repo = self.repo_dir(user, vault)?;
+        let binary = self.binary_dir(user, vault)?;
         let state = self.read_state(user, vault).await?;
         self.configure_git(&repo, &state).await?;
         // Never text-merge the ledger. A remote divergence requires explicit reconciliation.
@@ -192,7 +192,7 @@ impl VaultService {
                 } => {
                     let content = self
                         .content_from_inline_or_upload(
-                            &self.upload_dir(user, vault),
+                            &self.upload_dir(user, vault)?,
                             path,
                             content_base64.as_ref(),
                             upload_id.as_ref(),
@@ -497,7 +497,7 @@ impl VaultService {
                 }
                 manifest["renderRevision"] = Value::String(format!("{:x}", digest.finalize()));
                 files.insert(manifest_path.clone(), serde_json::to_vec(&manifest)?);
-                let status_path = self.vault_dir(user, vault).join("inkvault-render.json");
+                let status_path = self.vault_dir(user, vault)?.join("inkvault-render.json");
                 durable_write(&status_path,&serde_json::to_vec(&serde_json::json!({"documentId":manifest["documentId"],"sourceRevision":manifest["sourceRevision"],"status":"pending"}))?).await?;
                 let render_manifest = manifest.clone();
                 let render_files = files.clone();
@@ -579,8 +579,8 @@ impl VaultService {
         vault: &str,
         manifest: BinaryManifest,
     ) -> Result<()> {
-        let repo = self.repo_dir(user, vault);
-        let dir = self.vault_dir(user, vault);
+        let repo = self.repo_dir(user, vault)?;
+        let dir = self.vault_dir(user, vault)?;
         let old_head = self.head_from_repo(&repo).await?;
         let index = dir.join("inkvault-index");
         let _ = fs::remove_file(&index).await;
@@ -646,7 +646,7 @@ impl VaultService {
 
     pub(super) async fn recover_inkvault(&self, user: &str, vault: &str) -> Result<()> {
         let path = self
-            .vault_dir(user, vault)
+            .vault_dir(user, vault)?
             .join("inkvault-publication.json");
         let bytes = match fs::read(&path).await {
             Ok(b) => b,
@@ -654,7 +654,7 @@ impl VaultService {
             Err(e) => return Err(e.into()),
         };
         let publication: Publication = serde_json::from_slice(&bytes)?;
-        let repo = self.repo_dir(user, vault);
+        let repo = self.repo_dir(user, vault)?;
         validate_commit_id(&publication.new_head)?;
         ensure!(
             self.binary_manifest_at(&repo, &publication.new_head)
@@ -693,7 +693,7 @@ impl VaultService {
         )
         .await?;
         durable_write(
-            &self.vault_dir(user, vault).join("inkvault-render.json"),
+            &self.vault_dir(user, vault)?.join("inkvault-render.json"),
             &serde_json::to_vec(
                 &serde_json::json!({"status":"ready","serverHead":publication.new_head}),
             )?,
@@ -706,6 +706,7 @@ impl VaultService {
 }
 
 pub(crate) async fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::paths::reject_storage_links(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }

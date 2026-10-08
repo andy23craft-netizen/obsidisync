@@ -21,7 +21,369 @@ const BEARER: &str = "Bearer secret";
 const ENC_PASSWORD: &str = "correct horse";
 const IV: [u8; 16] = [9; 16];
 
+#[tokio::test]
+async fn published_legacy_saber_preserves_rendering_export_scope_and_revocation() {
+    use obsidian_git_sync_server::accounts::{AccountStore, Capability, Membership, Principal};
+    use obsidian_git_sync_server::publication::{Mapping, Publication};
+    use obsidian_git_sync_server::vault::{UploadLimits, VaultServiceOptions};
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("data");
+    let mut accounts = AccountStore::default();
+    let account = accounts
+        .create_account("alice", "synthetic-fixture-password-123")
+        .unwrap();
+    let share = accounts.create_share("Synthetic legacy Saber").unwrap();
+    let other = accounts.create_share("Other private fixture").unwrap();
+    let principal = Principal::Local {
+        account_id: account,
+    };
+    accounts.shares[0].members.push(Membership {
+        principal: principal.clone(),
+        capability: Capability::ReadWrite,
+    });
+    accounts.save(&root).unwrap();
+    obsidian_git_sync_server::migration::initialize(&root).unwrap();
+    let setup = fixture.path().join("setup.json");
+    std::fs::write(&setup, serde_json::to_vec(&serde_json::json!({"registration":{
+        "remoteUrl":"","branch":"main","authorName":"Synthetic","authorEmail":"fixture@example.invalid"},
+        "mapping": Mapping { user:"alice".into(),vault:"notes".into(),share_id:share.clone(),
+            principals:vec![principal],native_enabled:true,dav_enabled:true }})).unwrap()).unwrap();
+    obsidian_git_sync_server::admin::execute(
+        &root,
+        &["share", "setup", &share, setup.to_str().unwrap()].map(String::from),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(
+        VaultService::published(VaultServiceOptions {
+            data_dir: root.clone(),
+            remote_policy: Default::default(),
+            upload_limits: UploadLimits::default(),
+        }),
+        AuthVerifier::password(String::new(), &root).unwrap(),
+        PublicAuthConfig::Password,
+    )
+    .with_saber_render_delay(Duration::ZERO);
+    let app = app(&state);
+    let password = saber_password(&state, ENC_PASSWORD).await;
+    let auth = basic("alice", &password);
+    let cipher = cipher();
+    assert_eq!(
+        put_saber_file(&app, &auth, "config.sbc", config_sbc(&cipher)).await,
+        StatusCode::CREATED
+    );
+    let note_name = cipher.encrypt_file_name("/Legacy.sbn2");
+    assert_eq!(
+        put_saber_file(
+            &app,
+            &auth,
+            &note_name,
+            cipher.encrypt(&sample_note_bytes())
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    state.saber.wait_idle().await;
+    let (_, pdf) = state
+        .vaults
+        .dav_read("alice", "notes", "Tablet/Legacy.pdf")
+        .await
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF-1."));
+    state
+        .vaults
+        .prepare_share(
+            &other,
+            RegisterRequest {
+                remote_url: String::new(),
+                branch: "main".into(),
+                author_name: "Synthetic".into(),
+                author_email: "fixture@example.invalid".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut publication = Publication::load(&root).unwrap();
+    publication.published.push(other.clone());
+    publication.generation += 1;
+    publication.save(&root).unwrap();
+    let private_repo = root.join("shares").join(&other).join("repo");
+    std::fs::write(private_repo.join("secret.pdf"), &pdf).unwrap();
+    std::fs::write(private_repo.join("private.md"), b"#tablet\n![[secret.pdf]]").unwrap();
+    obsidian_git_sync_server::git::git(Some(&private_repo), &["add", "-A"], &[0])
+        .await
+        .unwrap();
+    let device = state
+        .device_passwords
+        .authenticate_published(Some("alice"), &password)
+        .await
+        .unwrap()
+        .dav_device();
+    state
+        .vaults
+        .dav_write("alice", "notes", "OutsideDav/source.pdf", pdf, &device)
+        .await
+        .unwrap();
+    state
+        .vaults
+        .dav_write(
+            "alice",
+            "notes",
+            "Elsewhere/export.md",
+            b"#tablet\n![[OutsideDav/source.pdf]]\n![[../../outside-secret.pdf]]".to_vec(),
+            &device,
+        )
+        .await
+        .unwrap();
+    let report = state.tablet.run("alice", "notes", &[]).await.unwrap();
+    assert_eq!(report.pushed, vec!["OutsideDav/source.pdf"]);
+    let exported = cipher.encrypt_file_name("/OutsideDav/source.sbn2");
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/remote.php/webdav/Saber/{exported}"),
+            Some(&auth),
+            &[],
+            vec![]
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(!root.join("users").exists());
+    assert!(root.join("shares").join(&other).exists());
+    let private_export = cipher.encrypt_file_name("/secret.sbn2");
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/remote.php/webdav/Saber/{private_export}"),
+            Some(&auth),
+            &[],
+            vec![]
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut share_grants = obsidian_git_sync_server::share_credentials::Store::load(&root).unwrap();
+    let (plain_id, plain_secret) = share_grants
+        .create(
+            &accounts,
+            &share,
+            accounts.shares[0].members[0].principal.clone(),
+            "Tablet/.sync",
+            Capability::ReadWrite,
+            "Synthetic plain DAV",
+        )
+        .unwrap();
+    share_grants.save(&root).unwrap();
+    obsidian_git_sync_server::admin::execute(
+        &root,
+        &["credential", "share", "activate", &plain_id].map(String::from),
+    )
+    .await
+    .unwrap();
+    let plain_auth = basic(&share, &plain_secret);
+    let plain_note = cipher.encrypt_file_name("/Plain.sbn2");
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            &format!("/remote.php/dav/files/{share}/Tablet/.sync/{plain_note}"),
+            Some(&plain_auth),
+            &[],
+            cipher.encrypt(&sample_note_bytes())
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    state.saber.wait_idle().await;
+    assert!(state
+        .vaults
+        .dav_stat("alice", "notes", "Tablet/Plain.pdf")
+        .await
+        .unwrap()
+        .is_none());
+    accounts.accounts[0].enabled = false;
+    accounts.shares[0].members.clear();
+    accounts.save(&root).unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/remote.php/webdav/Saber/config.sbc",
+            Some(&auth),
+            &[],
+            vec![]
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_saber_file(
+            &app,
+            &auth,
+            &note_name,
+            cipher.encrypt(&sample_note_bytes())
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    state.saber.wait_idle().await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let outside = fixture.path().join("private.md");
+        std::fs::write(&outside, "private synthetic contents").unwrap();
+        symlink(
+            &outside,
+            root.join("shares").join(&share).join("repo/escaped.md"),
+        )
+        .unwrap();
+        assert!(state
+            .vaults
+            .dav_read("alice", "notes", "escaped.md")
+            .await
+            .is_err());
+        let grant = state
+            .device_passwords
+            .authenticate_published(Some("alice"), &password)
+            .await
+            .unwrap();
+        let encrypted_outside = fixture.path().join("outside-encrypted-note");
+        std::fs::write(&encrypted_outside, cipher.encrypt(&sample_note_bytes())).unwrap();
+        let escaped_note = cipher.encrypt_file_name("/Symlink.sbn2");
+        std::fs::create_dir_all(root.join("shares").join(&share).join("repo/Tablet/.sync"))
+            .unwrap();
+        symlink(
+            &encrypted_outside,
+            root.join("shares")
+                .join(&share)
+                .join("repo/Tablet/.sync")
+                .join(&escaped_note),
+        )
+        .unwrap();
+        let report = state
+            .saber
+            .render_paths(&grant, &[format!("Tablet/.sync/{escaped_note}")])
+            .await
+            .unwrap();
+        assert!(report.rendered.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(!root
+            .join("shares")
+            .join(&share)
+            .join("repo/Tablet/Symlink.pdf")
+            .exists());
+        // A tagged link to a source symlink must fail before reading or exporting its target.
+        let outside_pdf = private_repo.join("secret.pdf");
+        symlink(
+            &outside_pdf,
+            root.join("shares").join(&share).join("repo/escaped.pdf"),
+        )
+        .unwrap();
+        obsidian_git_sync_server::git::git(
+            Some(&root.join("shares").join(&share).join("repo")),
+            &["add", "--", "escaped.pdf"],
+            &[0],
+        )
+        .await
+        .unwrap();
+        // Direct fixture bytes avoid writing through the forbidden link while setting up the attack.
+        std::fs::write(
+            root.join("shares")
+                .join(&share)
+                .join("repo/Elsewhere/export.md"),
+            b"#tablet\n![[escaped.pdf]]\n![[../../outside-private.pdf]]",
+        )
+        .unwrap();
+        let result = state
+            .tablet
+            .run("alice", "notes", &["Elsewhere/export.md".into()])
+            .await;
+        if let Ok(report) = result {
+            assert!(!report.failed.is_empty());
+            assert!(report.pushed.is_empty());
+        }
+        let export = cipher.encrypt_file_name("/escaped.sbn2");
+        assert!(!root
+            .join("shares")
+            .join(&share)
+            .join("repo/Tablet/.sync")
+            .join(export)
+            .exists());
+    }
+    let grant = state
+        .device_passwords
+        .authenticate_published(Some("alice"), &password)
+        .await
+        .unwrap();
+    let delayed = state
+        .clone()
+        .with_saber_render_delay(Duration::from_millis(50));
+    let delayed_app = router(delayed.clone(), 1024 * 1024, vec![]);
+    let queued_note = cipher.encrypt_file_name("/Queued.sbn2");
+    assert_eq!(
+        put_saber_file(
+            &delayed_app,
+            &auth,
+            &queued_note,
+            cipher.encrypt(&sample_note_bytes())
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    delayed
+        .tablet
+        .schedule("alice", "notes", vec!["Elsewhere/export.md".into()]);
+    assert!(state
+        .device_passwords
+        .revoke("alice", "notes", &grant.id)
+        .await
+        .unwrap());
+    delayed.saber.wait_idle().await;
+    delayed.tablet.wait_idle().await;
+    assert!(state
+        .vaults
+        .dav_stat("alice", "notes", "Tablet/Queued.pdf")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(state
+        .saber
+        .render_paths(&grant, &[format!("Tablet/.sync/{note_name}")])
+        .await
+        .is_err());
+    assert!(state
+        .tablet
+        .run("alice", "notes", &[])
+        .await
+        .unwrap()
+        .pushed
+        .is_empty());
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/remote.php/webdav/Saber/config.sbc",
+            Some(&auth),
+            &[],
+            vec![]
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    Publication::load(&root).unwrap().validate(&root).unwrap();
+}
+
+mod common;
 fn state(root: &std::path::Path) -> AppState {
+    common::initialize(&root.join("data"));
     AppState::new(
         VaultService::new(root.join("data")),
         AuthVerifier::StaticTokenForDev {
@@ -37,7 +399,16 @@ fn app(state: &AppState) -> axum::Router {
     router(state.clone(), 1024 * 1024, Vec::new())
 }
 
-async fn register(app: &axum::Router) {
+async fn register(app: &axum::Router, state: &AppState) {
+    common::publish_legacy(
+        &state.vaults.data_dir,
+        "alice",
+        "notes",
+        obsidian_git_sync_server::accounts::Principal::Development {
+            user: "alice".into(),
+        },
+    )
+    .await;
     let response = app
         .clone()
         .oneshot(
@@ -228,7 +599,7 @@ async fn login_flow_issues_a_saber_device_password() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
 
     let response = request(
         &app,
@@ -466,7 +837,7 @@ async fn webdav_exposes_the_granted_folder_as_saber() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
     let password = saber_password(&state, "").await;
     let auth = basic("alice", &password);
 
@@ -546,7 +917,7 @@ async fn webdav_exposes_the_granted_folder_as_saber() {
         vec![],
     )
     .await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let response = request(&app, "PROPFIND", "/remote.php/webdav/", None, &[], vec![]).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
@@ -565,7 +936,7 @@ async fn encrypted_notes_become_pdfs_and_deletions_remove_them() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
     let password = saber_password(&state, ENC_PASSWORD).await;
     let auth = basic("alice", &password);
     let cipher = cipher();
@@ -678,7 +1049,7 @@ async fn wrong_encryption_password_stores_files_without_rendering() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
     let password = saber_password(&state, "not the password").await;
     let auth = basic("alice", &password);
     let cipher = cipher();
@@ -734,7 +1105,7 @@ async fn saber_pdf_folder_must_not_overlap_sync_folder() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
     let error = state
         .device_passwords
         .create_saber(
@@ -757,10 +1128,20 @@ async fn password_mode_sends_the_browser_through_login_and_back() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let mut accounts = obsidian_git_sync_server::accounts::AccountStore::default();
-    accounts
+    let account = accounts
         .create_account("alice", "correct-horse-battery-staple")
         .unwrap();
     accounts.save(&data_dir).unwrap();
+    obsidian_git_sync_server::migration::initialize(&data_dir).unwrap();
+    common::publish_legacy(
+        &data_dir,
+        "alice",
+        "notes",
+        obsidian_git_sync_server::accounts::Principal::Local {
+            account_id: account,
+        },
+    )
+    .await;
     let state = AppState::new(
         VaultService::new(data_dir.clone()),
         AuthVerifier::password("alice".to_string(), data_dir).unwrap(),
@@ -1095,7 +1476,7 @@ async fn tagged_notes_push_their_pdfs_into_saber() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let app = app(&state);
-    register(&app).await;
+    register(&app, &state).await;
     let password = saber_password(&state, ENC_PASSWORD).await;
     let auth = basic("alice", &password);
     let cipher = cipher();

@@ -60,18 +60,19 @@ impl VaultService {
         else {
             return false;
         };
-        fs::metadata(self.vault_dir(&user, &vault).join("state.json"))
-            .await
-            .is_ok()
+        let Ok(root) = self.vault_dir(&user, &vault) else {
+            return false;
+        };
+        fs::metadata(root.join("state.json")).await.is_ok()
     }
 
     pub async fn dav_stat(&self, user: &str, vault: &str, path: &str) -> Result<Option<DavEntry>> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let path = validate_dav_path(path)?;
-        self.with_lock(&user, &vault, || async {
+        self.with_read_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             stat_unlocked(&repo, &manifest, &path).await
         })
@@ -82,9 +83,9 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let dir = validate_dav_path(dir)?;
-        self.with_lock(&user, &vault, || async {
+        self.with_read_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             list_unlocked(&repo, &manifest, &dir).await
         })
@@ -100,9 +101,9 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let path = validate_dav_path(path)?;
-        self.with_lock(&user, &vault, || async {
+        self.with_read_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             let entry = stat_unlocked(&repo, &manifest, &path)
                 .await?
@@ -111,7 +112,9 @@ impl VaultService {
                 bail!("not found: {path} is a directory");
             }
             let content = match manifest.files.get(&path) {
-                Some(binary) => read_binary_object(&self.binary_dir(&user, &vault), binary).await?,
+                Some(binary) => {
+                    read_binary_object(&self.binary_dir(&user, &vault)?, binary).await?
+                }
                 None => fs::read(repo_path(&repo, &path)?).await?,
             };
             Ok((entry, content))
@@ -123,9 +126,9 @@ impl VaultService {
     pub async fn list_tracked_paths(&self, user: &str, vault: &str) -> Result<Vec<String>> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
-        self.with_lock(&user, &vault, || async {
+        self.with_read_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             let mut paths: Vec<String> = if fs::metadata(repo.join(".git")).await.is_ok() {
                 split_nul(&git(Some(&repo), &["ls-files", "-z"], &[0]).await?.stdout)
@@ -153,7 +156,7 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         self.read_registered_state(&user, &vault).await?;
-        let upload_dir = self.upload_dir(&user, &vault);
+        let upload_dir = self.upload_dir(&user, &vault)?;
         fs::create_dir_all(&upload_dir).await?;
         let staged = upload_dir.join(format!("dav-{}.bin", random_upload_id()?));
         fs::write(&staged, []).await?;
@@ -172,9 +175,9 @@ impl VaultService {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let path = validate_dav_path(path)?;
-        self.with_lock(&user, &vault, || async {
+        self.with_read_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             Ok(stat_unlocked(&repo, &manifest, &path)
                 .await?
@@ -280,11 +283,11 @@ impl VaultService {
         }
         self.with_lock(&user, &vault, || async {
             let state = self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
-            let binary_root = self.binary_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
+            let binary_root = self.binary_dir(&user, &vault)?;
             self.guard_inkvault_paths(
                 &repo,
-                &self.binary_dir(&user, &vault),
+                &self.binary_dir(&user, &vault)?,
                 std::slice::from_ref(&path),
             )
             .await?;
@@ -348,10 +351,10 @@ impl VaultService {
         }
         self.with_lock(&user, &vault, || async {
             let state = self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             self.guard_inkvault_paths(
                 &repo,
-                &self.binary_dir(&user, &vault),
+                &self.binary_dir(&user, &vault)?,
                 std::slice::from_ref(&path),
             )
             .await?;
@@ -393,7 +396,7 @@ impl VaultService {
         }
         self.with_lock(&user, &vault, || async {
             self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
             let manifest = read_manifest(&repo).await?;
             if stat_unlocked(&repo, &manifest, &path).await?.is_some() {
                 bail!("exists: {path}");
@@ -431,11 +434,11 @@ impl VaultService {
         }
         self.with_lock(&user, &vault, || async {
             let state = self.read_registered_state(&user, &vault).await?;
-            let repo = self.repo_dir(&user, &vault);
-            let binary_root = self.binary_dir(&user, &vault);
+            let repo = self.repo_dir(&user, &vault)?;
+            let binary_root = self.binary_dir(&user, &vault)?;
             self.guard_inkvault_paths(
                 &repo,
-                &self.binary_dir(&user, &vault),
+                &self.binary_dir(&user, &vault)?,
                 &[from.clone(), to.clone()],
             )
             .await?;
@@ -514,7 +517,7 @@ impl VaultService {
     }
 
     async fn read_registered_state(&self, user: &str, vault: &str) -> Result<VaultState> {
-        match fs::read(self.vault_dir(user, vault).join("state.json")).await {
+        match fs::read(self.vault_dir(user, vault)?.join("state.json")).await {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 bail!("not found: vault {vault} is not registered")

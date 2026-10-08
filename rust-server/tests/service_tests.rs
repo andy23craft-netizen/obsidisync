@@ -26,7 +26,7 @@ async fn password_mode_get_login_on_fresh_storage_requires_offline_account() {
     let data_dir = root.path().join("data");
     let app = router(
         AppState::new(
-            VaultService::new(data_dir.clone()),
+            VaultService::legacy_for_fixture(data_dir.clone()),
             AuthVerifier::password_with_setup_token(
                 "Alice@example.com".to_string(),
                 data_dir,
@@ -121,7 +121,7 @@ async fn server_info_reports_api_compatibility() {
     let root = tempfile::tempdir().unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(root.path().join("data")),
+            VaultService::legacy_for_fixture(root.path().join("data")),
             AuthVerifier::StaticTokenForDev {
                 token: "secret".to_string(),
                 user: "alice".to_string(),
@@ -161,7 +161,7 @@ async fn http_authorization_rejects_cross_user_access() {
     let root = tempfile::tempdir().unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(root.path().join("data")),
+            VaultService::legacy_for_fixture(root.path().join("data")),
             AuthVerifier::StaticTokenForDev {
                 token: "secret".to_string(),
                 user: "alice".to_string(),
@@ -216,7 +216,7 @@ async fn password_auth_page_login_and_authorizes_api_requests() {
     accounts.save(&data_dir).unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(data_dir.clone()),
+            VaultService::legacy_for_fixture(data_dir.clone()),
             AuthVerifier::password("Alice@example.com".to_string(), data_dir).unwrap(),
             PublicAuthConfig::Password,
         ),
@@ -573,7 +573,7 @@ async fn password_setup_is_retired_even_with_bootstrap_token() {
     let data_dir = root.path().join("data");
     let app = router(
         AppState::new(
-            VaultService::new(data_dir.clone()),
+            VaultService::legacy_for_fixture(data_dir.clone()),
             AuthVerifier::password_with_setup_token(
                 "Alice@example.com".to_string(),
                 data_dir,
@@ -655,7 +655,7 @@ async fn password_endpoints_are_disabled_outside_password_mode() {
     let data_dir = root.path().join("data");
     let app = router(
         AppState::new(
-            VaultService::new(data_dir.clone()),
+            VaultService::legacy_for_fixture(data_dir.clone()),
             AuthVerifier::password("Alice@example.com".to_string(), data_dir).unwrap(),
             PublicAuthConfig::Token,
         ),
@@ -708,7 +708,7 @@ async fn http_rejects_oversized_sync_bodies() {
     let root = tempfile::tempdir().unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(root.path().join("data")),
+            VaultService::legacy_for_fixture(root.path().join("data")),
             AuthVerifier::StaticTokenForDev {
                 token: "secret".to_string(),
                 user: "alice".to_string(),
@@ -739,7 +739,7 @@ async fn http_does_not_allow_cross_origin_by_default() {
     let root = tempfile::tempdir().unwrap();
     let app = router(
         AppState::new(
-            VaultService::new(root.path().join("data")),
+            VaultService::legacy_for_fixture(root.path().join("data")),
             AuthVerifier::StaticTokenForDev {
                 token: "secret".to_string(),
                 user: "alice".to_string(),
@@ -771,7 +771,7 @@ async fn http_does_not_allow_cross_origin_by_default() {
 #[tokio::test]
 async fn production_service_rejects_local_git_remotes() {
     let fixture = GitFixture::new().await;
-    let service = VaultService::new(fixture.root.path().join("data"));
+    let service = VaultService::legacy_for_fixture(fixture.root.path().join("data"));
     let error = service
         .register(USER, VAULT, register_request(&fixture.remote))
         .await
@@ -783,7 +783,7 @@ async fn production_service_rejects_local_git_remotes() {
 async fn syncs_without_remote_using_persistent_server_local_repo() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = root.path().join("data");
-    let service = VaultService::new(data_dir.clone());
+    let service = VaultService::legacy_for_fixture(data_dir.clone());
 
     let registration = service
         .register(USER, VAULT, local_register_request())
@@ -816,7 +816,7 @@ async fn syncs_without_remote_using_persistent_server_local_repo() {
         .stdout
         .is_empty());
 
-    let restarted = VaultService::new(data_dir);
+    let restarted = VaultService::legacy_for_fixture(data_dir);
     let registration_after_restart = restarted
         .register(USER, VAULT, local_register_request())
         .await
@@ -844,7 +844,7 @@ async fn syncs_without_remote_using_persistent_server_local_repo() {
 #[tokio::test]
 async fn syncs_upserts_from_chunked_uploads() {
     let root = tempfile::tempdir().unwrap();
-    let service = VaultService::new(root.path().join("data"));
+    let service = VaultService::legacy_for_fixture(root.path().join("data"));
     service
         .register(USER, VAULT, local_register_request())
         .await

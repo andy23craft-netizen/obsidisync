@@ -50,6 +50,8 @@ pub enum MountLayout {
     Vault,
     /// `{prefix}/Saber/...` maps straight onto the granted folder; nothing else exists.
     VirtualFolder,
+    /// Share-native Nextcloud mounts use `{prefix}/{folder}/...` without a vault segment.
+    ShareFolder,
 }
 
 impl Mount {
@@ -256,15 +258,7 @@ pub async fn authenticate_device(
     if let Some(retry_after) = state.webdav_throttle.blocked_for(&throttle_keys).await {
         return Err(DavError::too_many_requests(retry_after));
     }
-    let result = match &username {
-        Some(username) => {
-            state
-                .device_passwords
-                .authenticate(username, &password)
-                .await
-        }
-        None => state.device_passwords.authenticate_bearer(&password).await,
-    };
+    let result = crate::grants::authenticate(state, username.as_deref(), &password).await;
     match result {
         Ok(grant) => {
             state.webdav_throttle.record_success(&throttle_keys).await;
@@ -295,10 +289,42 @@ async fn handle_inner(
         return Ok(options_response());
     }
 
+    let operations = crate::grants::operation_lock(&state.vaults.data_dir);
+    let _operation = operations.read().await;
     let grant = authenticate_device(state, headers, client_ip).await?;
 
+    let mut scoped = state.clone();
+    let mut scoped_mount = mount.clone();
+    if state.vaults.uses_published_storage() {
+        let (share, capability, share_native) = crate::grants::share_id(state, &grant)?;
+        if let Some(identity) = mount.prefix.strip_prefix("/remote.php/dav/files/") {
+            let identity = percent_encoding::percent_decode_str(identity)
+                .decode_utf8()
+                .map_err(|_| DavError::bad_request("invalid URL identity"))?;
+            let matches = if share_native {
+                identity == grant.user
+            } else {
+                crate::auth::normalize_user_claim(&identity).is_ok_and(|user| user == grant.user)
+            };
+            if !matches {
+                return Err(DavError::not_found());
+            }
+        }
+        if share_native && mount.layout == MountLayout::VirtualFolder {
+            scoped_mount.layout = MountLayout::ShareFolder;
+        }
+        if !matches!(method.as_str(), "PROPFIND" | "GET" | "HEAD" | "OPTIONS")
+            && capability != crate::accounts::Capability::ReadWrite
+        {
+            return Err(DavError::forbidden("forbidden: capability"));
+        }
+        scoped.vaults = state.vaults.for_share(&share)?;
+    }
+    let state = &scoped;
+    let mount = &scoped_mount;
+
     let segments = decode_path_segments(uri.path(), &mount.prefix)?;
-    let target = resolve_target(mount, &grant, &segments)?;
+    let target = authorized_target(state, mount, &grant, &segments)?;
 
     match method.as_str() {
         "PROPFIND" => propfind(state, mount, &grant, &target, headers).await,
@@ -450,6 +476,21 @@ fn decode_path_segments(raw_path: &str, prefix: &str) -> Result<Vec<String>, Dav
     Ok(segments)
 }
 
+fn authorized_target(
+    state: &AppState,
+    mount: &Mount,
+    grant: &DeviceGrant,
+    segments: &[String],
+) -> Result<Target, DavError> {
+    resolve_target(mount, grant, segments).map_err(|error| {
+        if state.vaults.uses_published_storage() && error.status == StatusCode::FORBIDDEN {
+            DavError::not_found()
+        } else {
+            error
+        }
+    })
+}
+
 fn resolve_target(
     mount: &Mount,
     grant: &DeviceGrant,
@@ -458,18 +499,22 @@ fn resolve_target(
     if mount.layout == MountLayout::VirtualFolder {
         return resolve_virtual_folder_target(mount, grant, segments);
     }
-    let Some(vault) = segments.first() else {
-        return Ok(Target::Ancestor {
-            href: format!("{}/", mount.prefix),
-            name: "dav".to_string(),
-            child_name: grant.vault.clone(),
-            child_href: href_for(mount, grant, "", true),
-        });
+    let relative = if mount.layout == MountLayout::ShareFolder {
+        segments.join("/")
+    } else {
+        let Some(vault) = segments.first() else {
+            return Ok(Target::Ancestor {
+                href: format!("{}/", mount.prefix),
+                name: "dav".to_string(),
+                child_name: grant.vault.clone(),
+                child_href: href_for(mount, grant, "", true),
+            });
+        };
+        if vault != &grant.vault {
+            return Err(DavError::forbidden("forbidden: vault is not accessible"));
+        }
+        segments[1..].join("/")
     };
-    if vault != &grant.vault {
-        return Err(DavError::forbidden("forbidden: vault is not accessible"));
-    }
-    let relative = segments[1..].join("/");
     let folder = grant.folder.as_str();
     if relative == folder || relative.starts_with(&format!("{folder}/")) {
         return Ok(Target::Inside { path: relative });
@@ -535,6 +580,7 @@ fn resolve_virtual_folder_target(
 fn href_for(mount: &Mount, grant: &DeviceGrant, path: &str, is_dir: bool) -> String {
     let mut href = mount.prefix.clone();
     let relative: &str = match mount.layout {
+        MountLayout::ShareFolder => path,
         MountLayout::Vault => {
             href.push('/');
             href.push_str(&encode_path_segment(&grant.vault));
@@ -788,7 +834,10 @@ async fn get(
 /// Parses a single-range `Range: bytes=...` header into an inclusive `(start, end)`.
 /// Malformed or multi-range headers are ignored (the whole file is served, as RFC 9110 allows);
 /// syntactically valid ranges that fall outside the file are rejected with 416.
-fn parse_range(value: Option<&HeaderValue>, total: u64) -> Result<Option<(u64, u64)>, DavError> {
+pub(crate) fn parse_range(
+    value: Option<&HeaderValue>,
+    total: u64,
+) -> Result<Option<(u64, u64)>, DavError> {
     let Some(spec) = value
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().strip_prefix("bytes="))
@@ -1036,7 +1085,7 @@ async fn move_or_copy(
         .ok_or_else(|| DavError::bad_request("Destination header is required"))?;
     let destination_path = destination_request_path(destination)?;
     let segments = decode_path_segments(&destination_path, &mount.prefix)?;
-    let to = match resolve_target(mount, grant, &segments)? {
+    let to = match authorized_target(state, mount, grant, &segments)? {
         Target::Inside { path } => path,
         Target::Ancestor { .. } => {
             return Err(DavError::forbidden(
