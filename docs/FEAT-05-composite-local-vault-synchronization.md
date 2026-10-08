@@ -4,7 +4,8 @@
 **Owner:** Obsidian plugin
 **Parent:** [FEAT-01](FEAT-01-multi-user-shares-and-composite-vault-sync.md)
 **Dependencies:** [FEAT-04](FEAT-04-client-share-selection-and-migration.md) - hard dependency; FEAT-03 share
-authorization remains a runtime prerequisite.
+authorization is implemented; its binding runtime contracts are in
+[Share storage and migration](SHARE_STORAGE_AND_MIGRATION.md).
 
 ## Problem
 
@@ -32,6 +33,20 @@ status, and retry. Local routing never weakens the server share boundary.
   then separately confirmed source deletion; retain both copies after partial failure.
 - Preserve Markdown link text; links grant no access and are not rewritten. Attachments follow their local mount.
 - Work through Obsidian's adapter on iOS/iPadOS/macOS without symlinks, union mounts, or desktop-only setup.
+
+## State Migration and Server Constraints
+
+FEAT-04's selected-share state is a prerequisite, not current composite functionality. Convert it only through
+explicit user-chosen prefixes and per-mount reconciliation. Preserve prior settings/head/manifest and local files
+until successful conversion; never infer share identity from Personal/Harmony labels. Back up before overwrite-local.
+
+Keep capability, pending upload/conflict/recovery and retry state isolated per mount. Membership loss, expired login,
+unpublished/retired share or credential revocation must not reset another mount or delete existing local copies.
+Do not fall back to a legacy namespace after denied v2 access. Read-only mounts use non-mutating v2 negotiation/sync.
+
+Carry FEAT-04's issuer-bound OIDC re-login and explicit development-principal behavior without aliasing identities.
+Device/service grants remain independent and staged until explicit offline activation; mount changes cannot retarget
+their immutable share/folder/capability or implicitly enable Saber. Legacy Saber stays within its original mapped share.
 
 ## Proposed Implementation
 
@@ -66,6 +81,9 @@ history/conflict/device-password/settings UI, `ignore.ts`, tests/e2e, and `READM
 - Add client/e2e tests for isolated scanning/apply/manifests, attachment routing, references, independent initial
   sync/recovery/conflicts/retries, read-only mounts, same-mount rename, rejected cross-mount rename, and failed
   import retaining source.
+- Test explicit single-share-to-mount conversion, retained old state after failure, authorization loss without
+  fallback or sibling mutation, and destination verification before separately confirmed source deletion.
+- Run required Rust, plugin, end-to-end and packaged-command suites using disposable data and synthetic credentials.
 - Exercise existing mobile-compatible adapter mocks and perform fixture manual checks on supported desktop/mobile.
 - Local completion is build/tests plus fixture/platform checks. Production rollout, user migration, and live
   verification remain operator activities with backup and per-mount reconciliation.
@@ -74,6 +92,8 @@ history/conflict/device-password/settings UI, `ignore.ts`, tests/e2e, and `READM
 
 Document owner-specific Personal mapping, Harmony setup, links, attachments, import, root exclusions, and recovery.
 Completion means local implementation/tests pass; it does not assert deployed or live-verified behavior.
+After FEAT-04 and FEAT-05 validation, production migration remains one coordinated separately authorized operation.
+No production access, deployment, live migration or Marvin/Harmony repository changes are authorized.
 
 ## Out of Scope
 

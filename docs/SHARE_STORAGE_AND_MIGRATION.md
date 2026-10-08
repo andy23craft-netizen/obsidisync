@@ -70,6 +70,27 @@ Offline legacy issuance/rotation after publication additionally requires an expl
 the existing command: `local ACCOUNT_ID` or `oidc ISSUER SUBJECT`. The actor must have write membership in the mapped
 share. Existing client provisioning authenticates the typed session and checks the original namespace first.
 
+## Approved client transition contract (FEAT-04, not yet implemented)
+
+The current plugin still uses v1 sync. FEAT-04 will select v2 from the advertised `shareSyncV2` feature;
+`/v1/server/info` reporting API version 1 does not mean v2 is unavailable. Old servers retain intentional writable
+v1 operation, but v2 authorization denial must never cause automatic v1 sync fallback.
+
+Read-only downloads will use per-file safe application: only proven unchanged local files may receive remote updates
+or deletions. Edited or uncertain files retain local state; overlapping changes create durable local reconciliation
+records while unaffected downloads continue. Remote progress and synchronized file baselines must remain distinct.
+Downgrade preserves edits/conflicts/recovery and stops writes; restored capability does not auto-upload previously
+blocked edits. Explicit reconciliation is required, with local-only actions while read-only. Server read sync has
+no merge-conflict semantics for this preservation; the client owns these records and restart-safe application.
+
+V2 selection will retain original user/vault as separate explicit legacy credential-management context. Existing
+v1 device-password routes authorize original namespace, typed mapping and current membership: listing requires read,
+creation/revocation read-write. V2 grant inventory does not include legacy DAV/Saber grants. The UI must distinguish
+these stores without reissuing grants, changing secrets/settings/URLs or enabling Saber through new share grants.
+Lost authorization or native cutoff makes client legacy management unavailable; retained context must not be deleted
+or inferred from membership. Independent grants may remain usable, including named DAV/Saber cutoff exceptions.
+Explicit host-local inventory/revocation remains the recovery path. No server authorization change is required.
+
 ## Empty installation setup
 
 Every command uses the existing binary's `admin --data-dir /data ...` interface while the server is stopped.

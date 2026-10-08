@@ -338,6 +338,11 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 
 ### Adding another device to a vault
 
+FEAT-04 client share selection is planned, not implemented. Its approved transition contracts are documented in
+[Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md#approved-client-transition-contract-feat-04-not-yet-implemented).
+They require feature-based v2 negotiation, per-file read-only preservation with explicit reconciliation, and retained
+namespace-authorized legacy DAV/Saber credential management. Current plugin instructions below describe v1 behavior.
+
 Every device that should carry the same vault talks to the same server and uses the same vault name. There are two kinds of devices:
 
 - **Obsidian devices** (macOS, iOS, iPadOS) run the plugin and take part in full two-way sync with conflict handling.
