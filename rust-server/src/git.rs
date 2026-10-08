@@ -47,6 +47,11 @@ pub async fn git(repo: Option<&Path>, args: &[&str], allowed_codes: &[i32]) -> R
     }
 }
 
+pub async fn git_strings(repo: &Path, args: &[String], allowed_codes: &[i32]) -> Result<GitOutput> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git(Some(repo), &refs, allowed_codes).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,9 +80,4 @@ mod tests {
             b"synthetic private"
         );
     }
-}
-
-pub async fn git_strings(repo: &Path, args: &[String], allowed_codes: &[i32]) -> Result<GitOutput> {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    git(Some(repo), &refs, allowed_codes).await
 }
