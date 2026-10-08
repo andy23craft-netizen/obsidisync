@@ -79,7 +79,8 @@ interface OidcTokenResponse {
 }
 
 export type ServerAuthConfig =
-  | { type: "password"; passwordConfigured: boolean; setupTokenRequired?: boolean }
+  | { type: "password"; passwordConfigured: boolean; setupTokenRequired?: boolean;
+      accountProvisioning?: "host-local"; loginAvailable?: boolean }
   | { type: "oidc"; issuer: string; clientId: string; scope: string; audience?: string | null }
   | { type: "token" };
 

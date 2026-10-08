@@ -3,9 +3,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs;
 use tokio::sync::Mutex;
 
 const ACCESS_TOKEN_TTL_SECONDS: u64 = 24 * 60 * 60;
@@ -27,6 +26,7 @@ pub struct AppSession {
 pub struct VerifiedSession {
     pub user: String,
     pub subject: String,
+    pub local_v1: bool,
 }
 
 #[derive(Debug)]
@@ -36,14 +36,18 @@ pub struct AppSessionStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionStore {
     sessions: Vec<SessionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionRecord {
     user: String,
     subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_version: Option<String>,
     access_token_hash: String,
     refresh_token_hash: String,
     access_expires_at: u64,
@@ -61,9 +65,23 @@ impl AppSessionStore {
     }
 
     pub async fn issue(&self, user: String, subject: String) -> Result<AppSession> {
+        self.issue_inner(user, subject, None).await
+    }
+
+    pub async fn issue_local(&self, user: String, subject: String) -> Result<AppSession> {
+        self.issue_inner(user, subject, Some("local-v1".to_string()))
+            .await
+    }
+
+    async fn issue_inner(
+        &self,
+        user: String,
+        subject: String,
+        identity_version: Option<String>,
+    ) -> Result<AppSession> {
         let _guard = self.lock.lock().await;
         let mut store = self.read_store().await?;
-        let session = new_session(user, subject)?;
+        let session = new_session(user, subject, identity_version)?;
         store.sessions.push(session.record.clone());
         prune_sessions(&mut store);
         self.write_store(&store).await?;
@@ -85,10 +103,37 @@ impl AppSessionStore {
         Ok(VerifiedSession {
             user: record.user.clone(),
             subject: record.subject.clone(),
+            local_v1: record.identity_version.as_deref() == Some("local-v1"),
         })
     }
 
     pub async fn refresh<F, Fut>(&self, refresh_token: &str, authorize: F) -> Result<AppSession>
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.refresh_inner(refresh_token, None, authorize).await
+    }
+
+    pub async fn refresh_local<F, Fut>(
+        &self,
+        refresh_token: &str,
+        authorize: F,
+    ) -> Result<AppSession>
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.refresh_inner(refresh_token, Some("local-v1"), authorize)
+            .await
+    }
+
+    async fn refresh_inner<F, Fut>(
+        &self,
+        refresh_token: &str,
+        required_kind: Option<&str>,
+        authorize: F,
+    ) -> Result<AppSession>
     where
         F: FnOnce(String, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
@@ -102,6 +147,9 @@ impl AppSessionStore {
             .iter()
             .position(|session| constant_time_eq(&session.refresh_token_hash, &token_hash))
             .ok_or_else(|| anyhow!("invalid refresh token"))?;
+        if store.sessions[index].identity_version.as_deref() != required_kind {
+            bail!("invalid refresh token identity; log in again");
+        }
         let record = store.sessions.remove(index);
         if record.refresh_expires_at <= now {
             self.write_store(&store).await?;
@@ -109,7 +157,7 @@ impl AppSessionStore {
         }
         self.write_store(&store).await?;
         authorize(record.user.clone(), record.subject.clone()).await?;
-        let session = new_session(record.user, record.subject)?;
+        let session = new_session(record.user, record.subject, record.identity_version)?;
         store.sessions.push(session.record.clone());
         prune_sessions(&mut store);
         self.write_store(&store).await?;
@@ -117,23 +165,24 @@ impl AppSessionStore {
     }
 
     async fn read_store(&self) -> Result<SessionStore> {
-        match fs::read_to_string(&self.store_path).await {
-            Ok(contents) => Ok(serde_json::from_str(&contents)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SessionStore {
+        let store: SessionStore =
+            crate::auth_storage::read(&self.store_path)?.unwrap_or(SessionStore {
                 sessions: Vec::new(),
-            }),
-            Err(error) => Err(error.into()),
+            });
+        for record in &store.sessions {
+            if record
+                .identity_version
+                .as_deref()
+                .is_some_and(|kind| kind != "local-v1")
+            {
+                bail!("auth store contains an unsupported session identity");
+            }
         }
+        Ok(store)
     }
 
     async fn write_store(&self, store: &SessionStore) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let temp_path = temp_store_path(&self.store_path);
-        fs::write(&temp_path, serde_json::to_vec_pretty(store)?).await?;
-        fs::rename(temp_path, &self.store_path).await?;
-        Ok(())
+        crate::auth_storage::write(&self.store_path, store)
     }
 }
 
@@ -142,7 +191,11 @@ struct IssuedSession {
     record: SessionRecord,
 }
 
-fn new_session(user: String, subject: String) -> Result<IssuedSession> {
+fn new_session(
+    user: String,
+    subject: String,
+    identity_version: Option<String>,
+) -> Result<IssuedSession> {
     let access_token = random_token()?;
     let refresh_token = random_token()?;
     let now = unix_now();
@@ -160,6 +213,7 @@ fn new_session(user: String, subject: String) -> Result<IssuedSession> {
         record: SessionRecord {
             user,
             subject,
+            identity_version,
             access_token_hash: hash_token(&access_token),
             refresh_token_hash: hash_token(&refresh_token),
             access_expires_at,
@@ -214,12 +268,6 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn temp_store_path(path: &Path) -> PathBuf {
-    let mut temp_path = path.to_path_buf();
-    temp_path.set_extension("json.tmp");
-    temp_path
 }
 
 #[cfg(test)]

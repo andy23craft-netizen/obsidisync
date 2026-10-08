@@ -1,5 +1,8 @@
+pub mod accounts;
+pub mod admin;
 pub mod app_session;
 pub mod auth;
+pub mod auth_storage;
 pub mod auth_throttle;
 pub mod binary_store;
 pub mod device_passwords;
@@ -12,6 +15,7 @@ pub mod paths;
 pub mod protocol;
 pub mod remote;
 pub mod saber;
+pub mod share_credentials;
 pub mod time_format;
 pub mod vault;
 pub mod version_registry;

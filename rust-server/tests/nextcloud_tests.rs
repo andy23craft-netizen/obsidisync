@@ -756,6 +756,11 @@ async fn saber_pdf_folder_must_not_overlap_sync_folder() {
 async fn password_mode_sends_the_browser_through_login_and_back() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
+    let mut accounts = obsidian_git_sync_server::accounts::AccountStore::default();
+    accounts
+        .create_account("alice", "correct-horse-battery-staple")
+        .unwrap();
+    accounts.save(&data_dir).unwrap();
     let state = AppState::new(
         VaultService::new(data_dir.clone()),
         AuthVerifier::password("alice".to_string(), data_dir).unwrap(),
@@ -763,21 +768,22 @@ async fn password_mode_sends_the_browser_through_login_and_back() {
     );
     let app = app(&state);
 
-    // Set the password and register a vault with the returned token.
+    // The account is provisioned offline; login and register using the normal JSON session.
     let response = request(
         &app,
         "POST",
-        "/login",
+        "/v1/auth/password/login",
         None,
-        &[("content-type", "application/x-www-form-urlencoded")],
-        b"username=alice&password=correct-horse-battery-staple&password_confirm=correct-horse-battery-staple".to_vec(),
+        &[("content-type", "application/json")],
+        serde_json::to_vec(
+            &serde_json::json!({"username":"alice","password":"correct-horse-battery-staple"}),
+        )
+        .unwrap(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let setup_html = text(response).await;
-    let token_start = setup_html.find("<textarea readonly>").unwrap() + "<textarea readonly>".len();
-    let token_end = setup_html[token_start..].find("</textarea>").unwrap() + token_start;
-    let bearer = format!("Bearer {}", &setup_html[token_start..token_end]);
+    let login = json(response).await;
+    let bearer = format!("Bearer {}", login["accessToken"].as_str().unwrap());
     let response = request(
         &app,
         "POST",

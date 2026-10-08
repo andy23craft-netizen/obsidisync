@@ -16,11 +16,41 @@ use std::path::PathBuf;
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "admin") && args.get(1).is_some_and(|a| a == "--help") {
+        println!("{}", obsidian_git_sync_server::admin::HELP);
+        return Ok(());
+    }
+    let mut data_dir = PathBuf::from(
+        std::env::var("OBSIDIAN_GIT_SYNC_DATA_DIR").unwrap_or_else(|_| "data".into()),
+    );
+    let admin_args = if args.first().is_some_and(|a| a == "admin") {
+        let mut commands = args[1..].to_vec();
+        if commands.first().is_some_and(|a| a == "--data-dir") {
+            if commands.len() < 2 {
+                bail!("--data-dir requires a path");
+            }
+            data_dir = PathBuf::from(&commands[1]);
+            commands.drain(..2);
+        }
+        Some(commands)
+    } else {
+        if !args.is_empty() {
+            bail!("unknown server arguments; use admin --help");
+        }
+        None
+    };
+    let _directory_lock =
+        obsidian_git_sync_server::auth_storage::DataDirectoryLock::acquire(&data_dir)?;
+    // Declared after the lock so runtime workers stop before the lock is released on return.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_STACK_BYTES)
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    if let Some(commands) = admin_args {
+        return runtime.block_on(obsidian_git_sync_server::admin::run(&data_dir, &commands));
+    }
+    runtime.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
@@ -77,7 +107,19 @@ impl RuntimeConfig {
             std::env::var("OBSIDIAN_GIT_SYNC_DATA_DIR").unwrap_or_else(|_| "data".to_string()),
         );
 
-        let (auth, public_auth) = if let Ok(token) = std::env::var("OBSIDIAN_GIT_SYNC_DEV_TOKEN") {
+        let mode = std::env::var("OBSIDIAN_GIT_SYNC_AUTH_MODE").ok();
+        if mode
+            .as_deref()
+            .is_some_and(|m| !matches!(m, "password" | "oidc" | "dev"))
+        {
+            bail!("OBSIDIAN_GIT_SYNC_AUTH_MODE must be password, oidc, or dev");
+        }
+        let development = mode.as_deref() == Some("dev")
+            || (mode.is_none() && std::env::var("OBSIDIAN_GIT_SYNC_DEV_TOKEN").is_ok());
+        let password = mode.as_deref() == Some("password")
+            || (mode.is_none() && password_user_env().is_some());
+        let (auth, public_auth) = if development {
+            let token = required_env("OBSIDIAN_GIT_SYNC_DEV_TOKEN")?;
             let token = non_empty_env_value("OBSIDIAN_GIT_SYNC_DEV_TOKEN", token)?;
             let user =
                 std::env::var("OBSIDIAN_GIT_SYNC_DEV_USER").unwrap_or_else(|_| "dev".to_string());
@@ -85,10 +127,12 @@ impl RuntimeConfig {
                 AuthVerifier::StaticTokenForDev { token, user },
                 PublicAuthConfig::Token,
             )
-        } else if let Some(user) = password_user_env() {
-            let setup_token = password_setup_token()?;
+        } else if password {
+            if std::env::var_os("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN").is_some() {
+                tracing::info!("password setup token configuration is retired and ignored");
+            }
             (
-                AuthVerifier::password_with_setup_token(user, data_dir.clone(), Some(setup_token))?,
+                AuthVerifier::password(password_user_env().unwrap_or_default(), data_dir.clone())?,
                 PublicAuthConfig::Password,
             )
         } else {
@@ -193,19 +237,6 @@ fn password_user_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn password_setup_token() -> Result<String> {
-    password_setup_token_from_env(std::env::var("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN"))
-}
-
-fn password_setup_token_from_env(
-    value: std::result::Result<String, std::env::VarError>,
-) -> Result<String> {
-    let value = value.map_err(|_| {
-        anyhow::anyhow!("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN is required in password mode")
-    })?;
-    non_empty_env_value("OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN", value)
-}
-
 fn non_empty_env_value(name: &str, value: String) -> Result<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -248,62 +279,14 @@ fn parse_csv_env(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::{Context, Layer};
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::registry::LookupSpan;
-
-    #[derive(Clone)]
-    struct EventRecorder(Arc<Mutex<Vec<String>>>);
-
-    impl<S> Layer<S> for EventRecorder
-    where
-        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-    {
-        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(event.metadata().name().to_string());
-        }
-    }
-
     #[test]
-    fn configured_password_setup_token_is_never_logged() {
-        let token = "production-setup-token-123456";
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(EventRecorder(events.clone()));
-
-        tracing::subscriber::with_default(subscriber, || {
-            assert_eq!(
-                password_setup_token_from_env(Ok(token.to_string())).unwrap(),
-                token
-            );
-        });
-
-        assert!(events.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn password_mode_requires_a_setup_token() {
-        let error = password_setup_token_from_env(Err(std::env::VarError::NotPresent))
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(
-            error,
-            "OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN is required in password mode"
-        );
-    }
-
-    #[test]
-    fn password_mode_rejects_an_invalid_setup_token() {
+    fn password_mode_ignores_retired_username_and_setup_token() {
         let data_dir = tempfile::tempdir().unwrap();
         assert!(AuthVerifier::password_with_setup_token(
-            "alice".to_string(),
+            String::new(),
             data_dir.path(),
             Some("too-short".to_string()),
         )
-        .is_err());
+        .is_ok());
     }
 }

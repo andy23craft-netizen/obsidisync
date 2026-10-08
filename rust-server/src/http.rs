@@ -118,6 +118,10 @@ enum PublicAuthConfigResponse {
         password_configured: bool,
         #[serde(rename = "setupTokenRequired")]
         setup_token_required: bool,
+        #[serde(rename = "accountProvisioning")]
+        account_provisioning: &'static str,
+        #[serde(rename = "loginAvailable")]
+        login_available: bool,
     },
     Oidc {
         issuer: String,
@@ -173,7 +177,12 @@ impl IntoResponse for ApiError {
 }
 
 fn status_for_error(message: &str) -> StatusCode {
-    if message.contains("unauthorized")
+    if message.contains("local login unavailable")
+        || message.contains("auth store")
+        || message.contains("account store")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if message.contains("unauthorized")
         || message.contains("authorization")
         || message.contains("OIDC")
         || message.contains("bearer")
@@ -320,6 +329,9 @@ fn apply_cors(router: Router, allowed_origins: Vec<String>) -> Router {
 
 fn public_error_message(status: StatusCode, message: &str) -> String {
     match status {
+        StatusCode::SERVICE_UNAVAILABLE if message.contains("local login unavailable") => {
+            "Ask the server operator to create or enable a local account".to_string()
+        }
         StatusCode::UNAUTHORIZED => "unauthorized".to_string(),
         StatusCode::FORBIDDEN => "forbidden".to_string(),
         StatusCode::NOT_FOUND => "not found".to_string(),
@@ -349,16 +361,12 @@ fn is_public_client_error(message: &str) -> bool {
 struct PasswordAuthRequest {
     username: String,
     password: String,
-    #[serde(default, rename = "setupToken")]
-    setup_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PasswordLoginForm {
     username: String,
     password: String,
-    password_confirm: Option<String>,
-    setup_token: Option<String>,
     /// Site-relative path to continue to after login (for example a Saber login flow page).
     next: Option<String>,
 }
@@ -405,13 +413,14 @@ async fn password_page(
         return Ok(Html(render_home_page(&state.public_auth)).into_response());
     }
     let configured = state.auth.password_is_configured().await?;
-    let setup_token_required = state.auth.password_setup_token_is_required()?;
+    if !configured {
+        return Ok(
+            Html("<p>Ask the server operator to create or enable a local account.</p>")
+                .into_response(),
+        );
+    }
     Ok(Html(render_password_page(
-        configured,
-        setup_token_required,
         None,
-        None,
-        &[],
         safe_next_path(query.next.as_deref()).as_deref(),
     ))
     .into_response())
@@ -427,68 +436,38 @@ async fn password_form(
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
     let configured = state.auth.password_is_configured().await?;
+    if !configured {
+        return Err(ApiError(anyhow::anyhow!("local login unavailable")));
+    }
     let keys = password_throttle_keys(&form.username, peer.as_ref());
     if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
         return Ok(password_throttled_form(
-            configured,
-            state.auth.password_setup_token_is_required()?,
             safe_next_path(form.next.as_deref()).as_deref(),
             retry_after,
         ));
     }
-    let result = if configured {
-        state
-            .auth
-            .login_password(&form.username, &form.password)
-            .await
-    } else if form.password_confirm.as_deref() != Some(form.password.as_str()) {
-        Err(anyhow::anyhow!("password confirmation does not match"))
-    } else {
-        state
-            .auth
-            .setup_password(&form.username, &form.password, form.setup_token.as_deref())
-            .await
-    };
+    let result = state
+        .auth
+        .login_password(&form.username, &form.password)
+        .await;
 
     let next = safe_next_path(form.next.as_deref());
     match result {
         Ok(session) => {
             state.password_throttle.record_success(&keys).await;
-            if configured {
-                Ok(redirect_with_site_session(
-                    next.as_deref().unwrap_or("/change-feed"),
-                    &session.access_token,
-                    site_session_cookie_is_secure(&headers),
-                ))
-            } else {
-                let feed = state.vaults.activity_feed(&session.user, 50).await?;
-                Ok(Html(render_password_page(
-                    true,
-                    state.auth.password_setup_token_is_required()?,
-                    Some(format!("Access token created for {}.", session.user)),
-                    Some(session.access_token.clone()),
-                    &feed,
-                    next.as_deref(),
-                ))
-                .into_response())
-            }
+            Ok(redirect_with_site_session(
+                next.as_deref().unwrap_or("/change-feed"),
+                &session.access_token,
+                site_session_cookie_is_secure(&headers),
+            ))
         }
         Err(_) => {
             state.password_throttle.record_failure(&keys).await;
             if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
-                return Ok(password_throttled_form(
-                    configured,
-                    state.auth.password_setup_token_is_required()?,
-                    next.as_deref(),
-                    retry_after,
-                ));
+                return Ok(password_throttled_form(next.as_deref(), retry_after));
             }
             Ok(Html(render_password_page(
-                configured,
-                state.auth.password_setup_token_is_required()?,
                 Some("login failed".to_string()),
-                None,
-                &[],
                 next.as_deref(),
             ))
             .into_response())
@@ -511,15 +490,13 @@ async fn change_feed_page(
     Ok(Html(render_change_feed_page(&auth.user, &feed)).into_response())
 }
 
-async fn setup_password(
-    State(state): State<Arc<AppState>>,
-    peer: Option<ConnectInfo<std::net::SocketAddr>>,
-    Json(request): Json<PasswordAuthRequest>,
-) -> Result<Response, ApiError> {
+async fn setup_password(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     if !matches!(state.public_auth, PublicAuthConfig::Password) {
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
-    password_json_attempt(&state, &request, peer.as_ref(), true).await
+    Ok((StatusCode::GONE, Json(ApiErrorBody {
+        error: "Public password setup is retired; ask the server operator to create an account offline".into(),
+    })).into_response())
 }
 
 async fn login_password(
@@ -530,7 +507,10 @@ async fn login_password(
     if !matches!(state.public_auth, PublicAuthConfig::Password) {
         return Err(ApiError(anyhow::anyhow!("password login is not enabled")));
     }
-    password_json_attempt(&state, &request, peer.as_ref(), false).await
+    if !state.auth.password_is_configured().await? {
+        return Err(ApiError(anyhow::anyhow!("local login unavailable")));
+    }
+    password_json_attempt(&state, &request, peer.as_ref()).await
 }
 
 fn password_throttle_keys(
@@ -559,18 +539,9 @@ fn throttled_response(retry_after: u64) -> Response {
     response
 }
 
-fn password_throttled_form(
-    configured: bool,
-    setup_token_required: bool,
-    next: Option<&str>,
-    retry_after: u64,
-) -> Response {
+fn password_throttled_form(next: Option<&str>, retry_after: u64) -> Response {
     let mut response = Html(render_password_page(
-        configured,
-        setup_token_required,
         Some("too many failed login attempts; try again later".to_string()),
-        None,
-        &[],
         next,
     ))
     .into_response();
@@ -585,27 +556,15 @@ async fn password_json_attempt(
     state: &Arc<AppState>,
     request: &PasswordAuthRequest,
     peer: Option<&ConnectInfo<std::net::SocketAddr>>,
-    setup: bool,
 ) -> Result<Response, ApiError> {
     let keys = password_throttle_keys(&request.username, peer);
     if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
         return Ok(throttled_response(retry_after));
     }
-    let result = if setup {
-        state
-            .auth
-            .setup_password(
-                &request.username,
-                &request.password,
-                request.setup_token.as_deref(),
-            )
-            .await
-    } else {
-        state
-            .auth
-            .login_password(&request.username, &request.password)
-            .await
-    };
+    let result = state
+        .auth
+        .login_password(&request.username, &request.password)
+        .await;
     match result {
         Ok(session) => {
             state.password_throttle.record_success(&keys).await;
@@ -616,11 +575,7 @@ async fn password_json_attempt(
             if let Some(retry_after) = state.password_throttle.blocked_for(&keys).await {
                 Ok(throttled_response(retry_after))
             } else {
-                Err(ApiError(anyhow::anyhow!(if setup {
-                    "password setup failed"
-                } else {
-                    "invalid username or password"
-                })))
+                Err(ApiError(anyhow::anyhow!("invalid username or password")))
             }
         }
     }
@@ -650,8 +605,10 @@ async fn auth_config(
 ) -> Result<Json<PublicAuthConfigResponse>, ApiError> {
     let response = match &state.public_auth {
         PublicAuthConfig::Password => PublicAuthConfigResponse::Password {
-            password_configured: state.auth.password_is_configured().await?,
-            setup_token_required: state.auth.password_setup_token_is_required()?,
+            password_configured: true,
+            setup_token_required: false,
+            account_provisioning: "host-local",
+            login_available: state.auth.password_is_configured().await?,
         },
         PublicAuthConfig::Oidc {
             issuer,
@@ -741,14 +698,7 @@ async fn auth_session(
     }))
 }
 
-fn render_password_page(
-    configured: bool,
-    setup_token_required: bool,
-    message: Option<String>,
-    token: Option<String>,
-    feed: &[ActivityFeedEntry],
-    next: Option<&str>,
-) -> String {
+fn render_password_page(message: Option<String>, next: Option<&str>) -> String {
     let next_field = next
         .map(|value| {
             format!(
@@ -757,41 +707,11 @@ fn render_password_page(
             )
         })
         .unwrap_or_default();
-    let title = if configured { "Log in" } else { "Set password" };
-    let password_label = if configured {
-        "Password"
-    } else {
-        "New password"
-    };
-    let confirm_field = if configured {
-        String::new()
-    } else {
-        r#"<label>Confirm password<input name="password_confirm" type="password" autocomplete="new-password" required></label>"#.to_string()
-    };
-    let setup_token_field = if configured || !setup_token_required {
-        String::new()
-    } else {
-        r#"<label>Setup token<input name="setup_token" type="password" autocomplete="one-time-code" required></label>"#.to_string()
-    };
-    let autocomplete = if configured {
-        "current-password"
-    } else {
-        "new-password"
-    };
+    let title = "Log in";
     let message_html = message
         .as_deref()
         .map(|value| format!(r#"<p class="message">{}</p>"#, escape_html(value)))
         .unwrap_or_default();
-    let token_html = token
-        .as_deref()
-        .map(|value| {
-            format!(
-                "<section><h2>Access token</h2><p>Paste this token into the Obsidian plugin access token field.</p><textarea readonly>{}</textarea></section>",
-                escape_html(value)
-            )
-        })
-        .unwrap_or_default();
-    let feed_html = render_feed(feed);
 
     format!(
         r#"<!doctype html>
@@ -826,13 +746,9 @@ button {{ cursor: pointer; font-weight: 700; }}
 <form action="/login" method="post">
 {next_field}
 <label>Username<input name="username" type="text" autocomplete="username" required autofocus></label>
-<label>{password_label}<input name="password" type="password" autocomplete="{autocomplete}" required></label>
-{confirm_field}
-{setup_token_field}
+<label>Password<input name="password" type="password" autocomplete="current-password" required></label>
 <button type="submit">{title}</button>
 </form>
-{token_html}
-{feed_html}
 </main>
 </body>
 </html>"#
@@ -1361,9 +1277,11 @@ mod password_throttle_route_tests {
     async fn app() -> Router {
         let root = tempfile::tempdir().unwrap().keep();
         let auth = AuthVerifier::password("alice".to_string(), &root).unwrap();
-        auth.setup_password("alice", "correct horse battery staple", None)
-            .await
+        let mut accounts = crate::accounts::AccountStore::default();
+        accounts
+            .create_account("alice", "correct horse battery staple")
             .unwrap();
+        accounts.save(&root).unwrap();
         router(
             AppState::new(
                 VaultService::new_for_tests(root),

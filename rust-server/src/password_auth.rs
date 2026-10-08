@@ -1,264 +1,138 @@
-use crate::app_session::{AppSession, AppSessionStore};
+use crate::accounts::Accounts;
+use crate::app_session::{AppSession, AppSessionStore, VerifiedSession};
 use crate::auth::normalize_user_claim;
 use anyhow::{anyhow, bail, Result};
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use tokio::fs;
+use std::path::PathBuf;
 use tokio::sync::Mutex;
-
-const MIN_PASSWORD_BYTES: usize = 12;
 
 #[derive(Debug)]
 pub struct PasswordAuth {
-    user: String,
-    setup_token_hash: Option<String>,
-    store_path: PathBuf,
+    accounts: Accounts,
     sessions: AppSessionStore,
+    dummy_hash: String,
     lock: Mutex<()>,
 }
-
 pub type PasswordAuthSession = AppSession;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PasswordStore {
-    user: String,
-    password_hash: Option<String>,
-    #[serde(default)]
-    sessions: Vec<PasswordSessionRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PasswordSessionRecord {
-    token_hash: String,
-    created_at: u64,
-}
 
 impl PasswordAuth {
     pub fn new(
-        user: String,
+        _user: String,
         data_dir: impl Into<PathBuf>,
-        setup_token: Option<String>,
+        _setup_token: Option<String>,
     ) -> Result<Self> {
-        let data_dir = data_dir.into();
-        let user = normalize_user_claim(&user)?;
-        let setup_token_hash = setup_token
-            .as_deref()
-            .map(validate_setup_token)
-            .transpose()?
-            .map(hash_token);
+        let root = data_dir.into();
+        let accounts = Accounts::new(root.clone());
+        accounts.require_import()?;
         Ok(Self {
-            user,
-            setup_token_hash,
-            store_path: data_dir.join("auth/password.json"),
-            sessions: AppSessionStore::new(data_dir),
+            accounts,
+            sessions: AppSessionStore::new(root),
+            dummy_hash: hash_password("reserved-invalid-login-check")?,
             lock: Mutex::new(()),
         })
     }
-
     pub async fn is_configured(&self) -> Result<bool> {
-        Ok(self.read_store().await?.password_hash.is_some())
+        Ok(self.accounts.load()?.accounts.iter().any(|a| a.enabled))
     }
-
-    pub async fn setup_password(
-        &self,
-        username: &str,
-        password: &str,
-        setup_token: Option<&str>,
-    ) -> Result<PasswordAuthSession> {
-        let _guard = self.lock.lock().await;
-        self.verify_setup_token(setup_token)?;
-        self.ensure_setup_user(username)?;
-        validate_password(password)?;
-
-        let mut store = self.read_store().await?;
-        if store.password_hash.is_some() {
-            bail!("password is already set");
-        }
-
-        store.password_hash = Some(hash_password(password)?);
-        self.write_store(&store).await?;
-        self.sessions
-            .issue(self.user.clone(), self.user.clone())
-            .await
-    }
-
     pub fn setup_token_is_required(&self) -> bool {
-        self.setup_token_hash.is_some()
+        false
     }
-
-    pub async fn login(&self, username: &str, password: &str) -> Result<PasswordAuthSession> {
+    pub async fn setup_password(&self, _: &str, _: &str, _: Option<&str>) -> Result<AppSession> {
+        bail!("public password setup is retired; use host-local administration")
+    }
+    pub async fn login(&self, username: &str, password: &str) -> Result<AppSession> {
         let _guard = self.lock.lock().await;
-        self.ensure_login_user(username)?;
-
-        let store = self.read_store().await?;
-        let password_hash = store
-            .password_hash
-            .as_deref()
-            .ok_or_else(|| anyhow!("password is not set"))?;
-        if !verify_password(password, password_hash)? {
-            bail!("invalid username or password");
+        let store = self.accounts.load()?;
+        if !store.accounts.iter().any(|a| a.enabled) {
+            bail!("local login unavailable; ask the server operator to create or enable a local account");
         }
-
-        self.write_store(&store).await?;
+        let user = normalize_user_claim(username).ok();
+        let account = store
+            .accounts
+            .iter()
+            .find(|a| Some(&a.user) == user.as_ref());
+        // Unknown and disabled usernames also pay the hash-verification cost.
+        let hash = account
+            .map(|a| a.password_hash.as_str())
+            .unwrap_or(&self.dummy_hash);
+        let valid = verify_password(password, hash)?;
+        let account = account.filter(|a| a.enabled && valid);
+        let Some(account) = account else {
+            bail!("invalid username or password");
+        };
         self.sessions
-            .issue(self.user.clone(), self.user.clone())
+            .issue_local(account.user.clone(), account.id.clone())
             .await
     }
-
-    pub async fn verify_token(&self, token: &str) -> Result<String> {
-        if self.read_store().await?.password_hash.is_none() {
-            bail!("password is not set");
+    pub async fn verify_token(&self, token: &str) -> Result<VerifiedSession> {
+        let session = self.sessions.verify_access_token(token).await?;
+        if !session.local_v1
+            || !self
+                .accounts
+                .load()?
+                .accounts
+                .iter()
+                .any(|a| a.id == session.subject && a.user == session.user)
+        {
+            bail!("invalid bearer token identity; log in again");
         }
-        Ok(self.sessions.verify_access_token(token).await?.user)
+        Ok(session)
     }
-
     pub async fn refresh_session(&self, refresh_token: &str) -> Result<AppSession> {
-        if self.read_store().await?.password_hash.is_none() {
-            bail!("password is not set");
-        }
         self.sessions
-            .refresh(refresh_token, |user, subject| async move {
-                let expected = normalize_user_claim(&user)?;
-                if subject == expected {
+            .refresh_local(refresh_token, |user, subject| async move {
+                if self
+                    .accounts
+                    .load()?
+                    .accounts
+                    .iter()
+                    .any(|a| a.id == subject && a.user == user && a.enabled)
+                {
                     Ok(())
                 } else {
-                    bail!("password session subject is invalid")
+                    bail!("invalid refresh token")
                 }
             })
             .await
     }
-
-    fn ensure_setup_user(&self, username: &str) -> Result<()> {
-        let user = normalize_user_claim(username)?;
-        if user == self.user {
-            Ok(())
-        } else {
-            bail!("forbidden: invalid username")
-        }
-    }
-
-    fn ensure_login_user(&self, username: &str) -> Result<()> {
-        let user = normalize_user_claim(username)?;
-        if user == self.user {
-            Ok(())
-        } else {
-            bail!("invalid username or password")
-        }
-    }
-
-    fn verify_setup_token(&self, setup_token: Option<&str>) -> Result<()> {
-        let Some(expected_hash) = &self.setup_token_hash else {
-            return Ok(());
-        };
-        let token = setup_token
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("password setup token is required"))?;
-        validate_setup_token(token)?;
-        let token_hash = hash_token(token);
-        if constant_time_eq(&token_hash, expected_hash) {
-            Ok(())
-        } else {
-            bail!("invalid password setup token")
-        }
-    }
-
-    async fn read_store(&self) -> Result<PasswordStore> {
-        match fs::read_to_string(&self.store_path).await {
-            Ok(contents) => {
-                let store: PasswordStore = serde_json::from_str(&contents)?;
-                if store.user != self.user {
-                    bail!(
-                        "password auth store belongs to {}, but configured user is {}",
-                        store.user,
-                        self.user
-                    );
-                }
-                Ok(store)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PasswordStore {
-                user: self.user.clone(),
-                password_hash: None,
-                sessions: Vec::new(),
-            }),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn write_store(&self, store: &PasswordStore) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let temp_path = temp_store_path(&self.store_path);
-        fs::write(&temp_path, serde_json::to_vec_pretty(store)?).await?;
-        fs::rename(temp_path, &self.store_path).await?;
-        Ok(())
-    }
 }
-
-fn validate_password(password: &str) -> Result<()> {
-    if password.len() < MIN_PASSWORD_BYTES {
-        bail!("password must be at least {MIN_PASSWORD_BYTES} bytes");
+pub fn validate_hash(hash: &str) -> Result<()> {
+    let parsed = PasswordHash::new(hash).map_err(|_| anyhow!("stored password hash is invalid"))?;
+    if !matches!(
+        parsed.algorithm.as_str(),
+        "argon2id" | "argon2i" | "argon2d"
+    ) || parsed.salt.is_none()
+        || parsed.hash.is_none()
+    {
+        bail!("stored password hash is invalid");
+    }
+    argon2::Params::try_from(&parsed)
+        .map_err(|_| anyhow!("stored password parameters are invalid"))?;
+    if let Some(version) = parsed.version {
+        argon2::Version::try_from(version)
+            .map_err(|_| anyhow!("stored password version is invalid"))?;
     }
     Ok(())
 }
-
-fn validate_setup_token(token: &str) -> Result<&str> {
-    if token.trim() != token || token.len() < 16 || token.chars().any(char::is_whitespace) {
-        bail!("invalid password setup token")
+pub fn hash_password(password: &str) -> Result<String> {
+    if password.len() < 12 {
+        bail!("password must be at least 12 bytes");
     }
-    Ok(token)
-}
-
-fn hash_password(password: &str) -> Result<String> {
-    let mut salt_bytes = [0_u8; 16];
-    getrandom::fill(&mut salt_bytes)
-        .map_err(|error| anyhow!("random generator failed: {error}"))?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|error| anyhow!("password salt generation failed: {error}"))?;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| anyhow!("random generator failed"))?;
+    let salt =
+        SaltString::encode_b64(&bytes).map_err(|_| anyhow!("password salt generation failed"))?;
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)
-        .map_err(|error| anyhow!("password hashing failed: {error}"))?
+        .map_err(|_| anyhow!("password hashing failed"))?
         .to_string())
 }
-
-fn verify_password(password: &str, password_hash: &str) -> Result<bool> {
-    let parsed_hash = PasswordHash::new(password_hash)
-        .map_err(|error| anyhow!("stored password hash is invalid: {error}"))?;
+fn verify_password(password: &str, hash: &str) -> Result<bool> {
+    let hash = PasswordHash::new(hash).map_err(|_| anyhow!("stored password hash is invalid"))?;
     Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
+        .verify_password(password.as_bytes(), &hash)
         .is_ok())
-}
-
-fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn constant_time_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = *left.get(index).unwrap_or(&0);
-        let right_byte = *right.get(index).unwrap_or(&0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
-}
-
-fn temp_store_path(path: &Path) -> PathBuf {
-    let mut temp_path = path.to_path_buf();
-    temp_path.set_extension("json.tmp");
-    temp_path
 }

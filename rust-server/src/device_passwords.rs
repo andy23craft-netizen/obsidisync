@@ -12,8 +12,7 @@ use crate::vault::dav::DavDevice;
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use tokio::fs;
+use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 /// Unambiguous lowercase alphabet (no 0/o, 1/l/i) so the password can be typed on a tablet.
@@ -31,12 +30,14 @@ pub struct DevicePasswordStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct StoreFile {
     #[serde(default)]
     passwords: Vec<DevicePasswordRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DevicePasswordRecord {
     id: String,
     user: String,
@@ -69,7 +70,7 @@ pub enum DeviceKind {
 
 /// Settings that let the server turn Saber's encrypted uploads into PDFs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SaberSettings {
     /// The user's Saber encryption password. Empty means "do not decrypt, just store".
     pub encryption_password: String,
@@ -259,6 +260,28 @@ impl DevicePasswordStore {
             .collect())
     }
 
+    /// Offline administration rotates only the hash, retaining the complete grant and metadata.
+    pub async fn rotate(&self, user: &str, vault: &str, id: &str) -> Result<CreatedDevicePassword> {
+        let user = validate_slug(user, "user")?;
+        let vault = validate_slug(vault, "vault")?;
+        let _guard = self.lock.lock().await;
+        let mut store = self.read_store().await?;
+        let record = store
+            .passwords
+            .iter_mut()
+            .find(|r| r.user == user && r.vault == vault && r.id == id)
+            .ok_or_else(|| anyhow!("credential not found"))?;
+        let password = generate_password()?;
+        record.password_hash = hash_password(&password);
+        let entry = record.public_entry();
+        self.write_store(&store).await?;
+        Ok(CreatedDevicePassword { entry, password })
+    }
+
+    pub async fn validate(&self) -> Result<()> {
+        self.read_store().await.map(|_| ())
+    }
+
     /// Saber devices of a vault whose notes the server may decrypt (encryption password set).
     pub async fn saber_grants(&self, user: &str, vault: &str) -> Result<Vec<DeviceGrant>> {
         let user = validate_slug(user, "user")?;
@@ -347,21 +370,38 @@ impl DevicePasswordStore {
     }
 
     async fn read_store(&self) -> Result<StoreFile> {
-        match fs::read(&self.store_path).await {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StoreFile::default()),
-            Err(error) => Err(error.into()),
+        let store: StoreFile = crate::auth_storage::read(&self.store_path)?.unwrap_or_default();
+        let mut ids = std::collections::HashSet::new();
+        for r in &store.passwords {
+            if !ids.insert(&r.id)
+                || r.id.is_empty()
+                || r.password_hash.len() != 64
+                || !r.password_hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("auth store contains invalid device records");
+            }
+            validate_slug(&r.user, "user")
+                .map_err(|_| anyhow!("auth store contains an invalid device namespace"))?;
+            validate_slug(&r.vault, "vault")
+                .map_err(|_| anyhow!("auth store contains an invalid device vault"))?;
+            validate_device_folder(&r.folder)
+                .map_err(|_| anyhow!("auth store contains an invalid device folder"))?;
+            if (r.kind == DeviceKind::Saber) != r.saber.is_some() {
+                bail!("auth store contains inconsistent Saber configuration");
+            }
+            if let Some(s) = &r.saber {
+                validate_device_folder(&s.pdf_folder)
+                    .map_err(|_| anyhow!("auth store contains an invalid Saber folder"))?;
+                if s.pdf_folder == r.folder || s.pdf_folder.starts_with(&format!("{}/", r.folder)) {
+                    bail!("auth store contains invalid Saber folder configuration");
+                }
+            }
         }
+        Ok(store)
     }
 
     async fn write_store(&self, store: &StoreFile) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let temp_path = temp_store_path(&self.store_path);
-        fs::write(&temp_path, serde_json::to_vec_pretty(store)?).await?;
-        fs::rename(temp_path, &self.store_path).await?;
-        Ok(())
+        crate::auth_storage::write(&self.store_path, store)
     }
 }
 
@@ -472,12 +512,6 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         diff |= (left_byte ^ right_byte) as usize;
     }
     diff == 0
-}
-
-fn temp_store_path(path: &Path) -> PathBuf {
-    let mut temp_path = path.to_path_buf();
-    temp_path.set_extension("json.tmp");
-    temp_path
 }
 
 #[cfg(test)]

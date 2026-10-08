@@ -38,6 +38,13 @@ export class AuthLoginModal extends Modal {
   private renderPassword(config: Extract<ServerAuthConfig, { type: "password" }>): void {
     const { contentEl } = this;
     contentEl.empty();
+    if (config.accountProvisioning === "host-local" && config.loginAvailable === false) {
+      contentEl.createEl("h2", { text: "Local account required" });
+      this.statusEl = contentEl.createEl("p", {
+        text: "Ask the server operator to create or enable a local account."
+      });
+      return;
+    }
     contentEl.createEl("h2", { text: config.passwordConfigured ? "Log in to ObsidiSync" : "Set ObsidiSync password" });
 
     let username = "";

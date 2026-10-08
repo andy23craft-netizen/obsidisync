@@ -13,7 +13,7 @@ The device does not run Git. The plugin sends changed files to:
 /v1/users/{user}/vaults/{vault}
 ```
 
-The Rust server validates the bearer token, authorizes the `{user}` namespace, commits Git history, optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens can come from OIDC or from the built-in single-user password mode.
+The Rust server validates the bearer token, authorizes the `{user}` namespace, commits Git history, optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens come from OIDC or host-provisioned local password accounts. Local accounts have separate immutable v1 namespaces; share network access is not enabled yet.
 
 ## Installation overview
 
@@ -43,13 +43,16 @@ Run it with persistent storage (swap the image name for the digest recorded in t
 docker run --rm \
   -p 8787:8787 \
   -v obsidian-git-sync-data:/data \
-  -e OBSIDIAN_GIT_SYNC_PASSWORD_USER="alice" \
-  -e OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN="replace-with-a-long-random-token" \
+  -e OBSIDIAN_GIT_SYNC_AUTH_MODE="password" \
   -e OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS="github.com,gitlab.com,git.example.com" \
   ghcr.io/andy23craft-netizen/obsidisync@sha256:<release-digest>
 ```
 
 Expose the server over HTTPS for real iOS use, usually through a reverse proxy. In the plugin settings, the sync server URL must point to this deployed server.
+
+Before starting a new password server, create an account against that same volume using the offline command in
+[Local administration and authentication upgrade](#local-administration-and-authentication-upgrade).
+Existing password installations must run the explicit legacy import and log in again before use.
 
 Use OIDC instead of password mode by setting the OIDC environment variables shown in [Run the Rust server](#run-the-rust-server).
 
@@ -224,18 +227,23 @@ export OBSIDIAN_GIT_SYNC_ALLOWED_ORIGINS="" # default: no browser CORS headers
 npm run start:server
 ```
 
-Single-user password mode without SSO:
+Local password accounts without SSO:
 
 ```bash
-export OBSIDIAN_GIT_SYNC_PASSWORD_USER="alice"
-export OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN="replace-with-a-long-random-token"
+export OBSIDIAN_GIT_SYNC_AUTH_MODE="password"
 export OBSIDIAN_GIT_SYNC_DATA_DIR="/srv/obsidian-git-sync"
 export OBSIDIAN_GIT_SYNC_LISTEN="127.0.0.1:8787"
 export OBSIDIAN_GIT_SYNC_ALLOWED_REMOTE_HOSTS="github.com,gitlab.com,git.example.com" # only needed when using network remotes
 npm run start:server
 ```
 
-Then click **Log in** in the Obsidian plugin settings. On the first login, the plugin asks for the setup token and sets the password through the server; later logins use the same button and store the returned access token automatically. `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN` is required in password mode and is never logged by the server. The web `/login` page remains available for browser access to the change feed and manual token recovery. `OBSIDIAN_GIT_SYNC_USER` is accepted as a shorter alias for `OBSIDIAN_GIT_SYNC_PASSWORD_USER`.
+Create accounts offline before login, then click **Log in** in the Obsidian plugin settings. Public password
+setup is retired; `/v1/auth/password/setup` returns `410`. `/login` signs in to the change feed and Saber flow.
+An empty/all-disabled store shows operator guidance. Password mode no longer requires a username or setup token.
+Legacy `OBSIDIAN_GIT_SYNC_PASSWORD_USER`/`OBSIDIAN_GIT_SYNC_USER` select password mode when an explicit mode is
+absent; they do not restrict login to one account. Obsolete setup-token configuration is ignored without logging
+its value. Explicit `OBSIDIAN_GIT_SYNC_AUTH_MODE=password|oidc|dev` selects exactly that mode and validates its
+required settings. Without it, precedence remains development token, password-user setting, then OIDC.
 
 After logging in, the page also shows a recent change feed for the user's synced vaults.
 
@@ -270,12 +278,15 @@ The container listens on `0.0.0.0:8787` and stores server state in `/data`.
 Security defaults:
 
 - OIDC issuer/JWKS URLs must use HTTPS, except localhost development URLs.
-- Password mode stores the Argon2 password hash under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/password.json` and hashed server session tokens under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/sessions.json`.
+- Password mode stores account IDs, immutable usernames, Argon2 hashes and staged share membership configuration
+  in `auth/accounts.json`; hashed server session tokens remain in `auth/sessions.json`.
 - WebDAV device passwords are generated server-side, stored only as SHA-256 hashes under `OBSIDIAN_GIT_SYNC_DATA_DIR/auth/device-passwords.json`, and each grants access to a single vault folder. They are created and revoked with a normal plugin login and work in every auth mode.
 - Failed WebDAV logins are throttled: 20 failures from one client address (first `X-Forwarded-For` hop, otherwise the TCP peer) or 100 failures for one username within 15 minutes lock that key for 15 minutes with a `429` and `Retry-After` response. Successful logins clear the counter.
-- Password setup and login (both `/login` forms and JSON endpoints) use the same limits and `429`/`Retry-After` behavior. Password username limits are independent of the client address, so changing an address cannot evade them. Password endpoints use the TCP peer and deliberately do not trust client-supplied forwarded-address headers.
+- Password login (both `/login` forms and JSON endpoints) uses the same limits and `429`/`Retry-After` behavior.
+  Password username limits are independent of the client address. Password endpoints use the TCP peer and do not
+  trust client-supplied forwarded-address headers. Unknown/disabled/wrong-password accounts fail generically.
 - Staged JSON uploads have a maximum declared file size (default 512 MiB), a per-vault incomplete-upload reservation budget (default 1 GiB), and an incomplete-upload TTL (default 24 hours). Complete uploads are never TTL-cleaned because a live sync may still reference them; they are removed when consumed by sync.
-- Password mode requires `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN`; first-time password setup requires the same token.
+- Password provisioning requires direct offline host/container access; there is no bootstrap token or web admin.
 - Plugin server/OIDC URLs must use HTTPS, except localhost development URLs.
 - Leaving the Git remote URL blank is allowed and selects server-local Git storage in `OBSIDIAN_GIT_SYNC_DATA_DIR`.
 - Git remotes must use HTTPS or SSH. Local paths and `file://` remotes are disabled unless `OBSIDIAN_GIT_SYNC_ALLOW_LOCAL_REMOTES=true`.
@@ -323,7 +334,8 @@ To add an Obsidian device:
 
 1. Create an empty vault on the new device, or open the vault you want to connect. Its contents will be reconciled with the server in step 5.
 2. Install and enable ObsidiSync on that device, following [Installation overview](#installation-overview).
-3. In the plugin settings, enter the same sync server URL as on your other devices and click **Log in**. Password mode uses the password you set on the first device; the setup token is only needed once, on the very first login for a server.
+3. In the plugin settings, enter the same sync server URL as on your other devices and click **Log in** using the
+   account provisioned by your server operator (or OIDC). There is no public first-device password setup.
 4. Set **Vault name** to the exact name used on your other devices (for example `personal`). This is what ties the devices to one server-side vault. Give the device a distinct **Computer name** so it is recognisable in file history and the per-device version indicators.
 5. Run **Sync now**. Because this is the device's first sync, the plugin asks how to reconcile:
    - Choose **Overwrite local** to pull the existing vault from the server. This is the normal choice for a new device; the plugin backs up any local files first.
@@ -426,7 +438,10 @@ If a sync is requested while another sync is running, ObsidiSync queues one foll
 The plugin only needs the sync server URL to start login:
 
 1. The plugin calls `GET /v1/auth/config`.
-2. In password mode, the plugin shows a username/password form and calls `/v1/auth/password/login` or `/v1/auth/password/setup`. First-time setup also requires the setup token.
+2. In password mode, the plugin shows a username/password form and calls `/v1/auth/password/login`. If no enabled
+   account exists, updated plugins show operator guidance. Discovery includes `accountProvisioning: "host-local"`
+   and `loginAvailable`. `passwordConfigured: true` tells old plugins to choose login rather than retired setup;
+   it is no longer a count/readiness signal. Updated plugins still support setup against older servers.
 3. In OIDC mode, the server returns the public device-flow client configuration, and the plugin performs device login with the issuer advertised by the server.
 4. The plugin sends the OIDC access token to `POST /v1/auth/oidc/login` and stores only the server-issued access token and refresh token.
 5. The plugin calls `GET /v1/auth/session` to set the user namespace.
@@ -476,7 +491,8 @@ Back up the complete server data directory configured by `OBSIDIAN_GIT_SYNC_DATA
 - `data/users/{user}/vaults/{vault}/repo`
 - `data/users/{user}/vaults/{vault}/binary`
 - `data/users/{user}/vaults/{vault}/state.json`
-- `auth/password.json` when using password mode
+- `auth/accounts.json` and retained legacy `auth/password.json` when using password mode
+- `auth/share-device-passwords.json` when staged share credentials exist
 - `auth/device-passwords.json` when devices sync over WebDAV
 - `auth/sessions.json` (hashed session/refresh-token records)
 - `users/*/vaults/*/uploads` while transfers are incomplete or complete-but-not-yet-consumed
@@ -497,9 +513,86 @@ Restore procedure:
 
 Do not restore only the Git repository without the binary object store. Binary file version retrieval depends on the `binary` directory retaining objects referenced by Git metadata.
 
+## Local administration and authentication upgrade
+
+All administration is offline. Stop the Marvin-managed server and suppress its automatic restart, then take a
+verified filesystem-consistent backup of the complete `/data` directory. Use the actual existing volume and
+pinned upgraded image; this repository does not change Marvin's deployment or choose a production volume.
+
+```bash
+docker run --rm -it --network none --user 10001:10001 \
+  -v <existing-volume>:/data <pinned-image> admin --data-dir /data account create alice
+```
+
+The password prompt does not echo. Protected stdin is supported for automation; never put secrets in arguments,
+environment variables, shell history, or logs. Container/runtime equivalents are acceptable. Do not mount a new
+volume by mistake or recursively change ownership. The existing Docker entrypoint dispatches `admin` without
+starting HTTP or requiring OIDC/server secrets. Run `admin --help` for all positional commands.
+
+For an existing single-user password installation, run `auth import-legacy --dry-run`, review its redacted
+namespace/mapping, then run `auth import-legacy` with the same volume. Optional legacy username configuration
+must agree with the imported namespace. The import copies the exact Argon2 hash and namespace into one enabled
+account with an immutable opaque ID, records completion, and leaves `auth/password.json` untouched for recovery.
+There is no password reset or vault move. A source without a password hash is explicitly recorded as unconfigured;
+create an account offline afterward. Corrupt input, mismatched namespaces, or existing conflicting accounts fail
+without replacement. Repeat import reports the existing mapping and does not retire fresh sessions.
+
+Restart the upgraded server and log in again with the same username/password on each plugin/browser. Old local
+access/refresh tokens return `401`; stale browser cookies redirect to login. OIDC sessions remain compatible.
+New local sessions carry immutable account IDs but expose the same username to v1. Re-login retains the client
+vault slug, head, manifest, registration and conflicts; do not reset registration, force-push, or overwrite local.
+Authentication import does not migrate document storage; that belongs to FEAT-03.
+
+Account commands are `create USER`, `disable ID`, and `list`. Usernames cannot be renamed or reused, including
+disabled accounts. Disable rejects fresh login/refresh; existing access tokens may last until their original
+24-hour expiry. The existing rejected-refresh behavior consumes its whole session, also invalidating that
+access token. Legacy device credentials remain independent and must be revoked separately.
+
+Share commands are `create LABEL`, `rename ID LABEL`, and `list`. Membership commands use explicit typed identities:
+`membership grant SHARE local ACCOUNT_ID read|read-write` or
+`membership grant SHARE oidc ISSUER VERIFIED_SUB read|read-write`; use `revoke` without capability or `list SHARE`.
+Use the server's verified issuer string and exact subject (not the display username). Share labels do not address
+vaults. These records do not enable sharing on the current v1 API.
+
+Credential commands require an explicit `legacy` or `share` target. Legacy create/list use `USER VAULT`, rotation
+and revocation additionally identify the credential ID. `create-saber` reads the encryption password separately
+and preserves existing rendering behavior. Rotation changes only the secret hash; grants/kinds/Saber settings
+remain unchanged. Lists never show hashes, generated secrets, or Saber encryption passwords.
+
+For Harmony, create its share/membership first, then issue a distinct service record, for example:
+`credential share create SHARE_ID local ACCOUNT_ID Household read-write "Harmony service"`.
+The creator must have sufficient membership. OIDC creator syntax also accepts explicit issuer/subject.
+Use `credential share rotate ID`, `revoke ID`, and `list`. Newly generated secrets appear only on creation/rotation.
+Share credentials are stored separately in `auth/share-device-passwords.json` and explicitly marked staged:
+**network access unavailable until FEAT-03**. They cannot authenticate against v1, DAV, Nextcloud or Saber, and
+no legacy DAV URL is supplied. Existing legacy hashes/grants/settings are never silently converted or retargeted.
+
+The server and every admin command hold an exclusive lifetime OS lock on the stable `/data/.obsidisync.lock`.
+Competing processes fail before reading stores or starting a listener. Do not delete/replace that lock file.
+Supported filesystems are local Linux ext4, XFS, Btrfs, overlayfs and tmpfs; tmpfs is suitable only for disposable
+fixtures unless you separately provide persistence. Network/unsupported filesystems fail closed. Old binaries
+and arbitrary host tools do not participate: stop the old server for the first upgrade and never run it beside
+the upgraded CLI. An abrupt exit releases the lock; restart reloads committed files, including device usage state.
+
+`admin --data-dir /data validate` checks account/membership and legacy/staged credential stores offline. Corrupt
+or unknown schemas fail closed rather than resetting state. Stores use restrictive permissions, synced temporary
+files, atomic rename and directory sync. A leftover `.json.tmp` is never promoted; inspect backups offline if a
+write was interrupted. A failure after rename may have committed a complete change: validate/list before retrying.
+If a newly generated secret was not delivered, rotate the corresponding credential again rather than reading it
+from disk. Do not print or share raw auth files while diagnosing recovery.
+
+Rollback before resumed writes means restoring the complete verified pre-import backup and old image/config while
+the service is stopped. After resumed writes, first take a fresh backup and reconcile newer documents/accounts/
+credentials before recovery; blindly restoring the old snapshot loses newer data. Never restore only the Git
+repository or silently reissue device credentials. Deployment, inventory and live verification remain operator work.
+
 ## Server maintenance
 
-- **Password/session compromise recovery:** stop the server, take a protected backup for investigation, and remove both `auth/password.json` and `auth/sessions.json` from the controlled `/data/auth` directory. Start it with a newly generated `OBSIDIAN_GIT_SYNC_PASSWORD_SETUP_TOKEN`, set a new password once, and have every plugin/browser client log in again. This intentionally invalidates every password-mode session and refresh token; do not attempt a partial reset.
+- **Password/session compromise recovery:** stop the server, suppress automatic restart, and take a protected
+  backup for investigation. Disable affected accounts offline and revoke their device credentials separately.
+  Existing access tokens can last up to 24 hours; removing `auth/sessions.json` offline intentionally invalidates
+  all app sessions, including OIDC. There is no password reset/rename command; plan account recovery explicitly.
+  Do not delete `accounts.json` or use the retired public setup flow to recover: that loses identity/membership.
 - Server-issued access tokens last 24 hours. Server-issued refresh tokens last 180 days, are rotated on every refresh, and can only be used once.
 - For OIDC, SSO is used for the initial login exchange. Clients refresh expired app sessions through the sync server; otherwise they should log in again when the plugin reports an expired or unauthorized login.
 - Keep `uploads/` on persistent storage while syncs are active; incomplete entries are automatically cleaned using `OBSIDIAN_GIT_SYNC_INCOMPLETE_UPLOAD_TTL_SECONDS`.
@@ -508,7 +601,9 @@ Do not restore only the Git repository without the binary object store. Binary f
 
 ### Secret-bearing data and logging checklist
 
-Treat the entire `/data` backup as sensitive: repositories and binary objects contain vault contents; `auth/password.json`, `auth/sessions.json`, and `auth/device-passwords.json` contain authentication material. Saber encryption passwords are stored in clear text in `auth/device-passwords.json` when server-side Saber PDF rendering is enabled, so that file can permit decryption of Saber notes. Keep backups encrypted and access-controlled.
+Treat the entire `/data` backup as sensitive: repositories/binary objects contain vault contents, and all files
+under `auth` contain identity or credential material. Saber encryption passwords remain recoverable in
+`auth/device-passwords.json` when rendering is enabled. Keep backups encrypted and access-controlled.
 
 - Redact `Authorization`, cookies, password/setup-token fields, bearer tokens, and full vault/document paths before sharing logs.
 - Do not enable request-body logging in Caddy, Podman, or the server.
@@ -520,7 +615,7 @@ Treat the entire `/data` backup as sensitive: repositories and binary objects co
 - `GET /v1/auth/session`
 - `POST /v1/auth/session/refresh`
 - `POST /v1/auth/oidc/login`
-- `POST /v1/auth/password/setup`
+- `POST /v1/auth/password/setup` retired (`410`, no mutation)
 - `POST /v1/auth/password/login`
 - `POST /v1/users/{user}/vaults/{vault}/register`
 - `POST /v1/users/{user}/vaults/{vault}/uploads`

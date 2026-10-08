@@ -182,7 +182,9 @@ would duplicate or obscure those contracts.
 ### Phase 1 / Subtask A: Principals, local accounts, shares, and host-local administration
 
 Introduce a share/authorization module owned by the Rust server. Persist its small configuration under
-`data/auth` using the existing JSON-plus-temp-file-rename pattern and one process-local lock. This is
+`data/auth` using JSON-plus-temp-file-rename persistence and process-local locks for runtime writes. Server and
+host-local administration must additionally hold one exclusive lifetime OS lock on the data directory; admin
+commands run offline, as specified in FEAT-02. This is
 appropriate for a single-instance household service; it avoids introducing a database or a public control
 plane.
 
@@ -203,8 +205,12 @@ Share
   optional remote/branch/author configuration
 ```
 
-For OIDC, `AuthContext.subject` is the member key; the normalized user name remains display data. For local
+For OIDC, verified issuer and `AuthContext.subject` identify the member; the normalized user name remains display data.
+Membership keys distinguish local IDs from OIDC issuer/subject pairs, as specified in FEAT-02. For local
 password accounts, create immutable random principal IDs and retain a separately validated login name.
+FEAT-02 imports the legacy password hash and namespace offline without moving vault storage, with a documented
+password-session re-login. It preserves legacy device grants and stages new share credentials without network
+activation until Phase 2. Limited client login/setup-state handling belongs to FEAT-02; share selection remains Phase 3.
 Refactor application sessions so they preserve the principal ID as `subject` and the current display/login
 name as `user`. Disabling an account must prevent fresh authentication and refresh; existing bearer-token
 expiry remains bounded by the current 24-hour access-token lifetime unless explicit server-side session

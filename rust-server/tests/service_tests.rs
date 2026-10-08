@@ -21,7 +21,7 @@ const USER: &str = "alice";
 const VAULT: &str = "notes";
 
 #[tokio::test]
-async fn password_mode_get_login_on_fresh_storage_renders_setup_form() {
+async fn password_mode_get_login_on_fresh_storage_requires_offline_account() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = root.path().join("data");
     let app = router(
@@ -52,8 +52,8 @@ async fn password_mode_get_login_on_fresh_storage_renders_setup_form() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_text(response).await;
-    assert!(body.contains("Set password"), "{body}");
-    assert!(body.contains("name=\"setup_token\""), "{body}");
+    assert!(body.contains("server operator"), "{body}");
+    assert!(!body.contains("name=\"setup_token\""), "{body}");
 }
 
 #[test]
@@ -206,9 +206,14 @@ async fn http_authorization_rejects_cross_user_access() {
 }
 
 #[tokio::test]
-async fn password_auth_page_setup_login_and_authorizes_api_requests() {
+async fn password_auth_page_login_and_authorizes_api_requests() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = root.path().join("data");
+    let mut accounts = obsidian_git_sync_server::accounts::AccountStore::default();
+    accounts
+        .create_account("alice", "correct-horse-battery-staple")
+        .unwrap();
+    accounts.save(&data_dir).unwrap();
     let app = router(
         AppState::new(
             VaultService::new(data_dir.clone()),
@@ -231,7 +236,7 @@ async fn password_auth_page_setup_login_and_authorizes_api_requests() {
         .await
         .unwrap();
     assert_eq!(setup_page.status(), StatusCode::OK);
-    assert!(response_text(setup_page).await.contains("Set password"));
+    assert!(response_text(setup_page).await.contains("Log in"));
 
     let config_before_setup = app
         .clone()
@@ -247,7 +252,9 @@ async fn password_auth_page_setup_login_and_authorizes_api_requests() {
     assert_eq!(config_before_setup.status(), StatusCode::OK);
     let config_body = response_json(config_before_setup).await;
     assert_eq!(config_body["type"], "password");
-    assert_eq!(config_body["passwordConfigured"], false);
+    assert_eq!(config_body["passwordConfigured"], true);
+    assert_eq!(config_body["loginAvailable"], true);
+    assert_eq!(config_body["accountProvisioning"], "host-local");
 
     let setup_form = app
         .clone()
@@ -263,10 +270,8 @@ async fn password_auth_page_setup_login_and_authorizes_api_requests() {
         )
         .await
         .unwrap();
-    assert_eq!(setup_form.status(), StatusCode::OK);
-    let setup_html = response_text(setup_form).await;
-    assert!(setup_html.contains("Access token"), "{setup_html}");
-    assert!(setup_html.contains("textarea"));
+    assert_eq!(setup_form.status(), StatusCode::SEE_OTHER);
+    assert!(setup_form.headers().get(header::SET_COOKIE).is_some());
 
     let login = app
         .clone()
@@ -563,7 +568,7 @@ async fn password_auth_page_setup_login_and_authorizes_api_requests() {
 }
 
 #[tokio::test]
-async fn password_setup_requires_bootstrap_token_when_configured() {
+async fn password_setup_is_retired_even_with_bootstrap_token() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = root.path().join("data");
     let app = router(
@@ -593,7 +598,9 @@ async fn password_setup_requires_bootstrap_token_when_configured() {
         .await
         .unwrap();
     let config_body = response_json(config).await;
-    assert_eq!(config_body["setupTokenRequired"], true);
+    assert_eq!(config_body["setupTokenRequired"], false);
+    assert_eq!(config_body["passwordConfigured"], true);
+    assert_eq!(config_body["loginAvailable"], false);
 
     let setup_without_token = app
         .clone()
@@ -613,7 +620,7 @@ async fn password_setup_requires_bootstrap_token_when_configured() {
         )
         .await
         .unwrap();
-    assert_eq!(setup_without_token.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(setup_without_token.status(), StatusCode::GONE);
 
     let setup_with_token = app
         .clone()
@@ -634,40 +641,12 @@ async fn password_setup_requires_bootstrap_token_when_configured() {
         )
         .await
         .unwrap();
-    assert_eq!(setup_with_token.status(), StatusCode::OK);
+    assert_eq!(setup_with_token.status(), StatusCode::GONE);
     let setup_body = response_json(setup_with_token).await;
-    assert_eq!(setup_body["user"], "alice");
-    let setup_access_token = setup_body["accessToken"].as_str().unwrap();
-    let setup_refresh_token = setup_body["refreshToken"].as_str().unwrap();
-    assert!(!setup_access_token.is_empty());
-    assert!(!setup_refresh_token.is_empty());
-    assert_eq!(setup_body["expiresIn"], 86_400);
-    assert_eq!(setup_body["refreshExpiresIn"], 15_552_000);
-
-    let refreshed_setup = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/session/refresh")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "refreshToken": setup_refresh_token }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(refreshed_setup.status(), StatusCode::OK);
-    let refreshed_setup_body = response_json(refreshed_setup).await;
-    assert_ne!(
-        refreshed_setup_body["accessToken"].as_str().unwrap(),
-        setup_access_token
-    );
-    assert_ne!(
-        refreshed_setup_body["refreshToken"].as_str().unwrap(),
-        setup_refresh_token
-    );
+    assert!(setup_body["accessToken"].is_null());
+    assert!(setup_body["error"].as_str().unwrap().contains("offline"));
+    assert!(!root.path().join("data/auth/accounts.json").exists());
+    assert!(!root.path().join("data/auth/sessions.json").exists());
 }
 
 #[tokio::test]

@@ -19,6 +19,8 @@ httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 jsonwebtoken = "9"
 lopdf = "0.44"
+libc = "0.2"
+rpassword = "7"
 pdf-writer = "0.15"
 percent-encoding = "2"
 roxmltree = "0.20"

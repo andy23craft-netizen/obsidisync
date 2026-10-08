@@ -107,6 +107,21 @@ impl ZitadelAuthorization {
 }
 
 impl AuthVerifier {
+    /// Membership identity is derived from the verifier, never a mutable username or client kind.
+    pub fn membership_principal(&self, auth: &AuthContext) -> Result<crate::accounts::Principal> {
+        match self {
+            Self::Password(_) => Ok(crate::accounts::Principal::Local {
+                account_id: auth.subject.clone(),
+            }),
+            Self::Oidc(verifier) => Ok(crate::accounts::Principal::Oidc {
+                issuer: verifier.issuer.clone(),
+                subject: auth.subject.clone(),
+            }),
+            Self::StaticTokenForDev { .. } => {
+                bail!("development identities have no production share membership")
+            }
+        }
+    }
     pub fn oidc(
         issuer: String,
         audience: String,
@@ -228,10 +243,10 @@ impl AuthVerifier {
         match self {
             AuthVerifier::Oidc(verifier) => verifier.verify_session_token(token).await,
             AuthVerifier::Password(verifier) => {
-                let user = verifier.verify_token(token).await?;
+                let session = verifier.verify_token(token).await?;
                 Ok(AuthContext {
-                    subject: user.clone(),
-                    user,
+                    subject: session.subject,
+                    user: session.user,
                 })
             }
             AuthVerifier::StaticTokenForDev {
@@ -254,12 +269,18 @@ impl AuthVerifier {
 
 impl OidcVerifier {
     async fn login(&self, oidc_access_token: &str) -> Result<AppSession> {
-        let auth = self.verify_oidc_token(oidc_access_token).await?;
+        let auth = self
+            .verify_oidc_token(oidc_access_token)
+            .await
+            .map_err(|_| anyhow!("unauthorized: invalid OIDC token"))?;
         self.sessions.issue(auth.user, auth.subject).await
     }
 
     async fn verify_session_token(&self, token: &str) -> Result<AuthContext> {
         let session = self.sessions.verify_access_token(token).await?;
+        if session.local_v1 {
+            bail!("invalid bearer token identity");
+        }
         Ok(AuthContext {
             subject: session.subject,
             user: session.user,
@@ -545,14 +566,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_auth_sets_password_and_verifies_bearer_tokens() {
+    async fn password_auth_uses_offline_account_and_verifies_bearer_tokens() {
         let root = tempfile::tempdir().unwrap();
         let verifier =
             AuthVerifier::password("Alice@example.com".to_string(), root.path()).unwrap();
 
         assert!(!verifier.password_is_configured().await.unwrap());
+        let mut accounts = crate::accounts::AccountStore::default();
+        let id = accounts
+            .create_account("alice", "correct horse battery staple")
+            .unwrap();
+        accounts.save(root.path()).unwrap();
         let session = verifier
-            .setup_password("alice", "correct horse battery staple", None)
+            .login_password("alice", "correct horse battery staple")
             .await
             .unwrap();
         assert_eq!(session.user, "alice");
@@ -565,6 +591,7 @@ mod tests {
         );
         let auth = verifier.verify_headers(&headers).await.unwrap();
         assert_eq!(auth.user, "alice");
+        assert_eq!(auth.subject, id);
 
         assert!(verifier
             .login_password("alice", "wrong password")
@@ -577,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_setup_requires_configured_bootstrap_token() {
+    async fn password_setup_is_retired_regardless_of_token() {
         let root = tempfile::tempdir().unwrap();
         let verifier = AuthVerifier::password_with_setup_token(
             "Alice@example.com".to_string(),
@@ -598,15 +625,14 @@ mod tests {
             )
             .await
             .is_err());
-        let session = verifier
+        assert!(verifier
             .setup_password(
                 "alice",
                 "correct horse battery staple",
                 Some("setup-token-123456"),
             )
             .await
-            .unwrap();
-        assert_eq!(session.user, "alice");
+            .is_err());
     }
 
     #[tokio::test]
