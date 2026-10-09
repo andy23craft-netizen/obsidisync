@@ -1,0 +1,21 @@
+digraph context {
+  graph [rankdir=TB, bgcolor="#ffffff", pad=0.4, nodesep=0.65, ranksep=0.8,
+    fontname="Arial", labelloc=t, label="ObsidiSync | System context\nCurrent repository architecture", fontsize=23];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=13,
+    margin="0.22,0.18", color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+  edge [fontname="Arial", fontsize=11, color="#64748b", fontcolor="#334155", arrowsize=0.8];
+
+  household [label="Household member\n[Person]\nEdits notes and attachments"];
+  operator [label="Operator\n[Person]\nProvisions identities and publishes storage"];
+  sync [label="ObsidiSync\n[Software system]\nObsidian plugin + self-hosted Rust server\nSynchronizes documents and preserves history",
+    fillcolor="#dbeafe", color="#2563eb", penwidth=2];
+  dav [label="WebDAV / Saber clients\n[External software]\nFolder-scoped document access"];
+  oidc [label="OIDC provider (optional auth mode)\n[External system]\nVerifies identity at login"];
+  remote [label="Git remote (optional per share)\n[External system]\nText history + binary manifest; no binary objects"];
+
+  household -> sync [label="Edit, sync, resolve conflicts, browse history"];
+  operator -> sync [label="Offline administration; server stopped"];
+  dav -> sync [label="DAV / Nextcloud compatibility\nDevice credential"];
+  sync -> oidc [label="Login verification / provider keys\nwhen OIDC is configured"];
+  sync -> remote [label="Fetch / rebase / push\nwhen remote is configured"];
+}

@@ -1,0 +1,45 @@
+digraph container {
+  graph [rankdir=LR, bgcolor="#ffffff", pad=0.4, nodesep=0.55, ranksep=0.85,
+    fontname="Arial", labelloc=t, fontsize=23,
+    label="ObsidiSync | Containers and storage boundaries\nCurrent client: v1   |   Current server: v2 shares + explicit v1 compatibility"];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=12,
+    margin="0.2,0.17", color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+  edge [fontname="Arial", fontsize=10, color="#64748b", fontcolor="#334155", arrowsize=0.8];
+
+  subgraph cluster_device {
+    label="User device / Obsidian runtime"; fontsize=16; color="#94a3b8"; style=rounded;
+    plugin [label="Obsidian plugin\n[Container: TypeScript]\nOne remote vault, head and manifest\nSync, conflict UI, file history", fillcolor="#dbeafe", color="#2563eb"];
+    local [label="Local vault + plugin data\n[Filesystem]\nMarkdown, attachments, sync state\nServer session tokens", shape=cylinder, fillcolor="#fef3c7"];
+    plugin -> local [label="Read edits / apply server files\nPersist synchronization progress"];
+  }
+  dav [label="WebDAV / Saber clients\n[External software]\nIndependent device credentials"];
+  native [label="Share API consumers\n[External software]\nNative session + share membership\nObsidian share selection is pending"];
+  oidc [label="OIDC provider\n[External system, optional]"];
+
+  subgraph cluster_host {
+    label="Self-hosted Linux server | TLS, deployment and backups owned by operator / Marvin";
+    fontsize=16; color="#94a3b8"; style=rounded;
+    server [label="Sync server\n[Container: Rust / Axum + Git CLI]\nv1 aliases, v2 shares, DAV / Nextcloud, browser UI\nAuthenticate and authorize before storage access\nMerge, history, uploads; legacy Saber workers",
+      fillcolor="#dbeafe", color="#2563eb", penwidth=2];
+    admin [label="Offline admin CLI\n[Container: same Rust executable]\nAccounts, memberships, grants\nMigration / publication / compatibility", fillcolor="#dbeafe", color="#2563eb"];
+    auth [label="Identity and publication stores\n[Filesystem: data/auth/]\nAccounts, memberships, hashed sessions/grants\nPublished share IDs and exact v1 mappings",
+      shape=cylinder, fillcolor="#fef3c7"];
+    shares [label="Independent share roots\n[Filesystem: data/shares/{opaque_id}/]\nrepo/: Git text + binary manifest\nbinary/: content-addressed attachment objects\nuploads/, state.json, device/conflict metadata\nEach share has its own history and state",
+      shape=cylinder, fillcolor="#dcfce7", color="#16a34a", penwidth=2];
+    legacy [label="Retained legacy trees / migration staging\n[Filesystem]\nRecovery material; no serving fallback",
+      shape=cylinder, fillcolor="#fef3c7"];
+    admin -> auth [label="Explicit durable administration\nAtomic publication manifest"];
+    admin -> shares [label="Prepare / validate / publish roots"];
+    admin -> legacy [label="Reviewed migration copies sources\nOriginal trees retained"];
+    server -> auth [label="Resolve identity, publication,\nmembership or independent grant"];
+    server -> shares [label="Authorized storage operations\nShared lock for v1 / v2 / DAV"];
+  }
+  remote [label="Git remote\n[External system, optional per share]\nSeparate trust boundary"];
+  plugin -> server [label="HTTPS: /v1/users/{user}/vaults/{vault}\nBearer session; explicit mapping to a share", penwidth=2, color="#2563eb"];
+  native -> server [label="HTTPS: /v2/shares/{id}/...\nBearer session + read / read-write membership"];
+  dav -> server [label="HTTPS: DAV / Nextcloud\nPublished share + folder / capability grant"];
+  plugin -> oidc [label="Device login in OIDC mode", style=dashed];
+  server -> oidc [label="Verify provider identity / keys", style=dashed];
+  server -> remote [label="Git fetch / rebase / push\nText + binary metadata only", style=dashed];
+  admin -> server [style=invis];
+}

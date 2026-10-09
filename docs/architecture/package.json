@@ -1,0 +1,8 @@
+{
+  "name": "obsidisync-architecture-diagrams",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@viz-js/viz": "3.31.0"
+  }
+}
