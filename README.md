@@ -338,7 +338,9 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 
 ### Adding another device to a vault
 
-FEAT-04 client share selection is planned, not implemented. Its approved transition contracts are documented in
+Share discovery and pending selection are implemented; v2 file synchronization remains disabled. See
+[Client share selection](docs/CLIENT_SHARE_SELECTION.md) for selection/cancellation and retained v1 state.
+The remaining FEAT-04 transition contracts are documented in
 [Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md#approved-client-transition-contract-feat-04-not-yet-implemented).
 They require feature-based v2 negotiation, per-file read-only preservation with explicit reconciliation, and retained
 namespace-authorized legacy DAV/Saber credential management. Current plugin instructions below describe v1 behavior.

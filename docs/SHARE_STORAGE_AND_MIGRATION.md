@@ -72,7 +72,8 @@ share. Existing client provisioning authenticates the typed session and checks t
 
 ## Approved client transition contract (FEAT-04, not yet implemented)
 
-The current plugin still uses v1 sync. FEAT-04 will select v2 from the advertised `shareSyncV2` feature;
+The current plugin still uses v1 file sync. [Pending share selection](CLIENT_SHARE_SELECTION.md) uses the advertised
+`shareSyncV2` feature, preserves old state and blocks file synchronization until explicit reconciliation is implemented;
 `/v1/server/info` reporting API version 1 does not mean v2 is unavailable. Old servers retain intentional writable
 v1 operation, but v2 authorization denial must never cause automatic v1 sync fallback.
 

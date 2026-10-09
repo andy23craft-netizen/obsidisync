@@ -11,6 +11,7 @@ import { ServerInfoResponse, SyncConflict } from "./protocol";
 import { createClientId, generateComputerName, slugFromName } from "./runtime";
 import { DEFAULT_SETTINGS, IosGitSyncSettings, IosGitSyncSettingTab } from "./settings";
 import { sha256Hex } from "./vaultState";
+import { ShareSelectionModal } from "./shareSelectionModal";
 
 const LOGIN_RENEWAL_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -165,6 +166,10 @@ export default class ObsidiSyncPlugin extends Plugin {
     if (this.gitService) this.gitService.updateSettings(this.settings);
   }
 
+  openShareSelectionModal(): void {
+    new ShareSelectionModal(this.app, this.gitService, this.settings).open();
+  }
+
   openLoginModal(): void {
     new AuthLoginModal(this.app, this.gitService, async () => {
       await this.saveSettings();
@@ -229,6 +234,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async resetLocalSyncState(): Promise<void> {
+    const blocked = this.gitService.destinationBlocker();
+    if (blocked) throw new Error(blocked);
     this.settings.serverHead = null;
     this.settings.localManifest = [];
     await this.saveSettings();
@@ -530,6 +537,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async syncNow(): Promise<void> {
+    const blocked = this.gitService.destinationBlocker();
+    if (blocked) { new Notice(blocked); return; }
     if (this.needsInitialSyncSetup()) {
       this.openInitialSyncModal();
       return;

@@ -1,9 +1,15 @@
-import { App, PluginSettingTab, Setting, TextComponent } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, TextComponent } from "obsidian";
 import ObsidiSyncPlugin from "./main";
 import { devicePasswordsAvailabilityMessage } from "./devicePasswords";
 import { ManifestEntry } from "./protocol";
+import type { ClientIdentity, LegacyManagementContext, LegacySyncBinding, PendingShareSelection } from "./shareSelection";
+import { syncDestinationBlocker } from "./shareSelection";
 
 export interface IosGitSyncSettings {
+  authenticatedIdentity?: ClientIdentity;
+  legacyManagementContext?: LegacyManagementContext;
+  legacySyncBinding?: LegacySyncBinding;
+  pendingShareSelection?: PendingShareSelection | null;
   serverUrl: string;
   oidcIssuer: string;
   oidcClientId: string;
@@ -142,6 +148,16 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Server share selection")
+      .setDesc("Discover authorized shares and stage an explicit selection. V2 file synchronization remains disabled.")
+      .addButton((button) => button.setButtonText("Choose share").onClick(() => this.plugin.openShareSelectionModal()));
+
+    if (this.plugin.settings.pendingShareSelection) {
+      new Setting(containerEl).setName("Pending share")
+        .setDesc(`${this.plugin.settings.pendingShareSelection.label}: reconciliation required; existing v1 state retained.`);
+    }
+
+    new Setting(containerEl)
       .setName("Author name")
       .addText((text) =>
         text.setValue(this.plugin.settings.authorName).onChange(async (value) => {
@@ -240,11 +256,12 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Access token")
-      .setDesc("Manual fallback for static-token development servers or recovery.")
+      .setDesc("Manual fallback for static-token development servers or recovery. After changing a token, use Server Check to verify its identity.")
       .addText((text) => {
         accessTokenText = text;
         text.inputEl.type = "password";
         text.setValue(this.plugin.settings.oidcAccessToken).onChange(async (value) => {
+          if (value !== this.plugin.settings.oidcAccessToken) this.plugin.settings.authenticatedIdentity = undefined;
           this.plugin.settings.oidcAccessToken = value;
           await this.plugin.saveSettings();
         });
@@ -277,6 +294,8 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
       .setDesc("Forget the last synced commit and manifest. Local files are not changed. The next sync asks again how to reconcile this vault with the server.")
       .addButton((button) =>
         button.setButtonText("Reset").onClick(async () => {
+          const blocked = syncDestinationBlocker(this.plugin.settings);
+          if (blocked) { new Notice(blocked); return; }
           this.plugin.settings.serverHead = null;
           this.plugin.settings.localManifest = [];
           this.plugin.settings.initialSyncDone = false;

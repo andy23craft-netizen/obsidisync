@@ -18,6 +18,8 @@ import {
   SyncResponse,
   ManifestEntry,
   ServerInfoResponse,
+  ShareEntry,
+  ShareSyncState,
   UploadChunkResponse,
   UploadCompleteResponse,
   UploadInitRequest,
@@ -37,6 +39,7 @@ import {
 import { IosGitSyncSettings } from "./settings";
 import { assertGitBranch, assertNamespaceSlug, assertSecureHttpUrl } from "./security";
 import { ServerUpsert, sha256Hex, VaultState } from "./vaultState";
+import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./shareSelection";
 
 type SaveSettings = () => Promise<void>;
 type ConflictNoticeHandler = (conflicts: SyncConflict[]) => void;
@@ -122,6 +125,7 @@ export class GitService {
   private oidcLoginConfig: Extract<ServerAuthConfig, { type: "oidc" }> | null = null;
   private oidcLoginServerUrl: string | null = null;
   private refreshInFlight: Promise<boolean> | null = null;
+  private selectionRevision = 0;
 
   constructor(
     private readonly vault: Vault,
@@ -129,7 +133,78 @@ export class GitService {
     private readonly saveSettings: SaveSettings,
     private readonly onConflictNotice?: ConflictNoticeHandler,
     private readonly syncBlocker?: SyncBlocker
-  ) {}
+  ) { captureLegacyContext(this.settings); }
+
+  destinationBlocker(): string | null {
+    return syncDestinationBlocker(this.settings);
+  }
+
+  private rememberAuthenticatedUser(session: AuthSessionResponse | PasswordLoginResponse): void {
+    captureLegacyContext(this.settings);
+    if (session.subject) {
+      this.settings.authenticatedIdentity = {
+        serverUrl: serverIdentity(this.settings.serverUrl), user: session.user, subject: session.subject
+      };
+      const binding = this.settings.legacySyncBinding;
+      if (binding && !binding.subject && binding.serverUrl === serverIdentity(this.settings.serverUrl) &&
+          binding.userSlug === session.user) binding.subject = session.subject;
+    }
+    this.settings.userSlug = session.user;
+  }
+
+  async discoverShares(): Promise<ShareEntry[]> {
+    const serverUrl = serverIdentity(this.settings.serverUrl);
+    const info = await this.checkServerCompatibility();
+    if (!info.features?.includes("shareSyncV2")) throw new Error("This server does not advertise shareSyncV2. Existing v1 synchronization remains available.");
+    const session = await this.getJson<AuthSessionResponse>("/v1/auth/session");
+    if (!session.subject || !session.user || serverIdentity(this.settings.serverUrl) !== serverUrl) {
+      throw new Error("Server or authenticated session changed during share discovery. Try again.");
+    }
+    this.rememberAuthenticatedUser(session);
+    await this.saveSettings();
+    const shares = await this.getJson<ShareEntry[]>("/v2/shares");
+    if (!Array.isArray(shares) || shares.some((share) => !validShare(share))) {
+      throw new Error("Server returned an invalid share list");
+    }
+    if (serverIdentity(this.settings.serverUrl) !== serverUrl) throw new Error("Server changed during share discovery");
+    return shares;
+  }
+
+  async stageShareSelection(shareId: string): Promise<void> {
+    if (this.running) throw new Error("Wait for synchronization to finish before selecting a share");
+    const revision = ++this.selectionRevision;
+    const shares = await this.discoverShares();
+    const share = shares.find((entry) => entry.shareId === shareId);
+    if (!share) throw new Error("Share is unavailable or inaccessible");
+    const identity = { ...this.settings.authenticatedIdentity! };
+    const token = this.settings.oidcAccessToken;
+    const config = await this.authConfig();
+    if (!["password", "oidc", "token"].includes(config.type)) throw new Error("Invalid authentication configuration");
+    const state = await this.getJson<ShareSyncState>(`/v2/shares/${encodeURIComponent(share.shareId)}/sync-state`);
+    if (this.running || revision !== this.selectionRevision || token !== this.settings.oidcAccessToken ||
+        serverIdentity(this.settings.serverUrl) !== identity.serverUrl ||
+        JSON.stringify(this.settings.authenticatedIdentity) !== JSON.stringify(identity) || this.settings.userSlug !== identity.user) {
+      throw new Error("Selection context changed. Try again after synchronization/login finishes.");
+    }
+    if (state.shareId !== share.shareId || !["read", "read-write"].includes(state.capability) ||
+        state.apiVersion !== 2 || !(state.serverHead === null || typeof state.serverHead === "string")) {
+      throw new Error("Server returned invalid share negotiation");
+    }
+    this.settings.pendingShareSelection = {
+      shareId: share.shareId, label: share.label, capability: state.capability, serverUrl: identity.serverUrl, identity,
+      authentication: config.type === "oidc" ? `oidc:${config.issuer}` : config.type,
+      status: "reconciliation-required", observedHead: state.serverHead,
+      syncState: { serverHead: null, localManifest: [], initialSyncDone: false }
+    };
+    await this.saveSettings();
+  }
+
+  async cancelShareSelection(): Promise<void> {
+    if (this.running) throw new Error("Wait for synchronization to finish before cancelling a selection");
+    ++this.selectionRevision;
+    this.settings.pendingShareSelection = null;
+    await this.saveSettings();
+  }
 
   updateSettings(settings: IosGitSyncSettings): void {
     if (settings.serverUrl !== this.settings.serverUrl) {
@@ -240,14 +315,14 @@ export class GitService {
     }
 
     const body = response.json as PasswordLoginResponse;
-    await this.storeServerSessionResponse(body);
+    await this.storeServerSessionResponse(body, serverUrl);
   }
 
   async loadAuthenticatedUser(): Promise<void> {
     if (!this.settings.oidcAccessToken) throw new Error("Log in before loading the authenticated user");
     await this.checkServerCompatibility();
     const session = await this.getJson<AuthSessionResponse>("/v1/auth/session");
-    this.settings.userSlug = session.user;
+    this.rememberAuthenticatedUser(session);
     this.settings.lastLoginError = null;
     await this.saveSettings();
     this.emitLoginStatus();
@@ -725,7 +800,10 @@ export class GitService {
     return info;
   }
 
-  private async storeServerSessionResponse(body: ServerSessionResponse | PasswordLoginResponse): Promise<void> {
+  private async storeServerSessionResponse(body: ServerSessionResponse | PasswordLoginResponse, serverUrl: string): Promise<void> {
+    if (serverIdentity(this.settings.serverUrl) !== serverIdentity(serverUrl)) {
+      throw new Error("Server changed during login/refresh. Log in again.");
+    }
     if (!body.accessToken) throw new Error("Server session response did not include an access token");
     if (!body.refreshToken) throw new Error("Server session response did not include a refresh token");
     this.settings.oidcAccessToken = body.accessToken;
@@ -736,7 +814,7 @@ export class GitService {
       typeof body.expiresIn === "number" && Number.isFinite(body.expiresIn) && body.expiresIn > 0
         ? new Date(Date.now() + body.expiresIn * 1000).toISOString()
         : null;
-    this.settings.userSlug = body.user;
+    this.rememberAuthenticatedUser(body);
     await this.saveSettings();
     this.emitLoginStatus();
   }
@@ -753,7 +831,7 @@ export class GitService {
     if (response.status < 200 || response.status >= 300) {
       throw new Error(response.text || `OIDC server session exchange failed: HTTP ${response.status}`);
     }
-    await this.storeServerSessionResponse(response.json as ServerSessionResponse);
+    await this.storeServerSessionResponse(response.json as ServerSessionResponse, serverUrl);
   }
 
   private async refreshOidcAccessToken(): Promise<boolean> {
@@ -779,7 +857,7 @@ export class GitService {
     });
     const body = (response.json ?? {}) as Partial<ServerSessionResponse> & OidcTokenResponse;
     if (response.status >= 200 && response.status < 300 && body.accessToken) {
-      await this.storeServerSessionResponse(body as ServerSessionResponse);
+      await this.storeServerSessionResponse(body as ServerSessionResponse, serverUrl);
       return true;
     }
 
@@ -917,10 +995,21 @@ export class GitService {
   }
 
   private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<RequestUrlResponse> {
+    const assertDestination = () => {
+      if (path.startsWith("/v1/users/")) {
+        const blocked = this.destinationBlocker();
+        if (blocked) throw new Error(blocked);
+      }
+    };
+    assertDestination();
     const serverUrl = this.settings.serverUrl.replace(/\/+$/, "");
     await this.refreshExpiringOidcAccessToken();
-    const send = () =>
-      requestUrl({
+    assertDestination();
+    const send = () => {
+      if (serverIdentity(this.settings.serverUrl) !== serverIdentity(serverUrl)) {
+        throw new Error("Server changed during request. Try again.");
+      }
+      return requestUrl({
         url: `${serverUrl}${path}`,
         method,
         ...(body === undefined ? {} : { contentType: "application/json", body: JSON.stringify(body) }),
@@ -929,19 +1018,20 @@ export class GitService {
         },
         throw: false
       });
+    };
 
     let response = await send();
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       if (await this.refreshOidcAccessToken()) {
+        assertDestination();
         response = await send();
-        if (response.status >= 200 && response.status < 300) {
-          return response;
+      }
+      if (response.status === 401) {
+        if (!this.settings.lastLoginError) {
+          await this.recordLoginFailure("Login expired or unauthorized. Log in to ObsidiSync again.");
         }
+        throw new Error("Login expired or unauthorized. Log in to ObsidiSync again.");
       }
-      if (!this.settings.lastLoginError) {
-        await this.recordLoginFailure("Login expired or unauthorized. Log in to ObsidiSync again.");
-      }
-      throw new Error("Login expired or unauthorized. Log in to ObsidiSync again.");
     }
 
     if (response.status < 200 || response.status >= 300) {
@@ -1017,6 +1107,9 @@ export class GitService {
   }
 
   private requireConfigured(): void {
+    captureLegacyContext(this.settings);
+    const blocked = this.destinationBlocker();
+    if (blocked) throw new Error(blocked);
     if (!this.settings.serverUrl) throw new Error("Set a sync server URL before syncing");
     if (!this.settings.oidcAccessToken) throw new Error("Set an access token before syncing");
     if (!this.settings.userSlug) throw new Error("Set a user namespace before syncing");
@@ -1109,4 +1202,9 @@ function serverErrorMessage(text: string | undefined, status: number): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function validShare(share: ShareEntry): boolean {
+  return !!share && typeof share.shareId === "string" && /^s_[a-f0-9]{32}$/.test(share.shareId) &&
+    typeof share.label === "string" && ["read", "read-write"].includes(share.capability);
 }

@@ -167,6 +167,20 @@ export interface ServerInfoResponse {
   features?: string[];
 }
 
+export interface ShareEntry {
+  shareId: string;
+  label: string;
+  capability: "read" | "read-write";
+}
+
+export interface ShareSyncState {
+  shareId: string;
+  serverHead: string | null;
+  branch: string;
+  capability: ShareEntry["capability"];
+  apiVersion: number;
+}
+
 export type DeviceKind = "webdav" | "saber";
 
 export interface DevicePasswordEntry {
