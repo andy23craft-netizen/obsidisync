@@ -35,6 +35,7 @@ export function serverIdentity(url: string): string {
 }
 
 export function captureLegacyContext(settings: IosGitSyncSettings): void {
+  if (settings.activeShare || settings.pendingShareSelection) return;
   if (!settings.serverUrl || !settings.userSlug || !settings.vaultSlug) return;
   const context = {
     serverUrl: serverIdentity(settings.serverUrl), userSlug: settings.userSlug, vaultSlug: settings.vaultSlug

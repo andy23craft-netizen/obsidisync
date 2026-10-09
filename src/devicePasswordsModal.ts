@@ -1,189 +1,183 @@
 import { App, Modal, Notice, Setting } from "obsidian";
-import type { ButtonComponent } from "obsidian";
-import { DEFAULT_DEVICE_FOLDER, describeDevicePassword, deviceUrl, normalizeDeviceFolder, webdavUrl } from "./devicePasswords";
+import { DEFAULT_DEVICE_FOLDER, describeDevicePassword, deviceUrl, normalizeDeviceFolder, webdavUrl,
+  shareCredentialPaths } from "./devicePasswords";
 import { GitService } from "./gitService";
-import { CreatedDevicePassword } from "./protocol";
+import type { CreatedDevicePassword, CreatedShareCredential } from "./protocol";
 
-/**
- * Creates, lists, and revokes per-device WebDAV passwords for the current vault.
- * The generated password is shown exactly once, right after creation.
- */
+/** Independent inventories. Secrets exist only in this open modal, never in plugin settings. */
 export class DevicePasswordsModal extends Modal {
-  private label = "";
-  private folder = DEFAULT_DEVICE_FOLDER;
-  private createdEl: HTMLElement | null = null;
-  private listEl: HTMLElement | null = null;
-  private statusEl: HTMLElement | null = null;
+  private closed = false;
+  private contextKey = "";
 
-  constructor(
-    app: App,
-    private readonly gitService: GitService,
-    private readonly serverUrl: string
-  ) {
+  constructor(app: App, private readonly gitService: GitService, private readonly serverUrl: string) {
     super(app);
+    this.contextKey = gitService.credentialContextKey();
   }
 
   async onOpen(): Promise<void> {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: "Device passwords" });
-    contentEl.createEl("p", {
-      text:
-        "Give an e-ink tablet or another WebDAV client access to one folder of this vault. " +
-        "Each device gets its own password that you can revoke at any time. " +
-        "Files the device uploads appear in Obsidian after the next sync."
-    });
-    contentEl.createEl("p", {
-      text:
-        "Using the Saber handwriting app? Do not create a password here: in Saber choose \"Log in with Nextcloud\", " +
-        "enter this sync server's URL, and finish the login in the browser. The device then appears in this list."
-    });
-
+    this.closed = false;
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: "Device passwords" });
+    this.contentEl.createEl("p", { text: "Grants are independently revocable. Removing or disabling their creator does not " +
+      "revoke them. Retired shares deny access. Ask the host operator to inventory or revoke grants if management is unavailable." });
     if (this.gitService.loginStatus().state !== "logged-in") {
-      contentEl.createEl("p", { text: "Log in to ObsidiSync before managing device passwords." });
+      this.contentEl.createEl("p", { text: "Log in to ObsidiSync before managing device passwords." });
       return;
     }
+    const legacy = this.contentEl.createDiv();
+    const native = this.contentEl.createDiv();
+    await this.renderLegacy(legacy);
+    if (!this.closed) await this.renderShare(native);
+  }
 
-    const checking = contentEl.createEl("p", { text: "Checking the sync server..." });
+  onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+
+  private async renderLegacy(container: HTMLElement): Promise<void> {
+    if (this.closed) return;
+    container.empty();
+    container.createEl("h3", { text: "Legacy DAV / Saber grants" });
     try {
+      this.assertContext();
+      const context = this.gitService.legacyCredentialContext();
+      container.createEl("p", { text: `Original namespace: ${context.userSlug}/${context.vaultSlug}. ` +
+        "Access is checked for this namespace independently of the selected share. Existing passwords and URLs are retained." });
       const unavailable = await this.gitService.devicePasswordsUnavailableReason();
-      if (unavailable) {
-        checking.setText(unavailable);
-        return;
+      if (unavailable) throw new Error(unavailable);
+      const inventory = await this.gitService.legacyCredentialInventory();
+      if (this.closed) return;
+      this.assertContext();
+      container.createEl("p", { text: "Existing Saber clients keep their original Nextcloud login, encryption and PDF settings. " +
+        "Saber provisioning uses the existing browser login in this original mapped namespace. Historical #tablet exports " +
+        "may scan that entire original vault, beyond the DAV folder restriction, but cannot enter other shares." });
+      if (!inventory.managementAllowed) container.createEl("p", { text: "Inventory is visible, but the server has not " +
+        "authorized grant management. Create/revoke controls are unavailable; ask the host operator." });
+      const created = container.createDiv();
+      if (inventory.managementAllowed) this.creationForm(container, false, true, async (label, folder) => {
+        const result = await this.gitService.createDevicePassword(label, folder);
+        this.assertContext();
+        if (!this.closed) this.renderCreated(created, result, context.serverUrl);
+      });
+      if (!inventory.entries.length) container.createEl("p", { text: "No legacy grants." });
+      for (const entry of inventory.entries) {
+        const row = new Setting(container).setName(entry.label).setDesc(describeDevicePassword(entry, context.serverUrl));
+        this.copyButton(row, "Copy URL", deviceUrl(entry, context.serverUrl));
+        if (inventory.managementAllowed) this.revokeButton(row, () => this.gitService.revokeDevicePassword(entry.id),
+          () => this.renderLegacy(container));
       }
     } catch (error) {
-      checking.setText(`Could not reach the sync server: ${errorMessage(error)}`);
-      return;
-    }
-    checking.remove();
-
-    this.createdEl = contentEl.createDiv();
-
-    contentEl.createEl("h3", { text: "New device password" });
-    new Setting(contentEl)
-      .setName("Device name")
-      .setDesc("Shown in sync history for files this device uploads.")
-      .addText((text) =>
-        text.setPlaceholder("Boox tablet").onChange((value) => {
-          this.label = value.trim();
-        })
-      );
-
-    new Setting(contentEl)
-      .setName("Folder")
-      .setDesc("Vault folder the device may read and write. It is created on the first upload.")
-      .addText((text) =>
-        text
-          .setPlaceholder("Tablet/Notes")
-          .setValue(this.folder)
-          .onChange((value) => {
-            this.folder = value;
-          })
-      );
-
-    new Setting(contentEl).addButton((button) =>
-      button
-        .setCta()
-        .setButtonText("Create password")
-        .onClick(() => void this.create(button))
-    );
-
-    contentEl.createEl("h3", { text: "Existing device passwords" });
-    this.listEl = contentEl.createDiv();
-    this.statusEl = contentEl.createEl("p", { text: "" });
-    await this.refreshList();
-  }
-
-  private async create(button: ButtonComponent): Promise<void> {
-    try {
-      if (!this.label) throw new Error("Enter a device name");
-      const folder = normalizeDeviceFolder(this.folder);
-      button.setDisabled(true);
-      const created = await this.gitService.createDevicePassword(this.label, folder);
-      this.renderCreated(created);
-      await this.refreshList();
-      this.setStatus("");
-    } catch (error) {
-      this.setStatus(`Could not create device password: ${errorMessage(error)}`);
-    } finally {
-      button.setDisabled(false);
+      if (!this.closed) container.createEl("p", { text: `Legacy management unavailable: ${errorMessage(error)} ` +
+        "Original context is retained. Namespace authorization or native compatibility cutoff may prevent management; " +
+        "existing DAV/Saber grants can remain usable. Ask the host operator." });
     }
   }
 
-  private renderCreated(created: CreatedDevicePassword): void {
-    const container = this.createdEl;
-    if (!container) return;
+  private async renderShare(container: HTMLElement): Promise<void> {
+    if (this.closed) return;
     container.empty();
-    container.createEl("h3", { text: `Password for ${created.label}` });
-    container.createEl("p", {
-      text: "Enter these values in the device's WebDAV settings. The password is shown only once; create a new one if you lose it."
-    });
+    container.createEl("h3", { text: "Share-native DAV grants" });
+    try {
+      this.assertContext();
+      const inventory = await this.gitService.shareCredentialInventory();
+      if (this.closed) return;
+      this.assertContext();
+      const writable = inventory.capability === "read-write";
+      container.createEl("p", { text: `Share ID / Basic and OCS username: ${inventory.shareId}. ` +
+        "New grants are staged until explicit offline host-operator activation. Activation preserves the ID and secret. " +
+        "These grants do not enable Saber scanning, rendering or pushing. A device bearer secret has the same grant scope; " +
+        "it is not a native synchronization session." });
+      if (!writable) container.createEl("p", { text: "Read-only membership can issue read grants. Revocation requires " +
+        "write membership or the host operator." });
+      const created = container.createDiv();
+      this.creationForm(container, true, writable, async (label, folder, capability) => {
+        const result = await this.gitService.createShareCredential(label, folder, capability);
+        this.assertContext();
+        if (!this.closed) this.renderCreated(created, result, this.serverUrl);
+      });
+      if (!inventory.entries.length) container.createEl("p", { text: "No share-native grants." });
+      for (const entry of inventory.entries) {
+        const paths = shareCredentialPaths(entry.shareId, entry.folder);
+        const row = new Setting(container).setName(entry.label)
+          .setDesc(`${entry.id} | ${entry.lifecycle} | ${entry.capability} | folder ${entry.folder}`);
+        this.copyButton(row, "Copy DAV URL", webdavUrl(this.serverUrl, paths.webdavPath));
+        this.copyButton(row, "Copy Nextcloud URL", webdavUrl(this.serverUrl, paths.nextcloudPath));
+        if (writable) this.revokeButton(row, () => this.gitService.revokeShareCredential(entry.id),
+          () => this.renderShare(container));
+      }
+    } catch (error) {
+      if (!this.closed) container.createEl("p", { text: `Share-native management unavailable: ${errorMessage(error)}` });
+    }
+  }
 
-    const url = webdavUrl(this.serverUrl, created.webdavPath);
-    this.renderCopyRow(container, "WebDAV URL", url);
+  private creationForm(container: HTMLElement, native: boolean, writable: boolean,
+      create: (label: string, folder: string, capability: "read" | "read-write") => Promise<void>): void {
+    let label = "";
+    let folder = DEFAULT_DEVICE_FOLDER;
+    const status = container.createEl("p", { text: "" });
+    new Setting(container).setName("Device name").addText(text => text.onChange(value => { label = value.trim(); }));
+    new Setting(container).setName("Folder").addText(text => text.setValue(folder).onChange(value => { folder = value; }));
+    const capabilities: ("read" | "read-write")[] = native ? (writable ? ["read", "read-write"] : ["read"]) : ["read-write"];
+    const buttons: { setDisabled(value: boolean): unknown }[] = [];
+    for (const capability of capabilities) new Setting(container).addButton(button => {
+      buttons.push(button);
+      button.setButtonText(native ? `Create staged ${capability} grant` : "Create password").onClick(async () => {
+        try {
+          if (!label) throw new Error("Enter a device name");
+          const normalized = normalizeDeviceFolder(folder);
+          this.assertContext();
+          buttons.forEach(item => item.setDisabled(true));
+          await create(label, normalized, capability);
+          status.setText("Created. Copy the one-time secret now, then reopen this modal to refresh inventory.");
+        } catch (error) {
+          status.setText(`Creation did not complete: ${errorMessage(error)}. If the response was lost, refresh inventory ` +
+            "before issuing another grant; secrets cannot be recovered. No automatic creation retry is performed.");
+        } finally {
+          buttons.forEach(item => item.setDisabled(false));
+        }
+      });
+    });
+  }
+
+  private renderCreated(container: HTMLElement, created: CreatedDevicePassword | CreatedShareCredential, serverUrl: string): void {
+    container.empty();
+    container.createEl("h3", { text: `Created grant ${created.id}` });
+    container.createEl("p", { text: "The password is shown only once. Copy it before closing this modal." });
+    if ("shareId" in created) {
+      container.createEl("p", { text: "STAGED: ask the host operator to run credential share activate with this ID offline. " +
+        "Do not reissue the secret to activate it. No automatic activation occurs." });
+      this.renderCopyRow(container, "Nextcloud / OCS URL", webdavUrl(serverUrl, created.nextcloudPath));
+    }
+    this.renderCopyRow(container, "WebDAV URL", webdavUrl(serverUrl, created.webdavPath));
     this.renderCopyRow(container, "Username", created.username);
     this.renderCopyRow(container, "Password", created.password);
   }
 
   private renderCopyRow(container: HTMLElement, name: string, value: string): void {
-    new Setting(container)
-      .setName(name)
-      .setDesc(value)
-      .addButton((button) =>
-        button.setButtonText("Copy").onClick(async () => {
-          await navigator.clipboard.writeText(value);
-          new Notice(`${name} copied`);
-        })
-      );
+    this.copyButton(new Setting(container).setName(name).setDesc(value), "Copy", value);
   }
 
-  private async refreshList(): Promise<void> {
-    const listEl = this.listEl;
-    if (!listEl) return;
-    listEl.empty();
-    try {
-      const entries = await this.gitService.listDevicePasswords();
-      if (entries.length === 0) {
-        listEl.createEl("p", { text: "No device passwords yet." });
-        return;
-      }
-      for (const entry of entries) {
-        new Setting(listEl)
-          .setName(entry.label)
-          .setDesc(describeDevicePassword(entry, this.serverUrl))
-          .addButton((button) =>
-            button.setButtonText("Copy URL").onClick(async () => {
-              await navigator.clipboard.writeText(deviceUrl(entry, this.serverUrl));
-              new Notice(entry.kind === "saber" ? "Server URL for Saber copied" : "WebDAV URL copied");
-            })
-          )
-          .addButton((button) =>
-            button
-              .setWarning()
-              .setButtonText("Revoke")
-              .onClick(async () => {
-                try {
-                  button.setDisabled(true);
-                  await this.gitService.revokeDevicePassword(entry.id);
-                  new Notice(`Revoked device password for ${entry.label}`);
-                  await this.refreshList();
-                } catch (error) {
-                  button.setDisabled(false);
-                  this.setStatus(`Could not revoke device password: ${errorMessage(error)}`);
-                }
-              })
-          );
-      }
-    } catch (error) {
-      this.setStatus(`Could not load device passwords: ${errorMessage(error)}`);
+  private copyButton(row: Setting, label: string, value: string): void {
+    row.addButton(button => button.setButtonText(label).onClick(async () => {
+      await navigator.clipboard.writeText(value);
+      new Notice("Copied");
+    }));
+  }
+
+  private revokeButton(row: Setting, revoke: () => Promise<void>, refresh: () => Promise<void>): void {
+    row.addButton(button => button.setWarning().setButtonText("Revoke").onClick(async () => {
+      button.setDisabled(true);
+      try { this.assertContext(); await revoke(); if (!this.closed) await refresh(); }
+      catch (error) { new Notice(`Revocation failed: ${errorMessage(error)}`); button.setDisabled(false); }
+    }));
+  }
+
+  private assertContext(): void {
+    if (this.closed || this.contextKey !== this.gitService.credentialContextKey()) {
+      throw new Error("Account or credential destination changed. Close and reopen this modal.");
     }
   }
-
-  private setStatus(message: string): void {
-    this.statusEl?.setText(message);
-  }
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

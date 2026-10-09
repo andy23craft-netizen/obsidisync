@@ -2,20 +2,20 @@
 
 **Status:** Client implementation remains
 **Owner:** Obsidian plugin
-**Remaining subtasks:** [FEAT-04](FEAT-04-client-share-selection-and-migration.md), then
-[FEAT-05](FEAT-05-composite-local-vault-synchronization.md).
+**Remaining subtask:** [FEAT-05](FEAT-05-composite-local-vault-synchronization.md).
 
 ## Problem and Current Behavior
 
 The server implements accounts, typed principals, share membership, published share storage, v2 APIs, scoped DAV
 grants, and offline migration/recovery. Its contracts are documented in
-[Share storage and migration](SHARE_STORAGE_AND_MIGRATION.md); inspected surfaces and disposable automated evidence
+[Share storage and migration](../SHARE_STORAGE_AND_MIGRATION.md); inspected surfaces and disposable automated evidence
 are recorded in the [server implementation audit](FEAT-03-IMPLEMENTATION-AUDIT.md).
-FEAT-02 and FEAT-03 have no remaining implementation work. Actual-client acceptance and production verification
+FEAT-02, FEAT-03 and FEAT-04 have no remaining implementation work. Actual-client acceptance and production verification
 remain outstanding.
 
-The plugin still stores one user/vault namespace, head and manifest and calls writable v1 registration before sync.
-It cannot select a v2 share or route a composite local vault to independent shares.
+The plugin supports one selected v2 share per local vault with guarded synchronization, recovery and separate
+legacy/share credential management. Intentional unconverted v1 operation remains supported. See
+[client contracts and the FEAT-04 acceptance audit](../CLIENT_SHARE_SELECTION.md). Composite routing remains unimplemented.
 
 ## Desired Behavior
 
@@ -28,28 +28,6 @@ Shares use stable opaque IDs. Names are display labels. A share is the storage a
 folder filtering and client UI are not privacy controls.
 
 ## Remaining Implementation
-
-### FEAT-04: One-share selection and safe client migration
-
-Discover authorized shares, select by stable ID and synchronize through the implemented v2 routes.
-Use non-mutating sync-state and empty-change read sync for downloads; v2 has no registration endpoint.
-Read-only users can negotiate, retrieve manifests, history, files and binaries without mutation.
-
-Select v2 by `shareSyncV2`, independently of the discovery API version number; never fall back after v2 denial.
-Read-only synchronization applies remote changes per file only when local state is proven unchanged. Preserve local
-edits on overlapping updates/deletions, persist local reconciliation records, and continue unaffected downloads.
-Uncertain files fail closed. Capability downgrade preserves pending state; restoration never auto-uploads blocked
-edits without explicit reconciliation. Remote progress must not falsely advance their synchronized baselines.
-
-Retain original user/vault as separate legacy management context after share selection. Existing v1 routes still
-authorize that namespace for legacy DAV/Saber grants; share membership alone cannot grant management access.
-Distinguish legacy grants from staged/active share-native grants. Unavailable management retains context and explains
-the limitation, including lost membership or native cutoff; host-local inventory/revocation remains available.
-
-Preserve existing login, sync, history, conflicts, InkVault, reference downloads, device-password and recovery
-workflows. Keep intentional v1 operation with compatible old servers and explicitly mapped namespaces.
-Do not infer mappings from labels, silently switch protocols after authorization failure, or clear old sync state.
-Require explicit share selection/reconciliation and preserve backup-before-overwrite behavior.
 
 ### FEAT-05: Composite local vault
 
@@ -107,7 +85,7 @@ and compromised endpoints remain separate trust boundaries; share membership is 
 
 ## Testing and Acceptance
 
-Follow the focused acceptance criteria in FEAT-04 and FEAT-05. Preserve the completed server regression suites,
+Follow the FEAT-04 acceptance audit and FEAT-05 criteria. Preserve the completed server and client regression suites,
 including every supported protocol, workers, mapped v1, independent credentials and publication recovery.
 Use disposable data and synthetic credentials.
 

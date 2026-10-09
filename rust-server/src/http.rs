@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 const SITE_SESSION_COOKIE: &str = "obsidisync_session";
+pub const LEGACY_GRANT_MANAGEMENT_HEADER: &str = "x-obsidisync-legacy-grant-management";
 const SITE_SESSION_COOKIE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SERVER_API_VERSION: u32 = 1;
 const MIN_CLIENT_API_VERSION: u32 = 1;
@@ -314,7 +315,10 @@ fn apply_cors(router: Router, allowed_origins: Vec<String>) -> Router {
     }
 
     let layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .expose_headers([axum::http::HeaderName::from_static(
+            LEGACY_GRANT_MANAGEMENT_HEADER,
+        )])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     if allowed_origins.iter().any(|origin| origin == "*") {
@@ -1192,7 +1196,7 @@ async fn list_device_passwords(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((user, vault)): Path<(String, String)>,
-) -> Result<Json<Vec<DevicePasswordEntry>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<DevicePasswordEntry>>), ApiError> {
     authorize_vault(
         &state,
         &headers,
@@ -1201,7 +1205,26 @@ async fn list_device_passwords(
         crate::accounts::Capability::Read,
     )
     .await?;
-    Ok(Json(state.device_passwords.list(&user, &vault).await?))
+    // Inventory visibility is independent of management authority. Reuse exact legacy authorization,
+    // never a caller's selected v2 share. Mutations continue checking authorization themselves.
+    let allowed = authorize_vault(
+        &state,
+        &headers,
+        &user,
+        &vault,
+        crate::accounts::Capability::ReadWrite,
+    )
+    .await
+    .is_ok();
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        LEGACY_GRANT_MANAGEMENT_HEADER,
+        HeaderValue::from_static(if allowed { "allowed" } else { "denied" }),
+    );
+    Ok((
+        response_headers,
+        Json(state.device_passwords.list(&user, &vault).await?),
+    ))
 }
 
 async fn create_device_password(

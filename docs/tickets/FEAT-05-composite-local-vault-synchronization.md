@@ -3,7 +3,7 @@
 **Status:** Proposed implementation subtask
 **Owner:** Obsidian plugin
 **Parent:** [FEAT-01](FEAT-01-multi-user-shares-and-composite-vault-sync.md)
-**Dependencies:** [FEAT-04](FEAT-04-client-share-selection-and-migration.md) - hard dependency; FEAT-03 share
+**Dependencies:** [Implemented FEAT-04 contracts and acceptance audit](../CLIENT_SHARE_SELECTION.md) - hard dependency; FEAT-03 share
 authorization is implemented; its binding runtime contracts are in
 [Share storage and migration](SHARE_STORAGE_AND_MIGRATION.md).
 

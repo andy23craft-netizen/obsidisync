@@ -126,7 +126,7 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js"];
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js"];
   for (const scenario of scenarios) {
     let server = await startServer();
     const stop = async () => {
@@ -145,9 +145,22 @@ async function main() {
       if (result.status !== 0) throw new Error(`fixture capability administration failed: ${result.stderr}`);
       server = await startServer(false);
     };
+    const offline = async (args = [], input) => {
+      await stop();
+      let value;
+      if (args.length) {
+        const result = spawnSync(path.join(REPO, "rust-server/target/debug/obsidian-git-sync-server"),
+          ["admin", "--data-dir", DATA_DIR, ...args], { encoding: "utf8", input });
+        if (result.status !== 0) throw new Error(`fixture administration failed: ${result.stderr}`);
+        value = JSON.parse(result.stdout);
+      }
+      server = await startServer(false);
+      return value;
+    };
     try {
       await (require(path.join(__dirname, scenario)))({ device, pending, serverFile, log, show, obsidian,
-        shareId: SHARE_ID, readerToken: READER_TOKEN, shareRoot: path.join(DATA_DIR, "shares", SHARE_ID), setCapability });
+        shareId: SHARE_ID, readerToken: READER_TOKEN, shareRoot: path.join(DATA_DIR, "shares", SHARE_ID), setCapability,
+        offline, dataDir: DATA_DIR });
     } finally {
       await stop();
     }

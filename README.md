@@ -346,10 +346,9 @@ Share selection, safe downloads and writable synchronization are implemented. Do
 download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.
 See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for verified backups, guarded per-file application,
 durable local/server conflicts, upload recovery, permission-restoration barriers and retained v1 state.
-The remaining FEAT-04 transition contracts are documented in
-[Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md#approved-client-transition-contract-feat-04-not-yet-implemented).
-Namespace-authorized legacy DAV/Saber credential management remains for FEAT-04D. Current plugin instructions below
-describe v1 behavior; selected-share downloads never register or upload merely to read.
+Legacy DAV/Saber and staged/active share credential management use separate authorization contexts, described below.
+See [Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md) for the server transition contracts.
+The legacy namespace instructions below describe v1 behavior; selected-share downloads never register or upload merely to read.
 
 Every device that should carry the same vault talks to the same server and uses the same vault name. There are two kinds of devices:
 
@@ -376,7 +375,9 @@ To add a WebDAV device, create a device password from any logged-in Obsidian dev
 
 Other devices that cannot run the plugin, for example an e-ink tablet that exports its PDF notes to a WebDAV share, can sync into one folder of a vault through the server's built-in WebDAV endpoint. Access is granted per device with a **device password**:
 
-1. Log in with the plugin on any client and sync the vault at least once.
+For existing v1 namespaces, use the **Legacy DAV / Saber grants** section:
+
+1. Log in with the plugin on an authorized client. The legacy vault must already be registered/mapped.
 2. Open **Settings -> ObsidiSync -> Device passwords (WebDAV) -> Manage** (or run the **Manage device passwords (WebDAV)** command).
 3. Enter a device name (shown in sync history) and the vault folder the device may use, for example `Tablet/Notes`, then click **Create password**.
 4. Copy the WebDAV URL, username, and generated password into the device's WebDAV settings. The password is shown only once.
@@ -387,7 +388,27 @@ The WebDAV URL has the form:
 https://sync.example.com/dav/{vault}/{folder}/
 ```
 
-The username is the ObsidiSync user namespace, and the password is the generated device password (five groups of four lowercase characters, easy to type on a tablet keyboard). Each password is bound to exactly one vault and folder: everything the device reads or writes must be inside that folder, parent folders are only browsable so clients can navigate down from the root, and every other path returns `403`. Revoke a device from the same dialog at any time; the device loses access immediately.
+The username is the original ObsidiSync user namespace. Each legacy DAV password is bound to that vault and folder.
+Parent folders are browsable for navigation; other paths are denied. Inventory requires original namespace read
+authorization; creation/revocation requires write authorization. Selecting a v2 share does not grant legacy authority.
+The plugin retains the original context and never registers or retargets a vault just to manage grants.
+Inventory responses advertise `X-ObsidiSync-Legacy-Grant-Management: allowed|denied`; only `allowed` enables management
+controls. Older servers without this header still allow inventory viewing, but management requires the host operator
+or a compatible client. Server mutation authorization is unchanged and remains authoritative.
+
+For a selected v2 share, use **Share-native DAV grants**. Choose read or read-write explicitly; read-only members
+can issue only read grants and need the host operator for revocation. New grants are **staged**: copy the one-time
+secret, then stop the server and have the host operator run
+`admin --data-dir /data credential share activate GRANT_ID`. Activation preserves the ID, secret hash and scope.
+There is no online/automatic activation. Refresh inventory by reopening the dialog after activation.
+Basic and OCS username is the exact opaque share ID. Use the returned DAV URL
+`/dav/{shareId}/{folder}/` or Nextcloud URL `/remote.php/dav/files/{shareId}/{folder}/`.
+A device bearer secret resolves the same grant and is not a native plugin login token. New share grants never enable Saber.
+
+Grants are independent: membership removal, account disable or downgrade does not revoke active grants.
+Explicitly revoke unwanted grants; retirement denies every grant on the share. Native v1 cutoff may prevent legacy
+management while named DAV/Saber exceptions remain usable. The offline host-operator inventory/revocation commands
+remain available. Closing the dialog clears its one-time secrets; they are never saved in plugin settings.
 
 Files uploaded over WebDAV are committed to the vault repository under the device name, so Obsidian clients receive them on their next sync and they appear in file history and the per-device version indicators like any other change. PDFs and other binary files go through the same binary object store as plugin uploads. Uploads are last-write-wins; the WebDAV side never has to resolve conflicts.
 
@@ -679,6 +700,12 @@ under `auth` contain identity or credential material. Saber encryption passwords
 - `POST /v1/users/{user}/vaults/{vault}/device-passwords`
 - `DELETE /v1/users/{user}/vaults/{vault}/device-passwords/{id}`
 - `/dav/{vault}/{folder}/...` WebDAV endpoint, HTTP Basic auth with a device password
+
+Successful legacy credential inventories keep their JSON array body and include
+`X-ObsidiSync-Legacy-Grant-Management: allowed|denied`, computed from that original namespace's write authorization.
+Unauthorized inventory responses omit it. Supported wildcard/explicit CORS configurations expose the header and
+permit credential DELETE preflights. Missing/unknown values disable plugin mutation controls, not inventory visibility.
+Clients cannot authorize mutations by supplying this header; create/revoke recheck existing server authorization.
 
 ## Limits
 

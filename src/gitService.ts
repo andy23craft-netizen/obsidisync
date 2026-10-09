@@ -7,6 +7,8 @@ import {
   FileContentMode,
   CreatedDevicePassword,
   DevicePasswordEntry,
+  ShareCredentialEntry,
+  CreatedShareCredential,
   DeviceEntry,
   DeviceVersionEntry,
   HistoryEntry,
@@ -42,7 +44,7 @@ import { assertGitBranch, assertNamespaceSlug, assertSecureHttpUrl } from "./sec
 import { ServerUpsert, sha256Hex, VaultState } from "./vaultState";
 import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./shareSelection";
 import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported, sameFile } from "./shareReconciliation";
-import type { PendingShareSelection } from "./shareSelection";
+import type { PendingShareSelection, LegacyManagementContext } from "./shareSelection";
 
 type SaveSettings = () => Promise<void>;
 type ConflictNoticeHandler = (conflicts: SyncConflict[]) => void;
@@ -1185,25 +1187,89 @@ export class GitService {
    * Servers without feature flags never advertise the feature, so old servers are reported as such.
    */
   async devicePasswordsUnavailableReason(): Promise<string | null> {
-    this.requireConfigured();
+    this.legacyCredentialContext();
     await this.checkServerCompatibility();
     return devicePasswordsAvailabilityMessage(this.settings);
   }
 
   async listDevicePasswords(): Promise<DevicePasswordEntry[]> {
-    this.requireConfigured();
-    return this.devicePasswordRequest(() => this.getJson<DevicePasswordEntry[]>(`${this.vaultPath()}/device-passwords`));
+    return (await this.legacyCredentialInventory()).entries;
+  }
+
+  legacyCredentialContext(): LegacyManagementContext {
+    captureLegacyContext(this.settings);
+    const context = this.settings.legacyManagementContext;
+    if (!context || context.serverUrl !== serverIdentity(this.settings.serverUrl)) {
+      throw new Error("Original legacy namespace is unavailable on this server. Retained context has not been changed.");
+    }
+    assertSecureHttpUrl(this.settings.serverUrl, "Sync server URL");
+    if (!this.settings.oidcAccessToken || /\s/.test(this.settings.oidcAccessToken)) {
+      throw new Error("Log in before managing legacy credentials");
+    }
+    assertNamespaceSlug(context.userSlug, "Legacy user");
+    assertNamespaceSlug(context.vaultSlug, "Legacy vault");
+    return { ...context };
+  }
+
+  /** Bind modal intent to the account and both independent destinations, not their mutable capabilities. */
+  credentialContextKey(): string {
+    return JSON.stringify([serverIdentity(this.settings.serverUrl), this.settings.userSlug,
+      this.settings.authenticatedIdentity, this.settings.legacyManagementContext,
+      (this.settings.activeShare ?? this.settings.pendingShareSelection)?.shareId]);
+  }
+
+  async legacyCredentialInventory(): Promise<{ entries: DevicePasswordEntry[]; managementAllowed: boolean }> {
+    const context = this.legacyCredentialContext();
+    const response = await this.devicePasswordRequest(() =>
+      this.requestWithAuth("GET", this.legacyCredentialPath(context), undefined, context));
+    const header = Object.entries(response.headers ?? {}).find(([key]) =>
+      key.toLowerCase() === "x-obsidisync-legacy-grant-management")?.[1];
+    return { entries: response.json as DevicePasswordEntry[], managementAllowed: header === "allowed" };
+  }
+
+  private legacyCredentialPath(context: LegacyManagementContext): string {
+    return `/v1/users/${encodeURIComponent(context.userSlug)}/vaults/${encodeURIComponent(context.vaultSlug)}/device-passwords`;
   }
 
   async createDevicePassword(label: string, folder: string): Promise<CreatedDevicePassword> {
-    this.requireConfigured();
+    const context = this.legacyCredentialContext();
     const request: CreateDevicePasswordRequest = { label, folder };
-    return this.devicePasswordRequest(() => this.postJson<CreatedDevicePassword>(`${this.vaultPath()}/device-passwords`, request));
+    const response = await this.devicePasswordRequest(() =>
+      this.requestWithAuth("POST", this.legacyCredentialPath(context), request, context));
+    return response.json as CreatedDevicePassword;
   }
 
   async revokeDevicePassword(id: string): Promise<void> {
-    this.requireConfigured();
-    await this.devicePasswordRequest(() => this.deleteJson<unknown>(`${this.vaultPath()}/device-passwords/${encodeURIComponent(id)}`));
+    const context = this.legacyCredentialContext();
+    await this.devicePasswordRequest(() => this.requestWithAuth("DELETE",
+      `${this.legacyCredentialPath(context)}/${encodeURIComponent(id)}`, undefined, context));
+  }
+
+  async shareCredentialInventory(): Promise<{ shareId: string; capability: "read" | "read-write";
+      entries: ShareCredentialEntry[] }> {
+    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    if (!selected) throw new Error("Choose a share to manage share-native grants.");
+    await this.negotiateShare(selected);
+    const entries = await this.getJson<ShareCredentialEntry[]>(`${this.sharePath(selected)}/device-passwords`);
+    return { shareId: selected.shareId, capability: selected.capability, entries };
+  }
+
+  async createShareCredential(label: string, folder: string, capability: "read" | "read-write"):
+      Promise<CreatedShareCredential> {
+    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    if (!selected) throw new Error("Choose a share first.");
+    await this.negotiateShare(selected);
+    if (capability !== "read" && capability !== "read-write") throw new Error("Invalid credential capability");
+    if (capability === "read-write" && selected.capability !== "read-write") throw new Error("Share is read-only");
+    return this.postJson<CreatedShareCredential>(`${this.sharePath(selected)}/device-passwords`, { label, folder, capability });
+  }
+
+  async revokeShareCredential(id: string): Promise<void> {
+    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    if (!selected) throw new Error("Choose a share first.");
+    await this.negotiateShare(selected);
+    if (selected.capability !== "read-write") throw new Error("Read-only membership requires host-operator revocation.");
+    await this.deleteJson(`${this.sharePath(selected)}/device-passwords/${encodeURIComponent(id)}`);
   }
 
   /** An old server has no device-password routes at all and answers 404; say so instead of "not found". */
@@ -1534,12 +1600,27 @@ export class GitService {
     return response.arrayBuffer;
   }
 
-  private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<RequestUrlResponse> {
+  private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown,
+      legacyCredential?: LegacyManagementContext): Promise<RequestUrlResponse> {
     const selected = path.startsWith("/v2/shares/") ? this.settings.activeShare ?? this.settings.pendingShareSelection : null;
+    const legacyAccount = legacyCredential ? JSON.stringify([this.settings.userSlug, this.settings.authenticatedIdentity]) : null;
     const assertDestination = () => {
       if (path.startsWith("/v1/users/")) {
-        const blocked = this.destinationBlocker();
-        if (blocked) throw new Error(blocked);
+        if (legacyCredential) {
+          const current = this.legacyCredentialContext();
+          const base = this.legacyCredentialPath(legacyCredential);
+          const id = path.slice(base.length + 1);
+          const validRoute = method === "DELETE" ? path.startsWith(`${base}/`) && id.length > 0 &&
+            id !== "." && id !== ".." && !id.includes("/") : path === base;
+          if (!validRoute || current.serverUrl !== legacyCredential.serverUrl ||
+              current.userSlug !== legacyCredential.userSlug || current.vaultSlug !== legacyCredential.vaultSlug ||
+              JSON.stringify([this.settings.userSlug, this.settings.authenticatedIdentity]) !== legacyAccount) {
+            throw new Error("Legacy credential context changed during request");
+          }
+        } else {
+          const blocked = this.destinationBlocker();
+          if (blocked) throw new Error(blocked);
+        }
       }
       if (selected) this.assertShareContext(selected);
     };

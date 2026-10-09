@@ -1,8 +1,8 @@
 # Client share selection and safe synchronization
 
 The plugin implements destination-bound selection (FEAT-04A), safe downloads (FEAT-04B) and writable share workflows
-(FEAT-04C). Download initialization starts download-only, even with read-write membership. Enable writes explicitly
-enables synchronization for reconciled files. FEAT-04D still supplies separate legacy/share credential management.
+(FEAT-04C) with separate legacy/share credential management (FEAT-04D). Download initialization starts download-only,
+even with read-write membership. Enable writes explicitly enables synchronization for reconciled files.
 Unconverted configurations retain v1 behavior.
 This is implemented repository behavior, not a household deployment or desktop/mobile acceptance result.
 
@@ -109,10 +109,11 @@ identity/configuration changes, denied access without fallback and retained lega
 share storage fingerprints for mutation. Native InkVault v2 publication/feature/capability gates and ordinary plugin
 PDF compatibility are exercised separately.
 
-Human desktop/iPhone acceptance and credential UI implementation remain for D and the parent audit. Existing v1 application semantics are preserved; B's guarded primitives apply to selected
+Human desktop/iPhone acceptance remains separate from automated validation. Existing v1 application semantics are
+preserved; guarded primitives apply to selected
 shares. Full snapshots and per-file state saves favor safety over transfer/storage efficiency. No production access,
 migration, deployment, sibling repository changes or ARM64 production publication is authorized by this stage.
-See the [FEAT-04 decomposition](tickets/FEAT-04-DECOMPOSITION.md) and
+See the credential workflow below and
 [server publication/migration contracts](SHARE_STORAGE_AND_MIGRATION.md).
 
 ## Writable workflows and interruption recovery (FEAT-04C)
@@ -152,3 +153,63 @@ Newer local edits remain detectable after matching acknowledgement recovery. Con
 replayed. Partial staging can leave temporary server uploads until normal cleanup; persisted byte-offset continuation
 is not promised. Safe downloads/matching acknowledgements recover automatically; ambiguous writes require review.
 The documented non-atomic external-writer filesystem race remains. No storage-adapter redesign is included.
+
+## Credential management
+
+The device-password dialog shows two independently authorized inventories. Legacy DAV/Saber uses retained
+`legacyManagementContext` (server/user/vault), never the selected share ID or label. Missing context after selection
+is not reconstructed. Namespace mismatch, membership loss or native cutoff keeps the context but explains why
+management is unavailable. Credential requests are a narrow exception to the v1 destination guard; registration,
+sync, uploads, history and other legacy file requests remain guarded.
+
+Successful v1 inventory responses include `X-ObsidiSync-Legacy-Grant-Management: allowed|denied` using the original
+mapping/namespace write authorization. Only `allowed` enables create/revoke controls. Missing/unknown headers on older
+servers leave authorized inventory visible without management controls. Selected-share capability cannot override it.
+Supported CORS configurations expose the header. It does not authorize mutations; the server rechecks every operation.
+
+Share-native inventory uses the selected stable ID, with fresh session/configuration/capability negotiation.
+Read grants explicitly request `read`; read-only members cannot revoke through this API and need host-operator help.
+The modal displays staged/active lifecycle and one-time create secrets, correct share-ID Basic/OCS identity, and DAV
+and Nextcloud URLs. Secrets are not saved in plugin state or recovered from inventory. Closing clears the modal.
+Lost creation responses require inventory review before intentional reissue; network failures never auto-retry creation.
+Offline `admin --data-dir /data credential share activate ID` activates an existing grant without rotation.
+
+Active grants remain independently usable after creator membership removal/disable/downgrade until explicit
+revocation or share retirement. Session management can become unavailable before the grant stops working; use offline
+operator inventory/revocation. Existing legacy Saber identities, URLs, encryption/PDF configuration and permissions
+are preserved. Historical vault-wide #tablet scanning remains inside the original mapped share and can exceed the DAV
+folder restriction. New share grants do not enable Saber scanning/rendering/pushing; share-native provisioning is deferred.
+
+Credential actions neither approve blocked file edits nor bypass initial reconciliation, interrupted application or
+write journals. Account/destination changes invalidate an open modal's actions. File sync still performs its normal
+recovery and capability checks afterward.
+
+## FEAT-04 parent acceptance audit
+
+Implementation coverage is complete across A/B/C/D. This is an audit of repository code and synthetic automated
+evidence, not human acceptance or production verification.
+
+| Contract | Implementation and automated evidence |
+| --- | --- |
+| Stable authorized selection, one share per local vault, retained v1 state | `shareSelection.ts`, `GitService`, chooser/settings; `shareSelection.test.ts`, Rust protocol authorization matrix |
+| Read-only reads without registration, per-file preservation and truthful baselines | `ShareReconciler`, `VaultState`; `shareDownloads.test.ts`, read-only e2e storage fingerprints |
+| Downgrade/restart/restoration, durable application and upload barriers | Reconciliation/application/write journals; plugin interruption tests and actual membership-change e2e |
+| Explicit initial backup/reconciliation and writable v2 without fallback | Initial/selection UI, v2 upload/resolve/history routes; writable e2e and base-revision regressions |
+| Conflicts, binary/reference transfers, history/device metadata and InkVault | Plugin regression tests, Rust protocol/InkVault suites, writable and legacy e2e scenarios |
+| Independent legacy/share grants, staging/activation, header/CORS and revocation | Credential modal/service, legacy inventory handler; plugin capability matrix, Rust header/transition tests, credential e2e |
+| Legacy Saber settings/rendering/background security continuity | Untouched legacy grant records through selection; synthetic credential e2e and published legacy Saber Rust regressions |
+| OIDC identity exception, explicit development identity, publication/recovery | Existing authentication/transition suites and packaged-command fixtures, including production-default development rejection |
+
+The final local validation passes 151 plugin tests and the plugin build, 145 Rust tests, strict all-target Clippy,
+five real-server e2e scenarios and actual Dockerfile AMD64 packaged-command tests. The only ignored Rust test writes a sample PDF
+for human inspection; automated Saber rendering tests run normally. Expected authorization failures in negative
+fixtures are assertions, not unresolved test failures. No production or sibling repository data is used.
+
+Remaining acceptance is a human desktop/iPhone pass using disposable notes: separately selected private/shared
+vaults, offline edits, overlapping updates/deletions, permission loss/restoration, interruption/restart, history,
+attachments and the two credential sections. Supported CORS behavior is router-tested; actual Obsidian mobile UI
+and third-party DAV clients have not been exercised here. Keep the documented external-writer filesystem race,
+conservative ambiguous-write reconciliation and non-resumable partial upload staging in mind.
+
+FEAT-04 is ready for final human acceptance review. FEAT-05 remains a separate authorized implementation step;
+household deployment and coordinated production migration remain later, separately authorized operations.

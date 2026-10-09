@@ -9,10 +9,18 @@ import {
   normalizeDeviceFolder,
   serverSupportsDevicePasswords,
   serverSupportsSaber,
-  webdavUrl
+  webdavUrl,
+  shareCredentialPaths
 } from "../src/devicePasswords";
 
 const root = process.cwd();
+
+test("share DAV and Nextcloud inventory URLs use opaque identity and encoded folder segments", () => {
+  assert.deepEqual(shareCredentialPaths("s_fixture", "Tablet/My Notes"), {
+    webdavPath: "/dav/s_fixture/Tablet/My%20Notes/",
+    nextcloudPath: "/remote.php/dav/files/s_fixture/Tablet/My%20Notes/"
+  });
+});
 
 test("device folders are normalized to safe vault-relative paths", () => {
   assert.equal(normalizeDeviceFolder(" /Tablet/Notes/ "), "Tablet/Notes");

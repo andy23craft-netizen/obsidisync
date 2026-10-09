@@ -8,7 +8,7 @@ let requests: any[] = [];
 let respond: (request: any) => any;
 let buttons: { text: string; click: () => any }[] = [];
 let textChanges: { name: string; change: (value: string) => any }[] = [];
-const element = () => ({ empty() {}, createEl: () => ({ setText() {} }) });
+const element = (): any => ({ empty() {}, createDiv: () => element(), createEl: () => element(), setText() {}, remove() {} });
 class Setting {
   private name = "";
   setName(name: string) { this.name = name; return this; }
@@ -17,7 +17,7 @@ class Setting {
     const action = { text: "", click: () => {} };
     const button: any = { setButtonText: (text: string) => { action.text = text; return button; },
       onClick: (click: () => any) => { action.click = click; return button; }, setDisabled: () => button,
-      setCta: () => button };
+      setCta: () => button, setWarning: () => button };
     callback(button); buttons.push(action); return this;
   }
   addText(callback: (text: any) => void) {
@@ -43,6 +43,7 @@ const { GitService, HttpStatusError } = require("../src/gitService");
 const { DEFAULT_SETTINGS, IosGitSyncSettingTab } = require("../src/settings");
 const { ShareSelectionModal } = require("../src/shareSelectionModal");
 const { LocalReconciliationModal } = require("../src/localReconciliationModal");
+const { DevicePasswordsModal } = require("../src/devicePasswordsModal");
 const ObsidiSyncPlugin = require("../src/main").default;
 Module._load = load;
 (globalThis as any).crypto ??= webcrypto;
@@ -97,6 +98,120 @@ test("API-1 feature discovery stages destination-bound state without files or re
   assert.match(restarted.destinationBlocker(), /not enabled/);
 });
 
+for (const selectedCapability of ["read", "read-write"]) {
+  for (const header of ["allowed", "denied", undefined, "unknown"]) {
+    test(`legacy management header ${header} is independent of selected ${selectedCapability}`, async () => {
+      const { service, settings } = fixture();
+      await service.stageShareSelection(share.shareId);
+      const previous = respond;
+      const entry = { id: "legacy-id", label: "Legacy Saber", kind: "saber", folder: "Saber/Sync", pdfFolder: "PDFs",
+        username: "andy", webdavPath: "/dav/notes/Saber/Sync/", createdAt: "fixture", lastUsedAt: null };
+      respond = request => {
+        if (request.url.endsWith("/info")) return ok({ ...info, features: [...info.features, "webdavDevicePasswords"] });
+        if (request.url.endsWith("/sync-state")) return ok({ ...share, capability: selectedCapability, apiVersion: 2 });
+        if (request.url.endsWith("/device-passwords")) return request.url.includes("/v1/")
+          ? { ...ok([entry]), headers: header === undefined ? {} : { "X-ObsidiSync-Legacy-Grant-Management": header } }
+          : ok([]);
+        return previous(request);
+      };
+      const preservedState = preserved(settings);
+      const inventory = await service.legacyCredentialInventory();
+      assert.equal(inventory.managementAllowed, header === "allowed");
+      assert.deepEqual(inventory.entries, [entry]);
+      buttons = [];
+      await new DevicePasswordsModal({}, service, settings.serverUrl).onOpen();
+      assert.equal(buttons.some(button => button.text === "Create password"), header === "allowed");
+      assert.equal(buttons.some(button => button.text === "Revoke"), header === "allowed");
+      assert.equal(buttons.some(button => button.text === "Create staged read-write grant"), selectedCapability === "read-write");
+      assert.ok(buttons.some(button => button.text === "Create staged read grant"));
+      assert.equal(preserved(settings), preservedState);
+      assert.ok(requests.filter(request => request.url.includes("/v1/users/")).every(request =>
+        request.url.endsWith("/v1/users/andy/vaults/notes/device-passwords") && request.method === "GET"));
+    });
+  }
+}
+
+test("retained legacy routes work after v2 selection without registration or retargeting", async () => {
+  const { service, settings } = fixture();
+  await service.stageShareSelection(share.shareId);
+  settings.vaultSlug = "different-display-context";
+  const context = JSON.stringify(settings.legacyManagementContext);
+  const old = respond;
+  requests = [];
+  respond = request => request.url.includes("/device-passwords") ? ok(request.method === "GET" ? [] : { id: "synthetic" }) : old(request);
+  await service.listDevicePasswords();
+  await service.createDevicePassword("Synthetic", "Tablet");
+  await service.revokeDevicePassword("synthetic");
+  assert.deepEqual(requests.map(request => request.method), ["GET", "POST", "DELETE"]);
+  assert.ok(requests.every(request => request.url.includes("/v1/users/andy/vaults/notes/device-passwords")));
+  assert.equal(JSON.stringify(settings.legacyManagementContext), context);
+  delete settings.legacyManagementContext;
+  await assert.rejects(service.listDevicePasswords(), /Original legacy namespace/);
+  assert.equal(settings.legacyManagementContext, undefined);
+});
+
+test("legacy denial is retained without another namespace attempt or v2 fallback", async () => {
+  const { service, settings } = fixture();
+  await service.stageShareSelection(share.shareId);
+  const context = JSON.stringify(settings.legacyManagementContext);
+  requests = [];
+  respond = () => ({ status: 404, json: {}, text: "not found" });
+  settings.serverFeatures = ["webdavDevicePasswords"];
+  await assert.rejects(service.legacyCredentialInventory(), (error: any) => error.status === 404);
+  assert.equal(requests.length, 1);
+  assert.equal(JSON.stringify(settings.legacyManagementContext), context);
+});
+
+test("legacy inventory cannot deliver an in-flight response after account or context changes", async () => {
+  for (const change of ["account", "context"]) {
+    const { service, settings } = fixture();
+    await service.stageShareSelection(share.shareId);
+    requests = [];
+    respond = () => {
+      if (change === "account") settings.authenticatedIdentity.subject = "different-subject";
+      else settings.legacyManagementContext.vaultSlug = "different-vault";
+      return { ...ok([]), headers: { "x-obsidisync-legacy-grant-management": "allowed" } };
+    };
+    await assert.rejects(service.legacyCredentialInventory(), /context changed/);
+    assert.equal(requests.length, 1);
+  }
+});
+
+test("share grant issuance sends explicit read, leaves recovery barriers intact, and never activates", async () => {
+  const { service, settings } = fixture();
+  await service.stageShareSelection(share.shareId);
+  const previous = respond;
+  settings.pendingShareSelection.download = undefined;
+  const state = preserved(settings);
+  respond = request => {
+    if (request.url.endsWith("/sync-state")) return ok({ ...share, capability: "read", apiVersion: 2 });
+    if (request.url.endsWith("/device-passwords")) return ok({ id: "staged", password: "synthetic-once", lifecycle: "staged" });
+    return previous(request);
+  };
+  await service.createShareCredential("Synthetic", "Tablet", "read");
+  await assert.rejects(service.createShareCredential("Synthetic", "Tablet", "read-write"), /read-only/);
+  await assert.rejects(service.revokeShareCredential("staged"), /host-operator/);
+  const posts = requests.filter(request => request.method !== "GET");
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(posts[0].body).capability, "read");
+  assert.equal(preserved(settings), state);
+  assert.ok(!JSON.stringify(settings).includes("synthetic-once"));
+});
+
+test("closing the credential modal removes one-time secrets and stale destination actions fail closed", async () => {
+  const { service, settings } = fixture();
+  await service.stageShareSelection(share.shareId);
+  const modal = new DevicePasswordsModal({}, service, settings.serverUrl);
+  modal.contextKey = service.credentialContextKey();
+  settings.pendingShareSelection.shareId = "different-share";
+  assert.throws(() => modal.assertContext(), /destination changed/);
+  let cleared = false;
+  modal.contentEl.empty = () => { cleared = true; };
+  modal.onClose();
+  assert.equal(cleared, true);
+  assert.throws(() => modal.assertContext(), /destination changed/);
+});
+
 test("only authorized discovered IDs can be negotiated; labels are not aliases", async () => {
   const { service, settings } = fixture();
   await assert.rejects(service.stageShareSelection("Harmony"), /unavailable/);
@@ -131,7 +246,7 @@ test("all v1 vault entry points fail before file writes or network while selecti
   for (const operation of [
     () => service.sync(), () => service.forcePushLocal(), () => service.overwriteLocalFromServer("backup"),
     () => service.resolveConflicts([{ path: "grocery.md", kind: "delete" }]),
-    () => service.history(), () => service.createDevicePassword("tablet", "Tablet")
+    () => service.history()
   ]) await assert.rejects(operation(), /not enabled/);
   assert.equal(requests.length, 0);
   assert.equal(preserved(settings), old);

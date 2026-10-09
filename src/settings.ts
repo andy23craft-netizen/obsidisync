@@ -198,7 +198,7 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
       .setName("Device passwords (WebDAV)")
       .setDesc(
         devicePasswordsAvailabilityMessage(this.plugin.settings) ??
-          "Let an e-ink tablet or another WebDAV client sync files into one folder of this vault. Each device gets its own revocable password."
+          "Manage retained legacy DAV/Saber grants separately from staged/active grants for the selected share. New share grants require offline activation."
       )
       .addButton((button) =>
         button.setButtonText("Manage").onClick(() => {

@@ -81,6 +81,8 @@ function fixture(t: any) {
         ({ path, op: "upsert", sha256: sha(text), ...(inline ? { contentBase64: Buffer.from(text).toString("base64") } : {}) })) });
     }
     if (url.pathname.endsWith("/conflicts")) return ok([]);
+    if (url.pathname.includes("/device-passwords")) return ok(options.method === "GET" ? [] :
+      { id: "synthetic-grant", password: "synthetic-once", lifecycle: "staged" });
     if (url.pathname.includes("/uploads")) {
       if (capability !== "read-write") return { status: 403, json: {}, text: "read-only" };
       const body = JSON.parse(options.body);
@@ -498,6 +500,25 @@ test("interrupted file application is recovered before collecting writable chang
   assert.equal(String(f.remoteFiles()["a.md"]), "base"); assert.equal(f.read("a.md"), "ambiguous local");
   assert.match(state.reconciliation[0].reason, /Interrupted/);
   assert.equal(state.applying, undefined);
+});
+
+test("credential management cannot approve reconciliation or clear interrupted file/write journals", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  const state = f.settings().activeShare.download;
+  state.applying = { path: "a.md", baseline: state.baseline[0], remote: { path: "a.md", op: "delete" },
+    remoteHead: "h1", reason: "ambiguous disk write", uploadBlocked: true };
+  state.reconciliation.push({ ...state.applying });
+  state.writing = { stage: "submitted", files: [], baseHead: "h1", remoteHead: null };
+  const before = JSON.stringify(state);
+  f.write("a.md", "pending local edit");
+  f.requests.length = 0;
+  await f.service().shareCredentialInventory();
+  await f.service().createShareCredential("Synthetic", "Tablet", "read");
+  await f.service().revokeShareCredential("synthetic-grant");
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(f.read("a.md"), "pending local edit");
+  assert.ok(f.requests.every(request => !/\/sync$|\/uploads|\/resolve|\/register/.test(new URL(request.url).pathname)));
+  assert.equal(JSON.stringify(f.restart().settings.activeShare.download), before);
 });
 
 test("writable mode also guards edits made during download and continues unaffected files", async (t) => {

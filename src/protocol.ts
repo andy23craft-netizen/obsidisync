@@ -206,3 +206,25 @@ export interface CreateDevicePasswordRequest {
 export interface CreatedDevicePassword extends DevicePasswordEntry {
   password: string;
 }
+
+/** V2 inventory deliberately has no secret, username, URLs or legacy timestamps. */
+export interface ShareCredentialEntry {
+  id: string;
+  shareId: string;
+  folder: string;
+  capability: "read" | "read-write";
+  label: string;
+  kind: "webdav";
+  lifecycle: "staged" | "active";
+}
+
+export interface CreatedShareCredential {
+  id: string;
+  shareId: string;
+  password: string;
+  username: string;
+  webdavPath: string;
+  nextcloudPath: string;
+  capability: "read" | "read-write";
+  lifecycle: "staged";
+}

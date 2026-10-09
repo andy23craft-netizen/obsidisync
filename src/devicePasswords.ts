@@ -66,6 +66,12 @@ export function describeDevicePassword(entry: DevicePasswordEntry, serverUrl: st
   return `${webdavUrl(serverUrl, entry.webdavPath)} · created ${created} · last used ${lastUsed}`;
 }
 
+/** Inventory omits URLs; identity and path are always based on the immutable share ID. */
+export function shareCredentialPaths(shareId: string, folder: string): { webdavPath: string; nextcloudPath: string } {
+  const suffix = `${encodeURIComponent(shareId)}/${folder.split("/").map(encodeURIComponent).join("/")}/`;
+  return { webdavPath: `/dav/${suffix}`, nextcloudPath: `/remote.php/dav/files/${suffix}` };
+}
+
 function formatDate(value: string): string {
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
