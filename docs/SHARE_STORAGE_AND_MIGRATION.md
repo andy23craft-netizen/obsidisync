@@ -168,6 +168,23 @@ Do not claim full cutoff while exceptions remain. Notify users and archive old t
 
 ## Automated validation
 
+### V2 synchronization base and prior existence
+
+V2 read synchronization intentionally records no device acknowledgements. For ordinary v2 writes, the supplied
+base must be a commit available in the selected share repository and an ancestor of its current head. Invalid,
+unavailable and unrelated bases are rejected before synchronization mutations. Prior file existence comes from
+the server's Git tree at that validated base; unavailable tree/blob data fails closed. Client existence claims are
+not used. Editing a base-present file deleted at the current head creates the existing edit/delete conflict rather
+than recreating it. Unchanged stale content does not undo deletion. Genuine/concurrent creation and binary conflict
+rules remain intact. V1 retains its original per-path device-acknowledgement semantics. Native InkVault keeps its
+separate audited paired publication and expected-head resolution contract.
+
+This narrow v2 correction is covered by the real-server read-first regression, including missing acknowledgements,
+ordinary edits, null/invalid/unavailable/foreign/non-ancestor bases, new/concurrent files, binary conflicts and v1
+compatibility. It does not authorize migration, deployment or changes to production data.
+
+### Fixture suites
+
 Use disposable directories/volumes and synthetic authentication for all migration/recovery tests. Run `npm test`,
 `npm run test:e2e`, build the actual Dockerfile, and `python3 tests/packaged_commands.py --image IMAGE` against a locally
 loaded image. Packaged fixtures use unique volumes and `--network none`, then remove only their own fixtures.

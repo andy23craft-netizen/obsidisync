@@ -14,11 +14,19 @@ export class ShareSelectionModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Choose server share" });
-    contentEl.createEl("p", { text: "Selection retains v1 state. Initial share download requires a verified backup before replacing files. V2 uploads remain disabled." });
+    contentEl.createEl("p", { text: "Selection retains v1 state. Explicit initial upload or download reconciliation requires a verified local backup." });
     const status = contentEl.createEl("p", { text: "Loading authorized shares..." });
     const active = this.settings.activeShare;
     if (active) {
-      status.setText(`${active.label} (${active.shareId}): ${active.capability}, download-only. ${active.download.reconciliation.length} reconciliation barrier(s). Use the conflict command to review local records. Use a separate local vault for another share.`);
+      status.setText(`${active.label} (${active.shareId}): ${active.capability}, ${active.status}. ${active.download.reconciliation.length} reconciliation barrier(s). Use the conflict command to review local records. Use a separate local vault for another share.`);
+      if (active.status === "download-only") new Setting(contentEl).setName("Writable synchronization")
+        .setDesc("Enable uploads for reconciled files. Existing local barriers remain blocked until explicitly reconciled.")
+        .addButton((button) => button.setButtonText("Enable writes").onClick(async () => {
+          if (!window.confirm("Enable share writes for safely reconciled files? Existing blocked edits stay blocked.")) return;
+          button.setDisabled(true);
+          try { await this.service.enableShareWrites(); this.close(); }
+          catch (error) { status.setText(errorMessage(error)); button.setDisabled(false); }
+        }));
       return;
     }
     const pending = this.settings.pendingShareSelection;
@@ -34,7 +42,14 @@ export class ShareSelectionModal extends Modal {
           button.setDisabled(true);
           try { await this.service.initializeShareDownload(); this.close(); }
           catch (error) { status.setText(errorMessage(error)); button.setDisabled(false); }
-        }));
+        }))
+        .addButton((button) => button.setButtonText("Back up and upload local vault")
+          .setDisabled(Boolean(pending.download) || pending.capability !== "read-write").onClick(async () => {
+            if (!window.confirm("Back up local files and replace the selected share with this local vault, including remote-only deletions? Concurrent remote changes may conflict. This is an explicit initial upload decision.")) return;
+            button.setDisabled(true);
+            try { await this.service.initializeShareUpload(); this.close(); }
+            catch (error) { status.setText(errorMessage(error)); button.setDisabled(false); }
+          }));
     }
     try {
       const shares = await this.service.discoverShares();

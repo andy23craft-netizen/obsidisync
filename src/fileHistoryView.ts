@@ -391,7 +391,7 @@ export class FileHistoryView extends ItemView {
       actions.style.alignItems = "center";
       actions.style.gap = "4px";
 
-      if (!this.gitService.isShareDownloadMode()) {
+      if (this.gitService.canWriteSelectedShare()) {
         const nameButton = this.createIconButton(actions, "pencil", "Name version");
         nameButton.onclick = () => this.nameVersion(entry);
 

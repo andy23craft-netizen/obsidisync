@@ -544,7 +544,11 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async syncNow(): Promise<void> {
-    if (this.gitService.isShareDownloadMode()) { await this.gitService.sync(); return; }
+    if (this.gitService.hasSelectedShare()) {
+      const conflicts = await this.gitService.sync();
+      if (conflicts.length) this.openConflictResolver(conflicts, { explicit: false });
+      return;
+    }
     const blocked = this.gitService.destinationBlocker();
     if (blocked) { new Notice(blocked); return; }
     if (this.needsInitialSyncSetup()) {
@@ -594,7 +598,8 @@ export default class ObsidiSyncPlugin extends Plugin {
    * forcing the dialog back open; the clickable conflict notice and the command still work.
    */
   private openConflictResolver(conflicts: SyncConflict[] = [], options: { explicit: boolean } = { explicit: true }): void {
-    if (this.settings.activeShare || this.settings.pendingShareSelection?.download) {
+    if (this.settings.pendingShareSelection?.download || (this.settings.activeShare &&
+        (conflicts.length === 0 || !this.gitService.canWriteSelectedShare()))) {
       new LocalReconciliationModal(this.app, this.gitService).open();
       return;
     }

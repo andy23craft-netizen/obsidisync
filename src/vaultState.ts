@@ -32,6 +32,15 @@ export class VaultState {
 
   paths(): string[] { return this.vault.getFiles().map((file) => file.path).filter((path) => !shouldIgnoreVaultPath(path)); }
 
+  /** Capture upload bytes and their evidence together; later edits cannot change this acknowledgement. */
+  async capture(path: string): Promise<{ entry: ManifestEntry | null; bytes?: ArrayBuffer }> {
+    const entry = await this.checkedEntryFor(path);
+    if (!entry) return { entry: null };
+    const bytes = await this.vault.adapter.readBinary(path);
+    if (await sha256Hex(bytes) !== entry.sha256) throw new Error(`File changed while capturing ${path}`);
+    return { entry, bytes };
+  }
+
   /** A folder or unreadable file is uncertainty, never evidence of absence. */
   async checkedEntryFor(path: string): Promise<ManifestEntry | null> {
     assertSafeVaultPath(path);

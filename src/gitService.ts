@@ -7,6 +7,7 @@ import {
   FileContentMode,
   CreatedDevicePassword,
   DevicePasswordEntry,
+  DeviceEntry,
   DeviceVersionEntry,
   HistoryEntry,
   RegisterRequest,
@@ -40,7 +41,7 @@ import { IosGitSyncSettings } from "./settings";
 import { assertGitBranch, assertNamespaceSlug, assertSecureHttpUrl } from "./security";
 import { ServerUpsert, sha256Hex, VaultState } from "./vaultState";
 import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./shareSelection";
-import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported } from "./shareReconciliation";
+import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported, sameFile } from "./shareReconciliation";
 import type { PendingShareSelection } from "./shareSelection";
 
 type SaveSettings = () => Promise<void>;
@@ -48,6 +49,7 @@ type ConflictNoticeHandler = (conflicts: SyncConflict[]) => void;
 
 export type ConflictResolution =
   | { path: string; kind: "text"; content: string }
+  | { path: string; kind: "binary"; contentBase64: string }
   | { path: string; kind: "current" }
   | { path: string; kind: "delete" };
 type SyncStateListener = (running: boolean) => void;
@@ -216,7 +218,13 @@ export class GitService {
     return this.settings.activeShare?.download.baseline ?? this.settings.localManifest;
   }
 
-  isShareDownloadMode(): boolean { return Boolean(this.settings.activeShare); }
+  hasSelectedShare(): boolean { return Boolean(this.settings.activeShare); }
+
+  canWriteSelectedShare(): boolean {
+    if (this.settings.pendingShareSelection) return false;
+    const selected = this.settings.activeShare;
+    return !selected || (selected.status === "writable" && selected.capability === "read-write");
+  }
 
   lastSynchronizedAt(): string | null {
     return this.settings.activeShare?.download.lastDownloadedAt ?? (this.settings.activeShare ? null : this.settings.lastSyncedAt);
@@ -224,7 +232,21 @@ export class GitService {
 
   shareDownloadStatus(): string | null {
     const selected = this.settings.activeShare;
-    return selected ? `${selected.capability}, download-only; uploads disabled; ${selected.download.reconciliation.length} local barrier(s)` : null;
+    return selected ? `${selected.capability}, ${selected.status}; ${selected.download.reconciliation.length} local barrier(s)` : null;
+  }
+
+  /** Explicit opt-in after initial download. Existing preservation records remain upload barriers. */
+  async enableShareWrites(): Promise<void> {
+    await this.exclusive(async () => {
+      const selected = this.settings.activeShare;
+      if (!selected || !selected.download.initial.complete) throw new Error("Finish initial reconciliation first");
+      await this.negotiateShare(selected);
+      if (selected.capability !== "read-write") throw new Error("Share is read-only");
+      await this.downloadSnapshot(selected); // Recover applying journals before enabling any write path.
+      await this.recoverShareWrite(selected);
+      selected.status = "writable";
+      await this.saveSettings();
+    });
   }
 
   localReconciliations(): LocalReconciliation[] {
@@ -311,24 +333,214 @@ export class GitService {
     this.assertShareContext(selected);
     if (state.shareId !== selected.shareId || state.apiVersion !== 2 ||
         !["read", "read-write"].includes(state.capability)) throw new Error("Invalid share negotiation");
+    const downgraded = selected.capability === "read-write" && state.capability === "read";
     selected.capability = state.capability;
     await this.saveSettings();
+    if (downgraded && selected.download) await new ShareReconciler(new VaultState(this.vault), selected.download,
+      this.saveSettings, () => this.assertShareContext(selected)).preserveLocalChanges();
   }
 
-  private async downloadSnapshot(selected: PendingShareSelection | ActiveShare, initial = false): Promise<void> {
-    const root = this.sharePath(selected);
-    const response = await this.postJson<SyncResponse>(`${root}/sync`, {
+  private async requireShareWrite(selected: PendingShareSelection | ActiveShare): Promise<void> {
+    await this.negotiateShare(selected);
+    if (selected.capability !== "read-write") throw new Error("Share is read-only; local edits and recovery state retained");
+  }
+
+  private async shareWrite<T>(selected: PendingShareSelection | ActiveShare, path: string, body: unknown): Promise<T> {
+    await this.requireShareWrite(selected);
+    try { return await this.postJson<T>(`${this.sharePath(selected)}${path}`, body); }
+    catch (error) {
+      if (error instanceof HttpStatusError && error.status === 403) {
+        selected.capability = "read";
+        await this.saveSettings();
+        if (selected.download) await new ShareReconciler(new VaultState(this.vault), selected.download,
+          this.saveSettings, () => this.assertShareContext(selected)).preserveLocalChanges();
+      }
+      throw error;
+    }
+  }
+
+  /** Recover unknown outcomes using remote contents, never by resending consumed upload IDs. */
+  private async recoverShareWrite(selected: ActiveShare): Promise<void> {
+    const state = selected.download;
+    const writing = state.writing;
+    if (!writing) return;
+    const response = await this.shareSnapshot(selected);
+    const pending = await this.readShareConflicts(selected, writing.entries.map((entry) => entry.path));
+    for (const sent of writing.entries) {
+      if (pending.some((file) => file.path === sent.path)) continue; // Server conflict is already a durable write barrier.
+      const remote = response.files.find((file) => file.path === sent.path) ?? { path: sent.path, op: "delete" as const };
+      const matches = remote.op === "delete" ? sent.entry === null : sent.entry?.sha256 === remote.sha256;
+      if (writing.stage !== "staging" && matches) {
+        state.baseline = state.baseline.filter((entry) => entry.path !== sent.path);
+        if (sent.entry) state.baseline.push(sent.entry);
+      } else if (!state.reconciliation.some((entry) => entry.path === sent.path)) {
+        state.reconciliation.push({ path: sent.path, baseline: state.baseline.find((entry) => entry.path === sent.path) ?? null,
+          remote, remoteHead: response.serverHead, reason: "Interrupted write has an unconfirmed outcome; explicit reconciliation required",
+          uploadBlocked: true });
+      }
+    }
+    delete state.writing;
+    await this.saveSettings();
+    await this.applyShareSnapshot(selected, response);
+  }
+
+  private async readShareConflicts(selected: ActiveShare, explicitlyHandled: string[] = []): Promise<SyncConflict[]> {
+    const pending = await this.getJson<SyncConflict[]>(`${this.sharePath(selected)}/conflicts?clientId=${encodeURIComponent(this.settings.clientId)}`);
+    if (!Array.isArray(pending) || pending.some((file) => typeof file.path !== "string" || typeof file.reason !== "string")) {
+      throw new Error("Invalid server conflict list");
+    }
+    for (const previous of selected.download.serverConflicts ?? []) {
+      if (pending.some((file) => file.path === previous.path) || explicitlyHandled.includes(previous.path) ||
+          selected.download.reconciliation.some((file) => file.path === previous.path)) continue;
+      const baseline = selected.download.baseline.find((entry) => entry.path === previous.path) ?? null;
+      selected.download.reconciliation.push({ path: previous.path, baseline, remote: baseline
+        ? { path: previous.path, op: "upsert", sha256: baseline.sha256 } : { path: previous.path, op: "delete" },
+        remoteHead: selected.download.observedHead, reason: "Server conflict was cleared elsewhere; reconcile retained local contents",
+        uploadBlocked: true });
+    }
+    selected.download.serverConflicts = pending;
+    await this.saveSettings();
+    return pending;
+  }
+
+  private async shareSnapshot(selected: PendingShareSelection | ActiveShare): Promise<SyncResponse> {
+    const response = await this.postJson<SyncResponse>(`${this.sharePath(selected)}/sync`, {
       baseHead: null, clientId: this.settings.clientId, deviceName: this.deviceName(),
       changes: [], clientManifest: [], fileContent: this.fileContentMode()
     } satisfies SyncRequest);
-    this.assertShareContext(selected);
-    if (response.status !== "ok" || !Array.isArray(response.conflicts) || response.conflicts.length ||
-        !Array.isArray(response.files) || !(response.serverHead === null || typeof response.serverHead === "string") ||
-        (response.files.length > 0 && !response.serverHead)) throw new Error("Invalid read-only sync response");
+    if (response.status !== "ok" || !Array.isArray(response.files) || !Array.isArray(response.conflicts) ||
+        response.conflicts.length || !(response.serverHead === null || typeof response.serverHead === "string") ||
+        (response.files.length && !response.serverHead)) throw new Error("Invalid read-only sync response");
+    return response;
+  }
+
+  private async applyShareSnapshot(selected: PendingShareSelection | ActiveShare, response: SyncResponse, initial = false): Promise<void> {
     if (!selected.download) throw new Error("Missing explicit initial reconciliation");
-    const reconciler = new ShareReconciler(new VaultState(this.vault), selected.download,
-      this.saveSettings, () => this.assertShareContext(selected));
-    await reconciler.applySnapshot(response.files, response.serverHead, (file) => this.downloadShareFile(selected, file, response.serverHead), initial);
+    await new ShareReconciler(new VaultState(this.vault), selected.download, this.saveSettings,
+      () => this.assertShareContext(selected)).applySnapshot(response.files, response.serverHead,
+      (file) => this.downloadShareFile(selected, file, response.serverHead), initial);
+  }
+
+  private async downloadSnapshot(selected: PendingShareSelection | ActiveShare, initial = false): Promise<void> {
+    await this.applyShareSnapshot(selected, await this.shareSnapshot(selected), initial);
+  }
+
+  private async performShareSync(): Promise<SyncConflict[]> {
+    const selected = this.settings.activeShare!;
+    await this.negotiateShare(selected);
+    // Recover application and network journals before collecting a single new upload.
+    if (selected.download.applying) await this.downloadSnapshot(selected);
+    await this.recoverShareWrite(selected);
+    if (selected.status !== "writable" || selected.capability !== "read-write") {
+      await this.performShareDownload(); return [];
+    }
+    await this.readShareConflicts(selected);
+    const vault = new VaultState(this.vault);
+    const paths = new Set([...vault.paths(), ...selected.download.baseline.map((entry) => entry.path)]);
+    const captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }> = [];
+    for (const path of paths) {
+      if (!sharePathSupported(path) || selected.download.reconciliation.some((entry) => entry.path === path) ||
+          selected.download.serverConflicts?.some((entry) => entry.path === path)) continue;
+      let file: { entry: ManifestEntry | null; bytes?: ArrayBuffer };
+      try { file = await vault.capture(path); }
+      catch (error) {
+        const baseline = selected.download.baseline.find((entry) => entry.path === path) ?? null;
+        selected.download.reconciliation.push({ path, baseline, remote: baseline
+          ? { path, op: "upsert", sha256: baseline.sha256 } : { path, op: "delete" },
+          remoteHead: selected.download.observedHead, reason: `Local upload state uncertain: ${String(error)}`, uploadBlocked: true });
+        await this.saveSettings();
+        continue;
+      }
+      if (!sameFile(file.entry, selected.download.baseline.find((entry) => entry.path === path) ?? null)) captured.push({ path, entry: file.entry });
+    }
+    if (captured.length) await this.submitShareChanges(selected, captured, selected.download.observedHead);
+    await this.downloadSnapshot(selected);
+    selected.download.lastDownloadedAt = new Date().toISOString();
+    this.settings.lastSyncCompletedAt = selected.download.lastDownloadedAt;
+    await this.saveSettings();
+    const conflicts = selected.download.serverConflicts ?? [];
+    if (conflicts.length) this.showConflictNotice(conflicts);
+    else new Notice(`Share sync complete: ${captured.length} local change(s); ${selected.download.reconciliation.length} local barrier(s)`);
+    return conflicts;
+  }
+
+  private async submitShareChanges(selected: ActiveShare,
+    captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }>, baseHead: string | null,
+    resolve = false): Promise<void> {
+    const state = selected.download;
+    if (state.writing || state.applying) throw new Error("Recover interrupted work before writing");
+    state.writing = { stage: "staging", entries: captured.map(({ path, entry }) => ({ path, entry })) };
+    await this.saveSettings();
+    const changes: ClientChange[] = [];
+    for (const file of captured) {
+      if (file.entry) {
+        // Hold at most one staged file's bytes. A reread must still match the journaled capture.
+        const bytes = file.bytes ?? (await new VaultState(this.vault).capture(file.path)).bytes;
+        if (!bytes || await sha256Hex(bytes) !== file.entry.sha256) throw new Error(`Local file changed before staging: ${file.path}`);
+        const uploadId = await this.uploadShareBuffer(selected, file.path, bytes, file.entry);
+        changes.push({ path: file.path, op: "upsert", uploadId, sha256: file.entry.sha256, mtime: file.entry.mtime });
+      } else changes.push({ path: file.path, op: "delete" });
+    }
+    state.writing.stage = "submitted";
+    await this.saveSettings();
+    const response = resolve
+      ? await this.shareWrite<SyncResponse>(selected, "/resolve", {
+        clientId: this.settings.clientId, deviceName: this.deviceName(), fileContent: this.fileContentMode(),
+        files: changes.map((change) => change.op === "delete" ? { path: change.path, delete: true }
+          : { path: change.path, uploadId: change.uploadId }) } satisfies ResolveRequest)
+      : await this.shareWrite<SyncResponse>(selected, "/sync", {
+        baseHead, clientId: this.settings.clientId, deviceName: this.deviceName(), changes,
+        clientManifest: state.baseline, fileContent: this.fileContentMode() } satisfies SyncRequest);
+    if (!["ok", "conflict"].includes(response.status) || !Array.isArray(response.conflicts) ||
+        !Array.isArray(response.files)) throw new Error("Invalid write response; journal retained");
+    const unresolved = resolve ? (state.serverConflicts ?? []).filter((conflict) =>
+      !captured.some((file) => file.path === conflict.path)) : [];
+    state.serverConflicts = [...unresolved, ...response.conflicts.filter((conflict) =>
+      !unresolved.some((file) => file.path === conflict.path))];
+    if (response.status === "ok") {
+      state.writing.stage = "accepted";
+      await this.saveSettings();
+      for (const file of captured) {
+        state.baseline = state.baseline.filter((entry) => entry.path !== file.path);
+        if (file.entry) state.baseline.push(file.entry);
+      }
+    } else {
+      // Marker bytes are a conflict view, not contents at serverHead. Never fetch them as a blob or acknowledge them.
+      for (const file of response.files) {
+        const sent = captured.find((entry) => entry.path === file.path);
+        if (!sent || file.op !== "upsert" || typeof file.contentBase64 !== "string" ||
+            !response.conflicts.some((entry) => entry.path === file.path)) continue;
+        const vault = new VaultState(this.vault);
+        const folder = this.recoveryFolder();
+        await vault.verifiedBackup(folder, (await vault.checkedEntryFor(file.path)) ? [file.path] : []);
+        state.applying = { path: file.path, baseline: sent.entry, remote: file, remoteHead: response.serverHead,
+          reason: "Interrupted server conflict display", uploadBlocked: true, backupFolder: folder };
+        await this.saveSettings();
+        const bytes = await vault.serverBytes(file, async () => { throw new Error("Conflict markers must be inline"); });
+        if (!await vault.applyGuarded(file, sent.entry, bytes, () => this.assertShareContext(selected))) {
+          state.reconciliation.push({ ...state.applying, reason: "Local edit during conflict response; bytes retained" });
+        }
+        delete state.applying;
+        await this.saveSettings();
+      }
+    }
+    delete state.writing;
+    await this.saveSettings();
+  }
+
+  private async uploadShareBuffer(selected: ActiveShare, path: string, bytes: ArrayBuffer, entry: ManifestEntry): Promise<string> {
+    const init = await this.shareWrite<UploadInitResponse>(selected, "/uploads", { path, sha256: entry.sha256, size: bytes.byteLength });
+    const chunkSize = Math.max(1, Math.min(init.chunkSize || 512 * 1024, 2 * 1024 * 1024));
+    for (let offset = 0; offset < bytes.byteLength;) {
+      const end = Math.min(offset + chunkSize, bytes.byteLength);
+      const chunk = await this.shareWrite<UploadChunkResponse>(selected, `/uploads/${encodeURIComponent(init.uploadId)}/chunk`,
+        { offset, contentBase64: arrayBufferToBase64(bytes.slice(offset, end)) });
+      if (chunk.received !== end) throw new Error(`Invalid upload progress: ${path}`);
+      offset = end;
+    }
+    const complete = await this.shareWrite<UploadCompleteResponse>(selected, `/uploads/${encodeURIComponent(init.uploadId)}/complete`, {});
+    if (complete.sha256 !== entry.sha256 || complete.size !== bytes.byteLength) throw new Error(`Upload verification failed: ${path}`);
+    return complete.uploadId;
   }
 
   private async downloadShareFile(selected: PendingShareSelection | ActiveShare, file: ServerUpsert,
@@ -359,6 +571,79 @@ export class GitService {
     record.localChoice = "keep-local";
     record.reason = "Local bytes retained by explicit choice; future upload still requires write reconciliation";
     await this.saveSettings();
+  }
+
+  /** An explicit, backed-up choice of current bytes against a freshly observed remote version. */
+  async uploadLocalReconciliation(path: string): Promise<void> {
+    await this.exclusive(async () => {
+      const selected = this.settings.activeShare;
+      if (!selected || selected.status !== "writable") throw new Error("Enable writable share synchronization first");
+      await this.requireShareWrite(selected);
+      await this.recoverShareWrite(selected);
+      await this.downloadSnapshot(selected);
+      const record = selected.download.reconciliation.find((entry) => entry.path === path);
+      if (!record) throw new Error("No local reconciliation record");
+      if (selected.download.serverConflicts?.some((entry) => entry.path === path)) throw new Error("Use server conflict resolution for this path");
+      const vault = new VaultState(this.vault);
+      const file = await vault.capture(path);
+      const folder = this.recoveryFolder();
+      const copied = await vault.verifiedBackup(folder, file.entry ? [path] : []);
+      if (!sameFile(copied[0] ?? null, file.entry)) throw new Error("File changed during reconciliation backup");
+      record.backupFolder = folder;
+      await this.saveSettings();
+      await this.submitShareChanges(selected, [{ path, ...file }], record.remoteHead);
+      if (!selected.download.serverConflicts?.some((entry) => entry.path === path)) {
+        selected.download.reconciliation = selected.download.reconciliation.filter((entry) => entry.path !== path);
+        await this.saveSettings();
+      }
+      await this.downloadSnapshot(selected);
+    });
+  }
+
+  /** Initial upload is an explicit replacement decision, with local backup and a real remote base. */
+  async initializeShareUpload(): Promise<void> {
+    await this.exclusive(async () => {
+      const pending = this.settings.pendingShareSelection;
+      if (!pending || pending.download) throw new Error("Select an uninitialized share; resume existing recovery instead");
+      await this.requireShareWrite(pending);
+      const vault = new VaultState(this.vault);
+      pending.download = { observedHead: null, baseline: [], reconciliation: [],
+        initial: { backupFolder: this.recoveryFolder(), appliedPaths: [], complete: false } };
+      await this.saveSettings();
+      const backup = await vault.verifiedBackup(pending.download.initial.backupFolder, vault.paths().filter(sharePathSupported));
+      pending.download.initial.backupManifest = backup;
+      await this.saveSettings();
+      const snapshot = await this.shareSnapshot(pending);
+      const captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }> = [];
+      const paths = new Set([...backup.map((entry) => entry.path), ...snapshot.files.map((file) => file.path)]);
+      for (const path of paths) {
+        if (!sharePathSupported(path)) continue;
+        const file = await vault.capture(path);
+        if (!sameFile(file.entry, backup.find((entry) => entry.path === path) ?? null)) {
+          throw new Error(`Local file changed after initial backup: ${path}. Resume safe download reconciliation.`);
+        }
+        const remote = snapshot.files.find((entry) => entry.path === path);
+        if (file.entry?.sha256 !== (remote?.op === "upsert" ? remote.sha256 : undefined)) captured.push({ path, entry: file.entry });
+      }
+      pending.download.baseline = snapshot.files.filter((file): file is ServerUpsert => file.op === "upsert" && sharePathSupported(file.path))
+        .map((file) => ({ path: file.path, sha256: file.sha256, size: file.size ?? 0, mtime: 0 }));
+      pending.download.observedHead = snapshot.serverHead;
+      pending.download.initial.complete = true;
+      const { syncState: _old, status: _status, observedHead: _head, ...destination } = pending;
+      const selected: ActiveShare = { ...destination, status: "writable", download: pending.download };
+      this.settings.activeShare = selected;
+      this.settings.pendingShareSelection = null;
+      await this.saveSettings();
+      if (captured.length) await this.submitShareChanges(selected, captured, snapshot.serverHead);
+      await this.downloadSnapshot(selected);
+      if (selected.download.serverConflicts?.length) {
+        this.showConflictNotice(selected.download.serverConflicts);
+        throw new Error("Initial upload encountered concurrent remote changes; resolve retained server conflicts before continuing");
+      }
+      selected.download.lastDownloadedAt = new Date().toISOString();
+      this.settings.lastSyncCompletedAt = selected.download.lastDownloadedAt;
+      await this.saveSettings();
+    });
   }
 
   async useRemoteReconciliation(path: string): Promise<void> {
@@ -559,7 +844,7 @@ export class GitService {
   }
 
   private async performSync(): Promise<SyncConflict[]> {
-    if (this.settings.activeShare) { await this.performShareDownload(); return []; }
+    if (this.settings.activeShare) return this.performShareSync();
     const blockReason = this.syncBlocker?.();
     if (blockReason) {
       new Notice(blockReason);
@@ -731,17 +1016,27 @@ export class GitService {
     return this.getJson<HistoryEntry[]>(`${root}/history${suffix}`);
   }
 
+  async devices(): Promise<DeviceEntry[]> {
+    return this.getJson<DeviceEntry[]>(`${await this.readVaultPath()}/devices`);
+  }
+
   async deviceVersions(path: string): Promise<DeviceVersionEntry[]> {
     const root = await this.readVaultPath();
     try {
       return await this.getJson<DeviceVersionEntry[]>(`${root}/files/device-versions?path=${encodeURIComponent(path)}`);
-    } catch {
+    } catch (error) {
+      if (this.settings.activeShare) throw error;
       // Older servers don't have this endpoint yet; degrade to no badges.
       return [];
     }
   }
 
   async saveVersionMetadata(request: VersionMetadataRequest): Promise<void> {
+    if (this.settings.activeShare) {
+      if (!this.canWriteSelectedShare()) throw new Error("Share metadata is read-only");
+      await this.shareWrite(this.settings.activeShare, "/files/version-metadata", request);
+      return;
+    }
     this.requireConfigured();
     await this.postJson<void>(`${this.vaultPath()}/files/version-metadata`, request);
   }
@@ -764,6 +1059,51 @@ export class GitService {
     if (this.running) {
       throw new Error("A sync is running. Wait for it to finish, then try again.");
     }
+    if (this.settings.activeShare) {
+      const result = await this.exclusive(async () => {
+        const selected = this.settings.activeShare!;
+        if (!this.canWriteSelectedShare()) throw new Error("Server conflict resolution requires writable share access");
+        await this.requireShareWrite(selected);
+        if (selected.download.applying) await this.downloadSnapshot(selected);
+        await this.recoverShareWrite(selected);
+        const pending = await this.pendingConflicts();
+        const vault = new VaultState(this.vault);
+        const captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }> = [];
+        for (const resolution of resolutions) {
+          if (!sharePathSupported(resolution.path) || !pending.some((entry) => entry.path === resolution.path)) {
+            throw new Error("Only supported pending server conflicts may be resolved");
+          }
+          const original = await vault.capture(resolution.path);
+          const folder = this.recoveryFolder();
+          const copied = await vault.verifiedBackup(folder, original.entry ? [resolution.path] : []);
+          if (!sameFile(copied[0] ?? null, original.entry)) throw new Error("File changed during resolution backup");
+          if (resolution.kind !== "current") {
+            const bytes = resolution.kind === "text" ? new TextEncoder().encode(resolution.content).buffer
+              : resolution.kind === "binary" ? base64ToArrayBuffer(resolution.contentBase64) : undefined;
+            const target: ServerFileChange = bytes ? { path: resolution.path, op: "upsert", sha256: await sha256Hex(bytes) }
+              : { path: resolution.path, op: "delete" };
+            selected.download.applying = { path: resolution.path, baseline: original.entry, remote: target,
+              remoteHead: selected.download.observedHead, reason: "Interrupted explicit conflict choice", uploadBlocked: true, backupFolder: folder };
+            await this.saveSettings();
+            if (!await vault.applyGuarded(target, original.entry, bytes, () => this.assertShareContext(selected))) {
+              throw new Error("Local edit during resolution; bytes retained");
+            }
+            delete selected.download.applying;
+            await this.saveSettings();
+          }
+          captured.push({ path: resolution.path, entry: (await vault.capture(resolution.path)).entry });
+        }
+        await this.submitShareChanges(selected, captured, selected.download.observedHead, true);
+        const remaining = await this.readShareConflicts(selected, captured.map((file) => file.path));
+        for (const file of captured) if (!remaining.some((entry) => entry.path === file.path)) {
+          selected.download.reconciliation = selected.download.reconciliation.filter((entry) => entry.path !== file.path);
+        }
+        await this.saveSettings();
+        await this.downloadSnapshot(selected);
+        return remaining;
+      });
+      return result ?? [];
+    }
     const result = await this.exclusive(async () => {
       this.requireConfigured();
       await this.checkServerCompatibility();
@@ -779,6 +1119,7 @@ export class GitService {
         if (resolution.kind === "text") {
           await this.vault.adapter.write(resolution.path, resolution.content);
         }
+        if (resolution.kind === "binary") throw new Error("Binary choices require selected-share guarded resolution");
         const buffer = await this.vault.adapter.readBinary(resolution.path);
         const uploadId = await this.uploadBuffer(resolution.path, buffer);
         files.push({ path: resolution.path, uploadId });
@@ -815,6 +1156,10 @@ export class GitService {
    * endpoint; they answer 404 and this returns an empty list.
    */
   async pendingConflicts(): Promise<SyncConflict[]> {
+    if (this.settings.activeShare) {
+      await this.readVaultPath();
+      return this.readShareConflicts(this.settings.activeShare);
+    }
     this.requireConfigured();
     try {
       const conflicts = await this.getJson<SyncConflict[]>(

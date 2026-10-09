@@ -1,8 +1,9 @@
-# Client share selection and safe downloads
+# Client share selection and safe synchronization
 
-The plugin implements destination-bound selection (FEAT-04A) and safe download reconciliation (FEAT-04B).
-Selected shares are **download-only**, even with read-write membership. FEAT-04C supplies writable workflows;
-FEAT-04D supplies separate legacy/share credential management. Unconverted configurations retain v1 behavior.
+The plugin implements destination-bound selection (FEAT-04A), safe downloads (FEAT-04B) and writable share workflows
+(FEAT-04C). Download initialization starts download-only, even with read-write membership. Enable writes explicitly
+enables synchronization for reconciled files. FEAT-04D still supplies separate legacy/share credential management.
+Unconverted configurations retain v1 behavior.
 This is implemented repository behavior, not a household deployment or desktop/mobile acceptance result.
 
 ## Selecting and initializing
@@ -33,7 +34,8 @@ backup **and plugin settings**, not merely clearing selection fields or resuming
 
 ## Ordinary download synchronization
 
-Startup, timer, manual and close-triggered synchronization use the same selected-share download path. It verifies
+In download-only mode or with read-only capability, startup, timer, manual and close synchronization use the
+selected-share download path. It verifies
 the selected identity/configuration, negotiates current capability and sends `POST /v2/shares/{id}/sync` with
 `changes: []`, `baseHead: null` and an empty client manifest. It never registers, uploads, resolves server conflicts,
 refreshes upstream or writes document/version/device metadata to download. Normal authentication refresh may still
@@ -44,7 +46,9 @@ remain reachable after head advancement or interruption. Matching local/remote c
 Reference and inline bytes are checksum-verified. Blob requests pin the returned remote head; authorized history,
 device-version reads and historical file downloads use v2 too. Historical content is checksum-verified.
 This client continues not to advertise `inkVaultNotesV1`; gated `.inkvault/` source omission never means deletion.
-Ordinary exported PDFs remain supported. Native InkVault write/conflict workflows remain C's responsibility.
+Ordinary exported PDFs remain supported. Managed InkVault PDFs cannot be independently changed by ordinary clients:
+rejection retains local bytes and recovery creates a barrier. Native InkVault clients retain their separate
+feature-gated paired source/PDF publication and resolution protocol. This plugin does not provision source editing.
 
 Each file has its own synchronized baseline. Local edits, new local files, local deletions, unreadable paths or
 file/folder mismatches fail closed for that file. Unaffected files continue. A remote update/deletion can apply only
@@ -53,9 +57,10 @@ No completion-time vault scan acknowledges edits that were never sent or applied
 
 ## Local reconciliation and permission changes
 
-Settings and download notices show capability, download-only status and pending counts. Open conflict resolver to
+Settings and synchronization notices show capability, selected mode and pending counts. Open conflict resolver to
 review **local reconciliation** records, separate from server merge conflicts. The file history view marks affected
-files as reconciliation-required and hides mutable metadata actions. The mobile changed indicator includes barriers.
+files as reconciliation-required. Mutable metadata actions require writable mode and read-write capability,
+rechecked before submission. The mobile changed indicator includes barriers.
 
 - Keep local (upload blocked) records an explicit local choice, retains bytes/deletion and keeps the upload barrier.
 - Back up and use remote requires confirmation, refreshes the current remote target, verifies a fresh local backup,
@@ -69,8 +74,8 @@ succeeded merely because bytes happen to match a remote hash.
 
 Observed read-only capability is saved. Local edits are scanned into barriers before the following read request,
 so a failed read does not lose downgrade protection. Restart, re-login or restored read-write membership cannot
-clear these barriers or make retained edits uploadable. Even local choices require C's explicit write reconciliation
-before any future upload. B itself permits no selected-share writes for either capability.
+clear these barriers or make retained edits uploadable. Even Keep local requires separate explicit write
+reconciliation before any upload. Read-only users see no server-mutating conflict, metadata or upload actions.
 
 ## Persisted ownership and C integration
 
@@ -82,7 +87,8 @@ before any future upload. B itself permits no selected-share writes for either c
   never reconstructs an OIDC issuer or resolves membership. Issuer-less sessions still require fresh verified login.
   Development tokens still require explicit server enablement, membership and mapping; production modes reject them.
 - `pendingShareSelection.download` contains initial backup/recovery progress. `activeShare.download` owns the selected
-  share's `baseline`, `observedHead`, local `reconciliation`, `applying` intent and initial recovery evidence.
+  share's `baseline`, `observedHead`, local `reconciliation`, `applying` intent, initial recovery evidence,
+  `writing` journal and separate `serverConflicts`.
   The flat legacy `serverHead`/`localManifest` are never repurposed as a share baseline.
 
 These fields use Obsidian's plugin data persistence; the vault adapter and plugin settings are not one transaction.
@@ -91,21 +97,58 @@ Intent-before-write and conservative recovery handle the disk/state interruption
 recovery backup. Do not hand-edit/delete state to bypass barriers. The adapter offers no cross-process compare-and-swap;
 final checks protect edits detected before the adapter operation, not concurrent external filesystem writers.
 
-C can consume `VaultState.applyGuarded`, verified byte/backup helpers and the per-file state directly. It must
-acknowledge only sent/applied content, recover `applying` before new work, and exclude every `uploadBlocked` path
-until explicit write reconciliation. `observedHead` is observation, not evidence that all local files are synchronized.
-Keep local preservation records distinct from server conflicts and check current capability before every write stage.
+Writable sync consumes guarded application and per-file state, recovers application/write journals before collecting
+uploads, and excludes every upload barrier until explicit reconciliation. Observed head advancement never
+acknowledges local bytes. Every write stage rechecks capability.
 
 ## Automated evidence and remaining validation
 
 Synthetic fixtures cover mixed safe/edited files, local/remote deletions, changes during transfer, checksum failures,
 backup failure/resume, ambiguous disk interruption, remote advancement, downgrade/restart/restoration, local choices,
-identity/configuration changes, denied access without fallback and retained legacy state. The e2e harness runs both
-writable v1 conflicts and real read-only v2 downloads, checking share storage fingerprints for document mutation.
+identity/configuration changes, denied access without fallback and retained legacy state. The e2e harness runs writable v1, read-only v2 and writable v2 recovery/conflict scenarios. Read-only tests check
+share storage fingerprints for mutation. Native InkVault v2 publication/feature/capability gates and ordinary plugin
+PDF compatibility are exercised separately.
 
-Human desktop/iPhone acceptance, native InkVault workflows and writable share/credential UI acceptance remain for
-C/D and the parent audit. Existing v1 application semantics are preserved; B's guarded primitives apply to selected
+Human desktop/iPhone acceptance and credential UI implementation remain for D and the parent audit. Existing v1 application semantics are preserved; B's guarded primitives apply to selected
 shares. Full snapshots and per-file state saves favor safety over transfer/storage efficiency. No production access,
 migration, deployment, sibling repository changes or ARM64 production publication is authorized by this stage.
 See the [FEAT-04 decomposition](tickets/FEAT-04-DECOMPOSITION.md) and
 [server publication/migration contracts](SHARE_STORAGE_AND_MIGRATION.md).
+
+## Writable workflows and interruption recovery (FEAT-04C)
+
+Enable writes explicitly opts a downloaded vault into uploads after recovery and capability checks. Existing local
+records remain blocked. Alternatively, before initial recovery starts, Back up and upload local vault confirms
+replacement of the selected share, including remote-only deletions. A fresh verified backup is mandatory. The client
+reads the actual remote snapshot/base and captures checked local bytes before staging. Concurrent remote changes
+can conflict. No v1 registration, baseline reuse or label mapping occurs. Preparation failures leave pending recovery:
+resume safe download reconciliation with retained local backups. Submission failures retain active state and a journal.
+
+Writable synchronization captures bytes and hashes together, saves a write journal, stages chunks and submits changes.
+Capability is checked before initialization, every chunk, completion, sync, server resolution and mutable metadata.
+Observed downgrade or HTTP 403 stops subsequent writes and saves preservation barriers. The server remains authoritative
+during requests. Only successfully accepted captured contents advance baselines. The following full snapshot applies
+merged contents against that exact evidence; edits during transfer remain local and become barriers.
+
+Server merge conflicts are persisted separately. Inline marker bytes are a conflict view, not contents at the returned
+Git head: verify checksums, back up local bytes and guard application without acknowledging markers. Binary conflicts
+preserve local bytes. The local reconciliation window offers a separate server resolver in writable mode. Explicit
+choices back up local files and use v2 resolve; pending paths are rechecked after resolution and restart.
+
+Back up and upload local choice is a separate explicit action for local barriers, available only in writable mode.
+It refreshes the remote target, captures/backups current bytes or deletion, and submits against that refreshed base.
+Concurrent remote changes can still conflict. Server-conflicted paths require the server resolver. Keep local alone
+never approves an upload. Historical reads, device listings/versions and mutable version metadata use v2.
+
+The write journal stores exact per-file hash/deletion evidence before network mutation:
+
+- Staging: submission was not confirmed; recovery blocks captured edits rather than auto-uploading them.
+- Submitted: a response may be lost. Authorized reads compare remote contents with captured evidence and pending
+  conflicts. Exact matches may acknowledge only the captured version; divergence/conflicts require reconciliation.
+- Accepted: success was received; the journal survives interruption while saving baselines. Recovery remains
+  conservative if remote contents subsequently diverged.
+
+Newer local edits remain detectable after matching acknowledgement recovery. Consumed upload IDs are never blindly
+replayed. Partial staging can leave temporary server uploads until normal cleanup; persisted byte-offset continuation
+is not promised. Safe downloads/matching acknowledgements recover automatically; ambiguous writes require review.
+The documented non-atomic external-writer filesystem race remains. No storage-adapter redesign is included.

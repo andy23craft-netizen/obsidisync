@@ -361,6 +361,7 @@ test("initial share download UI requires explicit consent and active chooser can
 test("local reconciliation UI offers only local choices and confirms remote replacement", async () => {
   const calls: string[] = [];
   const service = {
+    canWriteSelectedShare: () => false,
     localReconciliations: () => [{ path: "a.md", reason: "local edit", remote: { op: "delete" }, remoteHead: "h2" }],
     keepLocalReconciliation: async (path: string) => { calls.push(`keep:${path}`); },
     useRemoteReconciliation: async (path: string) => { calls.push(`remote:${path}`); }
@@ -373,6 +374,21 @@ test("local reconciliation UI offers only local choices and confirms remote repl
   await remote.click(); assert.equal(calls.length, 1);
   (globalThis as any).window.confirm = () => true;
   await remote.click(); assert.deepEqual(calls, ["keep:a.md", "remote:a.md"]);
+});
+
+test("writable reconciliation UI requires explicit confirmation for uploading a blocked local choice", async () => {
+  const calls: string[] = [];
+  const service = {
+    canWriteSelectedShare: () => true,
+    localReconciliations: () => [{ path: "a.md", reason: "local edit", remote: { op: "delete" }, remoteHead: "h2" }],
+    uploadLocalReconciliation: async (path: string) => { calls.push(path); }
+  };
+  (globalThis as any).window = { confirm: () => false };
+  buttons = []; new LocalReconciliationModal({}, service).onOpen();
+  const upload = buttons.find((button) => button.text === "Back up and upload local choice")!;
+  assert.ok(upload); await upload.click(); assert.deepEqual(calls, []);
+  (globalThis as any).window.confirm = () => true;
+  await upload.click(); assert.deepEqual(calls, ["a.md"]);
 });
 
 test("startup metadata migration retains legacy recovery records while selection is pending or active", async () => {

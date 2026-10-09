@@ -1,4 +1,4 @@
-import type { ManifestEntry, ServerFileChange } from "./protocol";
+import type { ManifestEntry, ServerFileChange, SyncConflict } from "./protocol";
 import type { PendingShareSelection } from "./shareSelection";
 import { shouldIgnoreVaultPath } from "./ignore";
 import { assertSafeVaultPath } from "./security";
@@ -24,11 +24,14 @@ export interface ShareDownloadState {
   reconciliation: LocalReconciliation[];
   /** Saved BEFORE touching a file. An ambiguous interrupted write fails closed on restart. */
   applying?: LocalReconciliation;
+  /** Exact captured contents, saved before staging. Never reconstructed by scanning at completion. */
+  writing?: { stage: "staging" | "submitted" | "accepted"; entries: Array<{ path: string; entry: ManifestEntry | null }> };
+  serverConflicts?: SyncConflict[];
   initial: { backupFolder: string; backupManifest?: ManifestEntry[]; appliedPaths: string[]; complete: boolean };
 }
 
 export interface ActiveShare extends Omit<PendingShareSelection, "status" | "syncState" | "observedHead" | "download"> {
-  status: "download-only";
+  status: "download-only" | "writable";
   download: ShareDownloadState;
 }
 
@@ -57,6 +60,7 @@ export class ShareReconciler {
   async preserveLocalChanges(): Promise<void> {
     const paths = new Set([...this.vault.paths().filter(sharePathSupported), ...this.state.baseline.map((entry) => entry.path)]);
     for (const path of paths) {
+      if (this.state.serverConflicts?.some((entry) => entry.path === path)) continue;
       if (this.state.reconciliation.some((entry) => entry.path === path)) continue;
       this.assertDestination();
       const baseline = this.state.baseline.find((entry) => entry.path === path) ?? null;
@@ -98,6 +102,8 @@ export class ShareReconciler {
 
     for (const remote of targets.values()) {
       this.assertDestination();
+      // Server conflicts are resolved explicitly, not as local-only preservation decisions.
+      if (this.state.serverConflicts?.some((entry) => entry.path === remote.path)) continue;
       const baseline = this.state.baseline.find((entry) => entry.path === remote.path) ?? null;
       const target: ServerFileChange = remote.op === "upsert"
         ? { path: remote.path, op: "upsert", sha256: remote.sha256, size: remote.size } : remote;

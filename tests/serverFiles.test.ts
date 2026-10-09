@@ -45,7 +45,7 @@ test("download progress names the file", () => {
 
 test("sync paths request references, download per file, and persist progress", () => {
   const service = readFileSync(join(root, "src", "gitService.ts"), "utf8");
-  assert.equal((service.match(/fileContent: this\.fileContentMode\(\)/g) ?? []).length, 5, "v1 sync, force push, probe, resolve and v2 read snapshot");
+  assert.equal((service.match(/fileContent: this\.fileContentMode\(\)/g) ?? []).length, 7, "v1 workflows and v2 read/write/resolve");
   assert.match(service, /download: \(file\) => this\.downloadServerFile\(file, serverHead\)/);
   assert.match(service, /if \(actual !== file\.sha256\)/);
   assert.match(service, /appliedSinceSave >= DOWNLOAD_PROGRESS_SAVE_EVERY/);

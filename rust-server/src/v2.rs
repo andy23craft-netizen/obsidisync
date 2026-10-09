@@ -123,9 +123,7 @@ async fn handle(
             {
                 service.sync_inkvault("share", &share, request).await?
             } else {
-                service
-                    .sync_with_sources("share", &share, request, native)
-                    .await?
+                service.sync_v2(&share, request, native).await?
             };
             if !read_sync {
                 if let Some(mapping) = publication

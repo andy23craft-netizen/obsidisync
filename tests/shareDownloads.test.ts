@@ -40,6 +40,8 @@ function fixture(t: any) {
   let hook: ((options: any) => Promise<void>) | undefined;
   let deny = 0;
   let inline = false;
+  let after: ((options: any) => Promise<void>) | undefined;
+  const uploads = new Map<string, { path: string; sha256: string; bytes: Buffer }>();
   const versions = new Map<string, Record<string, string | Buffer>>();
   const save = async () => writeFileSync(join(root, "settings.json"), JSON.stringify(settings));
   const make = () => { service = new GitService(vault, settings, save); return service; };
@@ -57,12 +59,44 @@ function fixture(t: any) {
     if (url.pathname.endsWith("/sync-state")) return ok({ shareId: id, capability, apiVersion: 2, serverHead: head });
     if (url.pathname.endsWith("/sync")) {
       const body = JSON.parse(options.body);
-      assert.deepEqual(body.changes, []);
-      assert.deepEqual(body.clientManifest, []);
-      assert.equal(body.baseHead, null);
+      if (body.changes.length) {
+        if (capability !== "read-write") return { status: 403, json: {}, text: "read-only" };
+        for (const change of body.changes) {
+          if (change.op === "delete") delete remote[change.path];
+          else {
+            const upload = uploads.get(change.uploadId)!;
+            assert.equal(sha(upload.bytes), upload.sha256);
+            remote[change.path] = upload.bytes;
+            uploads.delete(change.uploadId);
+          }
+        }
+        head += "-write";
+      } else {
+        assert.deepEqual(body.clientManifest, []);
+        assert.equal(body.baseHead, null);
+      }
       versions.set(head, { ...remote });
+      await after?.(options);
       return ok({ status: "ok", conflicts: [], serverHead: head, files: Object.entries(remote).map(([path, text]) =>
         ({ path, op: "upsert", sha256: sha(text), ...(inline ? { contentBase64: Buffer.from(text).toString("base64") } : {}) })) });
+    }
+    if (url.pathname.endsWith("/conflicts")) return ok([]);
+    if (url.pathname.includes("/uploads")) {
+      if (capability !== "read-write") return { status: 403, json: {}, text: "read-only" };
+      const body = JSON.parse(options.body);
+      if (url.pathname.endsWith("/uploads")) {
+        const uploadId = `upload-${uploads.size}`;
+        uploads.set(uploadId, { ...body, bytes: Buffer.alloc(0) });
+        return ok({ uploadId, chunkSize: 3 });
+      }
+      const uploadId = url.pathname.split("/").slice(-2)[0];
+      const upload = uploads.get(uploadId)!;
+      if (url.pathname.endsWith("/chunk")) {
+        assert.equal(body.offset, upload.bytes.length);
+        upload.bytes = Buffer.concat([upload.bytes, Buffer.from(body.contentBase64, "base64")]);
+        return ok({ uploadId, received: upload.bytes.length });
+      }
+      return ok({ uploadId, sha256: sha(upload.bytes), size: upload.bytes.length });
     }
     if (url.pathname.endsWith("/blob")) {
       const value = versions.get(url.searchParams.get("hash")!)?.[url.searchParams.get("path")!];
@@ -79,6 +113,8 @@ function fixture(t: any) {
     remote: (files: Record<string, string | Buffer>, version = "h1") => { remote = files; head = version; },
     capability: (value: string) => { capability = value; }, hook: (value?: typeof hook) => { hook = value; },
     deny: (status: number) => { deny = status; }, inline: () => { inline = true; },
+    after: (value?: typeof after) => { after = value; },
+    remoteFiles: () => remote,
     write: (path: string, text: string) => { mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), text); },
     read: (path: string) => existsSync(join(dir, path)) ? readFileSync(join(dir, path), "utf8") : null,
     remove: (path: string) => rmSync(join(dir, path)),
@@ -115,7 +151,7 @@ test("explicit initial download verifies backup, preserves v1 settings, and supp
   await f.service().history("grocery.md"); await f.service().deviceVersions("grocery.md");
   await f.service().fileAtVersion("grocery.md", "h1");
   for (const operation of [() => f.service().forcePushLocal(), () => f.service().resolveConflicts([{ path: "grocery.md", kind: "delete" }]),
-    () => f.service().saveVersionMetadata({ path: "grocery.md", hash: "h1" })]) await assert.rejects(operation(), /not enabled/);
+    () => f.service().saveVersionMetadata({ path: "grocery.md", hash: "h1" })]) await assert.rejects(operation(), /not enabled|writable share access|read-only/);
   onlyReads(f);
 });
 
@@ -361,4 +397,143 @@ test("malformed or unsafe remote snapshots fail before any local application", a
     await assert.rejects(f.service().sync(), /Invalid|Unsafe|Duplicate/);
     assert.equal(f.read("a.md"), "base");
   }
+});
+
+test("writable selection requires explicit enablement and synchronizes exact Markdown/binary/deletion evidence", async (t) => {
+  const f = fixture(t);
+  f.remote({ "a.md": "base", "deleted.md": "base" }); await f.initialize();
+  await f.service().enableShareWrites();
+  f.write("a.md", "sent bytes"); f.write("attachment.bin", "binary bytes"); f.remove("deleted.md");
+  await f.service().sync();
+  assert.equal(String(f.remoteFiles()["a.md"]), "sent bytes");
+  assert.equal(String(f.remoteFiles()["attachment.bin"]), "binary bytes");
+  assert.equal(f.remoteFiles()["deleted.md"], undefined);
+  assert.equal(f.settings().activeShare.download.baseline.find((entry: any) => entry.path === "a.md").sha256, sha("sent bytes"));
+  assert.equal(f.settings().activeShare.download.writing, undefined);
+  assert.ok(f.requests.every((request) => !/register|\/v1\/users\//.test(request.url)));
+});
+
+test("edits during chunk upload remain local and are never acknowledged by completion-time scanning", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.write("a.md", "captured");
+  f.hook(async (request) => { if (request.url.endsWith("/chunk")) { f.write("a.md", "new unsent bytes"); f.hook(); } });
+  await f.service().sync();
+  assert.equal(String(f.remoteFiles()["a.md"]), "captured"); assert.equal(f.read("a.md"), "new unsent bytes");
+  assert.equal(f.settings().activeShare.download.baseline.find((entry: any) => entry.path === "a.md").sha256, sha("captured"));
+  assert.equal(f.settings().activeShare.download.reconciliation[0].uploadBlocked, true);
+  await f.restart().sync(); assert.equal(String(f.remoteFiles()["a.md"]), "captured");
+});
+
+test("acknowledgement-lost retry recovers matching sent evidence across restart without resending uploads", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.write("a.md", "sent");
+  f.after(async (request) => { if (JSON.parse(request.body).changes.length) { f.after(); throw new Error("lost acknowledgement"); } });
+  await assert.rejects(f.service().sync(), /lost acknowledgement/);
+  assert.equal(f.saved().activeShare.download.writing.stage, "submitted");
+  const uploads = f.requests.filter((request) => request.url.endsWith("/uploads")).length;
+  await f.restart().sync();
+  assert.equal(f.requests.filter((request) => request.url.endsWith("/uploads")).length, uploads);
+  assert.equal(f.settings().activeShare.download.writing, undefined);
+  assert.equal(f.settings().activeShare.download.baseline[0].sha256, sha("sent"));
+});
+
+test("unknown write outcome blocks divergent remote contents instead of replaying after restart", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.write("a.md", "sent");
+  f.after(async (request) => { if (JSON.parse(request.body).changes.length) { f.after(); throw new Error("lost acknowledgement"); } });
+  await assert.rejects(f.service().sync());
+  f.remote({ "a.md": "subsequent remote" }, "later");
+  await f.restart().sync();
+  assert.equal(f.read("a.md"), "sent"); assert.equal(String(f.remoteFiles()["a.md"]), "subsequent remote");
+  assert.equal(f.settings().activeShare.download.reconciliation[0].uploadBlocked, true);
+});
+
+test("downgrade during staging stops writes; restart/restoration retain barriers until explicit reconciliation", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.write("a.md", "blocked edit");
+  f.hook(async (request) => { if (request.url.endsWith("/chunk")) { f.capability("read"); f.hook(); } });
+  await assert.rejects(f.service().sync(), /read-only/);
+  assert.equal(String(f.remoteFiles()["a.md"]), "base");
+  assert.equal(f.saved().activeShare.capability, "read");
+  assert.equal(f.saved().activeShare.download.reconciliation[0].uploadBlocked, true);
+  f.capability("read-write"); await f.restart().sync();
+  assert.equal(String(f.remoteFiles()["a.md"]), "base");
+  await f.service().uploadLocalReconciliation("a.md");
+  assert.equal(String(f.remoteFiles()["a.md"]), "blocked edit");
+  assert.equal(f.settings().activeShare.download.reconciliation.length, 0);
+});
+
+test("partial staging failure recovers conservatively, never acknowledges or automatically retries retained edits", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.write("a.md", "pending");
+  f.hook(async (request) => { if (request.url.endsWith("/complete")) { f.hook(); throw new Error("staging interrupted"); } });
+  await assert.rejects(f.service().sync(), /staging interrupted/);
+  assert.equal(f.saved().activeShare.download.writing.stage, "staging");
+  await f.restart().sync();
+  assert.equal(f.read("a.md"), "pending"); assert.equal(String(f.remoteFiles()["a.md"]), "base");
+  assert.equal(f.settings().activeShare.download.baseline[0].sha256, sha("base"));
+  assert.equal(f.settings().activeShare.download.reconciliation[0].uploadBlocked, true);
+});
+
+test("explicit initial upload backs up local bytes, uses selected remote base and retains the original v1 state", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "remote", "remote-only.md": "remote" }); f.write("a.md", "local");
+  await f.service().stageShareSelection(id);
+  const legacy = JSON.stringify([f.settings().serverHead, f.settings().localManifest]);
+  await f.service().initializeShareUpload();
+  assert.equal(String(f.remoteFiles()["a.md"]), "local"); assert.equal(f.remoteFiles()["remote-only.md"], undefined);
+  assert.equal(f.settings().activeShare.status, "writable");
+  assert.equal(f.read(`${f.settings().activeShare.download.initial.backupFolder}/a.md`), "local");
+  assert.equal(JSON.stringify([f.settings().serverHead, f.settings().localManifest]), legacy);
+  const write = f.requests.find((request) => request.url.endsWith("/sync") && JSON.parse(request.body).changes.length);
+  assert.equal(JSON.parse(write.body).baseHead, "h1");
+});
+
+test("interrupted file application is recovered before collecting writable changes", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  const state = f.settings().activeShare.download;
+  state.applying = { path: "a.md", baseline: state.baseline[0], remote: { path: "a.md", op: "delete" },
+    remoteHead: "h1", reason: "ambiguous disk write", uploadBlocked: true };
+  f.write("a.md", "ambiguous local");
+  await f.service().sync();
+  assert.equal(String(f.remoteFiles()["a.md"]), "base"); assert.equal(f.read("a.md"), "ambiguous local");
+  assert.match(state.reconciliation[0].reason, /Interrupted/);
+  assert.equal(state.applying, undefined);
+});
+
+test("writable mode also guards edits made during download and continues unaffected files", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base", "safe.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.remote({ "a.md": "remote", "safe.md": "updated" }, "h2");
+  f.hook(async (request) => { if (request.url.includes("/blob?path=a.md")) { f.write("a.md", "edit during download"); f.hook(); } });
+  await f.service().sync();
+  assert.equal(f.read("a.md"), "edit during download"); assert.equal(f.read("safe.md"), "updated");
+  assert.equal(f.settings().activeShare.download.baseline.find((entry: any) => entry.path === "a.md").sha256, sha("base"));
+  assert.equal(f.settings().activeShare.download.observedHead, "h2");
+  assert.equal(f.settings().activeShare.download.reconciliation[0].uploadBlocked, true);
+});
+
+test("read-only selection cannot enable writes, reconcile by upload or mutate version metadata", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); f.capability("read"); await f.initialize();
+  await assert.rejects(f.service().enableShareWrites(), /read-only/);
+  await assert.rejects(f.service().uploadLocalReconciliation("a.md"), /Enable writable/);
+  await assert.rejects(f.service().saveVersionMetadata({ path: "a.md", hash: "h1", name: "denied" }), /read-only/);
+  assert.equal(f.service().canWriteSelectedShare(), false); onlyReads(f);
+});
+
+test("uncertain writable file fails closed per-file while safe remote updates continue", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base", "safe.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.remove("a.md"); mkdirSync(join(f.dir, "a.md"));
+  f.remote({ "a.md": "changed", "safe.md": "updated" }, "h2");
+  await f.service().sync(); assert.equal(f.read("safe.md"), "updated");
+  assert.match(f.settings().activeShare.download.reconciliation[0].reason, /uncertain/);
+  assert.equal(String(f.remoteFiles()["a.md"]), "changed");
+});
+
+test("a server conflict cleared elsewhere cannot make retained marker/local contents upload automatically", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize(); await f.service().enableShareWrites();
+  f.settings().activeShare.download.serverConflicts = [{ path: "a.md", reason: "server conflict" }];
+  f.write("a.md", "retained unresolved contents");
+  await f.service().sync();
+  assert.equal(String(f.remoteFiles()["a.md"]), "base"); assert.equal(f.read("a.md"), "retained unresolved contents");
+  assert.match(f.settings().activeShare.download.reconciliation[0].reason, /cleared elsewhere/);
+  assert.equal(f.settings().activeShare.download.reconciliation[0].uploadBlocked, true);
 });

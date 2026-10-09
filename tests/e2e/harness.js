@@ -67,7 +67,8 @@ function serverFile(rel) {
   return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
 }
 
-async function startServer() {
+async function startServer(reset = true) {
+  if (reset) {
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const binary = path.join(REPO, "rust-server/target/debug/obsidian-git-sync-server");
@@ -89,6 +90,7 @@ async function startServer() {
     mapping: { user: USER, vault: VAULT, share_id: share.id,
       principals: [{ kind: "local", account_id: account.id }], native_enabled: true, dav_enabled: true } }));
   admin(["share", "setup", share.id, setup]);
+  }
   const child = spawn(path.join(REPO, "rust-server/target/debug/obsidian-git-sync-server"), [], {
     env: {
       ...process.env,
@@ -124,18 +126,30 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js"];
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js"];
   for (const scenario of scenarios) {
-    const server = await startServer();
-    try {
-      await (require(path.join(__dirname, scenario)))({ device, pending, serverFile, log, show, obsidian,
-        shareId: SHARE_ID, readerToken: READER_TOKEN, shareRoot: path.join(DATA_DIR, "shares", SHARE_ID) });
-    } finally {
+    let server = await startServer();
+    const stop = async () => {
       await new Promise((resolve) => {
         if (server.exitCode !== null || server.signalCode !== null) { resolve(); return; }
         server.once("exit", resolve);
         server.kill();
       });
+    };
+    const setCapability = async (capability) => {
+      await stop();
+      const accounts = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "auth/accounts.json"), "utf8"));
+      const account = accounts.accounts.find((entry) => entry.user === USER);
+      const result = spawnSync(path.join(REPO, "rust-server/target/debug/obsidian-git-sync-server"),
+        ["admin", "--data-dir", DATA_DIR, "membership", "grant", SHARE_ID, "local", account.id, capability], { encoding: "utf8" });
+      if (result.status !== 0) throw new Error(`fixture capability administration failed: ${result.stderr}`);
+      server = await startServer(false);
+    };
+    try {
+      await (require(path.join(__dirname, scenario)))({ device, pending, serverFile, log, show, obsidian,
+        shareId: SHARE_ID, readerToken: READER_TOKEN, shareRoot: path.join(DATA_DIR, "shares", SHARE_ID), setCapability });
+    } finally {
+      await stop();
     }
   }
 }

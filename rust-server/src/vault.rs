@@ -128,6 +128,7 @@ struct ClientChangeContext<'a> {
     upload_root: &'a Path,
     base_head: Option<&'a str>,
     device_paths: &'a HashMap<String, String>,
+    verified_base_existence: bool,
 }
 
 impl VaultState {
@@ -448,6 +449,29 @@ impl VaultService {
         request: SyncRequest,
         include_sources: bool,
     ) -> Result<SyncResponse> {
+        self.sync_with_contract(user, vault, request, include_sources, false)
+            .await
+    }
+
+    /// V2 downloads do not write device acknowledgements. Its verified Git base supplies prior existence.
+    pub async fn sync_v2(
+        &self,
+        share: &str,
+        request: SyncRequest,
+        include_sources: bool,
+    ) -> Result<SyncResponse> {
+        self.sync_with_contract("share", share, request, include_sources, true)
+            .await
+    }
+
+    async fn sync_with_contract(
+        &self,
+        user: &str,
+        vault: &str,
+        request: SyncRequest,
+        include_sources: bool,
+        verified_base_existence: bool,
+    ) -> Result<SyncResponse> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         self.with_lock(&user, &vault, || async {
@@ -455,6 +479,22 @@ impl VaultService {
             self.validate_remote_url(&state.remote_url)?;
             let base_head = validate_optional_commit_id(request.base_head.as_deref())?;
             let repo = self.repo_dir(&user, &vault)?;
+            if verified_base_existence {
+                if let Some(base) = base_head.as_deref() {
+                    if !self.valid_commit(&repo, base).await?
+                        || git(
+                            Some(&repo),
+                            &["merge-base", "--is-ancestor", base, "HEAD"],
+                            &[0, 1, 128],
+                        )
+                        .await?
+                        .code
+                            != 0
+                    {
+                        bail!("invalid synchronization base for selected share");
+                    }
+                }
+            }
             let binary_root = self.binary_dir(&user, &vault)?;
             let upload_root = self.upload_dir(&user, &vault)?;
             let device_paths = read_devices(&self.devices_path(&user, &vault)?)
@@ -506,6 +546,7 @@ impl VaultService {
                         upload_root: &upload_root,
                         base_head: base_head.as_deref(),
                         device_paths: &device_paths,
+                        verified_base_existence,
                     },
                     &request.changes,
                 )
@@ -1417,6 +1458,7 @@ impl VaultService {
                             path_ack,
                             &safe,
                             &content,
+                            context.verified_base_existence,
                         )
                         .await?
                         {
@@ -2262,19 +2304,34 @@ async fn apply_text_upsert(
     path_ack: Option<&str>,
     path: &str,
     client_content: &[u8],
+    verified_base_existence: bool,
 ) -> Result<Option<SyncConflict>> {
     let absolute = repo_path(repo, path)?;
     let current = fs::read(&absolute).await.ok();
     let base_at_head = match base_head {
+        Some(head) if verified_base_existence => {
+            // Distinguish an absent path from unavailable tree/blob data. The latter must fail closed.
+            let tree = git(Some(repo), &["ls-tree", "-z", head, "--", path], &[0]).await?;
+            if tree.stdout.is_empty() {
+                None
+            } else {
+                Some(
+                    git(Some(repo), &["show", &format!("{head}:{path}")], &[0])
+                        .await?
+                        .stdout,
+                )
+            }
+        }
         Some(head) => read_file_at_commit(repo, head, path).await?,
         None => None,
     };
-    // A missing per-path ack means this device may never have seen the path. That only matters
+    // V1: a missing per-path ack means this device may never have seen the path. That only matters
     // when the server has no current file either: then the upload is a genuine first-time create
     // even if the name existed at base_head through another device's create+delete. When the
     // server does hold the file, the device's vault-wide base_head is the right merge base;
-    // devices that synced before acks were recorded have none for their older files.
-    let base = if current.is_none() && path_ack.is_none() {
+    // devices that synced before acks were recorded have none for their older files. V2 read sync
+    // deliberately records no device acks: prior existence comes from its validated Git base.
+    let base = if !verified_base_existence && current.is_none() && path_ack.is_none() {
         None
     } else {
         base_at_head

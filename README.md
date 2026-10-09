@@ -13,7 +13,10 @@ The device does not run Git. The plugin sends changed files to:
 /v1/users/{user}/vaults/{vault}
 ```
 
-The Rust server validates the bearer token, authorizes the `{user}` namespace, commits Git history, optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens come from OIDC or host-provisioned local password accounts. Local accounts have separate immutable v1 namespaces. Selected v2 shares currently support safe download-only synchronization; writable share workflows remain under development.
+The Rust server validates the bearer token, authorizes the v1 namespace or selected v2 share, commits Git history,
+optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens come from OIDC or
+host-provisioned local password accounts. Local accounts have separate immutable v1 namespaces. Selected v2 shares
+support guarded downloads and explicitly enabled writable synchronization with durable reconciliation barriers.
 
 ## Installation overview
 
@@ -332,19 +335,21 @@ Advanced settings:
 - Refresh token, a server-issued single-use token used to renew the app session.
 - User namespace, normally set automatically from the authenticated server user.
 
-The plugin always registers vaults on the `main` branch and uses the persistent server-local repository at `data/users/{user}/vaults/{vault}/repo`.
+Legacy v1 sync registers on `main`; mapped namespaces use the published share root. Selected v2 sync never registers
+and uses the selected share's isolated repository under `data/shares/{shareId}/repo`.
 
 The plugin checks `/v1/server/info` before authenticated server operations and records the server version/API version in settings. If the server reports an incompatible API version, the plugin stops before syncing and shows a compatibility error. The same response carries a `features` list; optional features such as device passwords are offered only when the server advertises them, and the plugin explains that the server needs an update otherwise.
 
 ### Adding another device to a vault
 
-Share selection and safe download reconciliation are implemented. Selected shares remain download-only, even for
-read-write members, until FEAT-04C. See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for explicit verified
-backup, guarded per-file downloads, durable local conflicts, permission-restoration barriers and retained v1 state.
+Share selection, safe downloads and writable synchronization are implemented. Download initialization remains
+download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.
+See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for verified backups, guarded per-file application,
+durable local/server conflicts, upload recovery, permission-restoration barriers and retained v1 state.
 The remaining FEAT-04 transition contracts are documented in
 [Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md#approved-client-transition-contract-feat-04-not-yet-implemented).
-Writable v2 and namespace-authorized legacy DAV/Saber credential management remain for FEAT-04C/D. Current plugin
-instructions below describe v1 behavior; selected-share downloads never register or upload merely to read.
+Namespace-authorized legacy DAV/Saber credential management remains for FEAT-04D. Current plugin instructions below
+describe v1 behavior; selected-share downloads never register or upload merely to read.
 
 Every device that should carry the same vault talks to the same server and uses the same vault name. There are two kinds of devices:
 

@@ -160,8 +160,8 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
     }
     const active = this.plugin.settings.activeShare;
     if (active) {
-      new Setting(containerEl).setName("Selected share: download-only")
-        .setDesc(`${active.label} (${active.shareId}), capability: ${active.capability}. ${active.download.reconciliation.length} local reconciliation barrier(s). Uploads remain disabled even after write permission returns. Review using Resolve conflicts.`);
+      new Setting(containerEl).setName(`Selected share: ${active.status}`)
+        .setDesc(`${active.label} (${active.shareId}), capability: ${active.capability}. ${active.download.reconciliation.length} local reconciliation barrier(s). Blocked edits require explicit reconciliation even after write permission returns. Review using Resolve conflicts.`);
     }
 
     new Setting(containerEl)

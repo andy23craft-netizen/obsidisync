@@ -165,6 +165,11 @@ export class ConflictResolverModal extends Modal {
     contentEl.createEl("h2", { text: "Resolve sync conflicts" });
     this.renderSyncStatus(contentEl);
 
+    if (!this.gitService.canWriteSelectedShare()) {
+      contentEl.createEl("p", { text: "Server conflict actions require current read-write access. Local edits and conflicts are retained." });
+      return;
+    }
+
     if (this.conflicts.length === 0) {
       contentEl.createEl("p", { text: "No conflicts are left in this vault." });
       const actions = this.createButtonRow(contentEl);
@@ -566,6 +571,7 @@ export class ConflictResolverModal extends Modal {
         const latest = history[0];
         if (!latest) throw new Error(`The server has no committed version of ${conflict.path}. Delete it on the server instead.`);
         const version = await this.gitService.fileAtVersion(conflict.path, latest.hash);
+        if (this.gitService.hasSelectedShare()) return { path: conflict.path, kind: "binary", contentBase64: version.contentBase64 };
         const bytes = Uint8Array.from(atob(version.contentBase64), (char) => char.charCodeAt(0));
         await this.ensureParentFolder(conflict.path);
         await this.app.vault.adapter.writeBinary(conflict.path, bytes.buffer);
