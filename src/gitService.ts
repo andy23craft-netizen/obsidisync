@@ -1,5 +1,5 @@
 import { Notice, requestUrl, RequestUrlResponse, Vault } from "obsidian";
-import { arrayBufferToBase64 } from "./base64";
+import { arrayBufferToBase64, base64ToArrayBuffer } from "./base64";
 import { diffManifests } from "./manifest";
 import {
   ClientChange,
@@ -28,7 +28,7 @@ import {
   VersionMetadataRequest
 } from "./protocol";
 import { devicePasswordsAvailabilityMessage } from "./devicePasswords";
-import { getDeviceName } from "./runtime";
+import { createClientId, getDeviceName } from "./runtime";
 import {
   describeDownloadProgress,
   hashesByPath,
@@ -40,6 +40,8 @@ import { IosGitSyncSettings } from "./settings";
 import { assertGitBranch, assertNamespaceSlug, assertSecureHttpUrl } from "./security";
 import { ServerUpsert, sha256Hex, VaultState } from "./vaultState";
 import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./shareSelection";
+import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported } from "./shareReconciliation";
+import type { PendingShareSelection } from "./shareSelection";
 
 type SaveSettings = () => Promise<void>;
 type ConflictNoticeHandler = (conflicts: SyncConflict[]) => void;
@@ -172,6 +174,9 @@ export class GitService {
 
   async stageShareSelection(shareId: string): Promise<void> {
     if (this.running) throw new Error("Wait for synchronization to finish before selecting a share");
+    if (this.settings.activeShare || this.settings.pendingShareSelection?.download) {
+      throw new Error("Existing share reconciliation state must be retained. Use a separate local vault for another share.");
+    }
     const revision = ++this.selectionRevision;
     const shares = await this.discoverShares();
     const share = shares.find((entry) => entry.shareId === shareId);
@@ -201,9 +206,194 @@ export class GitService {
 
   async cancelShareSelection(): Promise<void> {
     if (this.running) throw new Error("Wait for synchronization to finish before cancelling a selection");
+    if (this.settings.pendingShareSelection?.download) throw new Error("Initial download has started. Resume reconciliation; cancellation cannot safely restore v1 files.");
     ++this.selectionRevision;
     this.settings.pendingShareSelection = null;
     await this.saveSettings();
+  }
+
+  synchronizedManifest(): ManifestEntry[] {
+    return this.settings.activeShare?.download.baseline ?? this.settings.localManifest;
+  }
+
+  isShareDownloadMode(): boolean { return Boolean(this.settings.activeShare); }
+
+  lastSynchronizedAt(): string | null {
+    return this.settings.activeShare?.download.lastDownloadedAt ?? (this.settings.activeShare ? null : this.settings.lastSyncedAt);
+  }
+
+  shareDownloadStatus(): string | null {
+    const selected = this.settings.activeShare;
+    return selected ? `${selected.capability}, download-only; uploads disabled; ${selected.download.reconciliation.length} local barrier(s)` : null;
+  }
+
+  localReconciliations(): LocalReconciliation[] {
+    return this.settings.activeShare?.download.reconciliation ?? this.settings.pendingShareSelection?.download?.reconciliation ?? [];
+  }
+
+  /** Entry from explicit download/overwrite consent only. No background call creates this recovery state. */
+  async initializeShareDownload(): Promise<void> {
+    await this.exclusive(async () => {
+      const selected = this.settings.pendingShareSelection;
+      if (!selected) throw new Error("Select a share before initial reconciliation");
+      await this.negotiateShare(selected);
+      this.assertShareContext(selected);
+      const vaultState = new VaultState(this.vault);
+      if (!selected.download) {
+        selected.download = { observedHead: null, baseline: [], reconciliation: [],
+          initial: { backupFolder: "", appliedPaths: [], complete: false } };
+        await this.saveSettings();
+      }
+      if (!selected.download.initial.backupManifest) {
+        // A failed/interrupted backup is retained, but never reused as proof of a completed backup.
+        selected.download.initial.backupFolder = this.recoveryFolder();
+        await this.saveSettings();
+        selected.download.initial.backupManifest = await vaultState.verifiedBackup(
+          selected.download.initial.backupFolder, vaultState.paths().filter(sharePathSupported));
+        await this.saveSettings();
+      }
+      await this.downloadSnapshot(selected, true);
+      this.assertShareContext(selected);
+      selected.download.lastDownloadedAt = new Date().toISOString();
+      this.settings.lastSyncCompletedAt = selected.download.lastDownloadedAt;
+      const { syncState: _oldPendingState, status: _status, observedHead: _observation, ...destination } = selected;
+      this.settings.activeShare = { ...destination, status: "download-only", download: selected.download };
+      this.settings.pendingShareSelection = null;
+      await this.saveSettings();
+      new Notice(`Share download initialized; ${selected.download.reconciliation.length} file(s) require reconciliation. V2 uploads remain disabled.`);
+    });
+  }
+
+  private recoveryFolder(): string {
+    return `.obsidian-git-sync/backups/${new Date().toISOString().replace(/[:.]/g, "-")}-${createClientId()}`;
+  }
+
+  private assertShareContext(selected: PendingShareSelection | ActiveShare): void {
+    const current = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    const identity = this.settings.authenticatedIdentity;
+    if (current !== selected || serverIdentity(this.settings.serverUrl) !== selected.serverUrl ||
+        identity?.serverUrl !== selected.serverUrl || identity?.subject !== selected.identity.subject ||
+        identity?.user !== selected.identity.user || this.settings.userSlug !== selected.identity.user) {
+      throw new Error("Share destination or account changed. Reconciliation state is retained; restore the selected identity.");
+    }
+    assertSecureHttpUrl(this.settings.serverUrl, "Sync server URL");
+    if (!this.settings.oidcAccessToken || /\s/.test(this.settings.oidcAccessToken)) throw new Error("Log in before share downloads");
+  }
+
+  private sharePath(selected: PendingShareSelection | ActiveShare): string {
+    this.assertShareContext(selected);
+    return `/v2/shares/${encodeURIComponent(selected.shareId)}`;
+  }
+
+  private async readVaultPath(): Promise<string> {
+    if (this.settings.activeShare) {
+      const selected = this.settings.activeShare;
+      await this.negotiateShare(selected);
+      return this.sharePath(selected);
+    }
+    this.requireConfigured();
+    return this.vaultPath();
+  }
+
+  private async negotiateShare(selected: PendingShareSelection | ActiveShare): Promise<void> {
+    this.assertShareContext(selected);
+    const info = await this.checkServerCompatibility();
+    if (!info.features?.includes("shareSyncV2")) throw new Error("Selected server no longer advertises shareSyncV2; no v1 fallback");
+    const session = await this.getJson<AuthSessionResponse>("/v1/auth/session");
+    this.assertShareContext(selected);
+    if (session.subject !== selected.identity.subject || session.user !== selected.identity.user) {
+      throw new Error("Authenticated account differs from selected share state");
+    }
+    const config = await this.authConfig();
+    const authentication = config.type === "oidc" ? `oidc:${config.issuer}` : config.type;
+    if (authentication !== selected.authentication) throw new Error("Authentication configuration changed; selected recovery state is retained");
+    const state = await this.getJson<ShareSyncState>(`${this.sharePath(selected)}/sync-state`);
+    this.assertShareContext(selected);
+    if (state.shareId !== selected.shareId || state.apiVersion !== 2 ||
+        !["read", "read-write"].includes(state.capability)) throw new Error("Invalid share negotiation");
+    selected.capability = state.capability;
+    await this.saveSettings();
+  }
+
+  private async downloadSnapshot(selected: PendingShareSelection | ActiveShare, initial = false): Promise<void> {
+    const root = this.sharePath(selected);
+    const response = await this.postJson<SyncResponse>(`${root}/sync`, {
+      baseHead: null, clientId: this.settings.clientId, deviceName: this.deviceName(),
+      changes: [], clientManifest: [], fileContent: this.fileContentMode()
+    } satisfies SyncRequest);
+    this.assertShareContext(selected);
+    if (response.status !== "ok" || !Array.isArray(response.conflicts) || response.conflicts.length ||
+        !Array.isArray(response.files) || !(response.serverHead === null || typeof response.serverHead === "string") ||
+        (response.files.length > 0 && !response.serverHead)) throw new Error("Invalid read-only sync response");
+    if (!selected.download) throw new Error("Missing explicit initial reconciliation");
+    const reconciler = new ShareReconciler(new VaultState(this.vault), selected.download,
+      this.saveSettings, () => this.assertShareContext(selected));
+    await reconciler.applySnapshot(response.files, response.serverHead, (file) => this.downloadShareFile(selected, file, response.serverHead), initial);
+  }
+
+  private async downloadShareFile(selected: PendingShareSelection | ActiveShare, file: ServerUpsert,
+    head: string | null): Promise<ArrayBuffer> {
+    if (!head) throw new Error("Missing remote version for reference download");
+    return this.requestBinary("GET", `${this.sharePath(selected)}/blob?path=${encodeURIComponent(file.path)}&hash=${encodeURIComponent(head)}`);
+  }
+
+  private async performShareDownload(): Promise<void> {
+    const selected = this.settings.activeShare!;
+    await this.negotiateShare(selected);
+    await new ShareReconciler(new VaultState(this.vault), selected.download, this.saveSettings,
+      () => this.assertShareContext(selected)).preserveLocalChanges();
+    await this.downloadSnapshot(selected);
+    this.settings.lastSyncCompletedAt = new Date().toISOString();
+    selected.download.lastDownloadedAt = this.settings.lastSyncCompletedAt;
+    await this.saveSettings();
+    new Notice(`Share downloads complete (${selected.capability}); ${selected.download.reconciliation.length} local reconciliation barrier(s). V2 uploads remain disabled.`);
+  }
+
+  async keepLocalReconciliation(path: string): Promise<void> {
+    if (this.running) throw new Error("Wait for synchronization to finish");
+    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    if (!selected) throw new Error("No selected share");
+    this.assertShareContext(selected);
+    const record = this.localReconciliations().find((entry) => entry.path === path);
+    if (!record) throw new Error("No local reconciliation record");
+    record.localChoice = "keep-local";
+    record.reason = "Local bytes retained by explicit choice; future upload still requires write reconciliation";
+    await this.saveSettings();
+  }
+
+  async useRemoteReconciliation(path: string): Promise<void> {
+    await this.exclusive(async () => {
+      const selected = this.settings.activeShare;
+      if (!selected) throw new Error("Resume initial download before reconciling individual files");
+      await this.negotiateShare(selected);
+      await this.downloadSnapshot(selected); // Refresh the target; never resolve a stale tombstone.
+      const record = selected.download.reconciliation.find((entry) => entry.path === path);
+      if (!record) return;
+      const vaultState = new VaultState(this.vault);
+      const backupFolder = this.recoveryFolder();
+      const copied = await vaultState.verifiedBackup(backupFolder,
+        (await vaultState.checkedEntryFor(path)) ? [path] : []);
+      const expected = copied[0] ?? null;
+      record.backupFolder = backupFolder;
+      await this.saveSettings();
+      const bytes = record.remote.op === "upsert" ? await vaultState.serverBytes(record.remote,
+        (file) => this.downloadShareFile(selected, file, record.remoteHead)) : undefined;
+      this.assertShareContext(selected);
+      selected.download.applying = record;
+      await this.saveSettings();
+      if (!await vaultState.applyGuarded(record.remote, expected, bytes, () => this.assertShareContext(selected))) {
+        record.reason = "Local file changed during reconciliation; bytes retained";
+      } else {
+        selected.download.baseline = selected.download.baseline.filter((entry) => entry.path !== path);
+        if (record.remote.op === "upsert") selected.download.baseline.push({ path, sha256: record.remote.sha256,
+          size: bytes!.byteLength, mtime: Date.now() });
+        // The explicit remote choice discards the backed-up edit. It does not approve a local upload.
+        selected.download.reconciliation = selected.download.reconciliation.filter((entry) => entry.path !== path);
+      }
+      delete selected.download.applying;
+      await this.saveSettings();
+      new Notice(`Local reconciliation processed for ${path}. Backup: ${backupFolder}`);
+    });
   }
 
   updateSettings(settings: IosGitSyncSettings): void {
@@ -226,7 +416,7 @@ export class GitService {
 
   async localChangeSummary(): Promise<{ changed: number; upserts: number; deletes: number }> {
     const manifest = await new VaultState(this.vault).computeManifest();
-    const diff = diffManifests(manifest, this.settings.localManifest);
+    const diff = diffManifests(manifest, this.synchronizedManifest());
     return {
       changed: diff.upsertPaths.length + diff.deletePaths.length,
       upserts: diff.upsertPaths.length,
@@ -369,6 +559,7 @@ export class GitService {
   }
 
   private async performSync(): Promise<SyncConflict[]> {
+    if (this.settings.activeShare) { await this.performShareDownload(); return []; }
     const blockReason = this.syncBlocker?.();
     if (blockReason) {
       new Notice(blockReason);
@@ -535,15 +726,15 @@ export class GitService {
   }
 
   async history(path?: string): Promise<HistoryEntry[]> {
-    this.requireConfigured();
+    const root = await this.readVaultPath();
     const suffix = path ? `?path=${encodeURIComponent(path)}` : "";
-    return this.getJson<HistoryEntry[]>(`${this.vaultPath()}/history${suffix}`);
+    return this.getJson<HistoryEntry[]>(`${root}/history${suffix}`);
   }
 
   async deviceVersions(path: string): Promise<DeviceVersionEntry[]> {
-    this.requireConfigured();
+    const root = await this.readVaultPath();
     try {
-      return await this.getJson<DeviceVersionEntry[]>(`${this.vaultPath()}/files/device-versions?path=${encodeURIComponent(path)}`);
+      return await this.getJson<DeviceVersionEntry[]>(`${root}/files/device-versions?path=${encodeURIComponent(path)}`);
     } catch {
       // Older servers don't have this endpoint yet; degrade to no badges.
       return [];
@@ -556,8 +747,12 @@ export class GitService {
   }
 
   async fileAtVersion(path: string, hash: string): Promise<VersionFileResponse> {
-    this.requireConfigured();
-    return this.getJson<VersionFileResponse>(`${this.vaultPath()}/file?path=${encodeURIComponent(path)}&hash=${encodeURIComponent(hash)}`);
+    const root = await this.readVaultPath();
+    const file = await this.getJson<VersionFileResponse>(`${root}/file?path=${encodeURIComponent(path)}&hash=${encodeURIComponent(hash)}`);
+    if (this.settings.activeShare && await sha256Hex(base64ToArrayBuffer(file.contentBase64)) !== file.sha256) {
+      throw new Error(`History download checksum mismatch: ${path}`);
+    }
+    return file;
   }
 
   /**
@@ -995,17 +1190,20 @@ export class GitService {
   }
 
   private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<RequestUrlResponse> {
+    const selected = path.startsWith("/v2/shares/") ? this.settings.activeShare ?? this.settings.pendingShareSelection : null;
     const assertDestination = () => {
       if (path.startsWith("/v1/users/")) {
         const blocked = this.destinationBlocker();
         if (blocked) throw new Error(blocked);
       }
+      if (selected) this.assertShareContext(selected);
     };
     assertDestination();
     const serverUrl = this.settings.serverUrl.replace(/\/+$/, "");
     await this.refreshExpiringOidcAccessToken();
     assertDestination();
     const send = () => {
+      assertDestination();
       if (serverIdentity(this.settings.serverUrl) !== serverIdentity(serverUrl)) {
         throw new Error("Server changed during request. Try again.");
       }
@@ -1037,7 +1235,7 @@ export class GitService {
     if (response.status < 200 || response.status >= 300) {
       throw new HttpStatusError(response.status, serverErrorMessage(responseText(response), response.status));
     }
-
+    assertDestination();
     return response;
   }
 

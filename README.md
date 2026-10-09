@@ -13,7 +13,7 @@ The device does not run Git. The plugin sends changed files to:
 /v1/users/{user}/vaults/{vault}
 ```
 
-The Rust server validates the bearer token, authorizes the `{user}` namespace, commits Git history, optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens come from OIDC or host-provisioned local password accounts. Local accounts have separate immutable v1 namespaces; share network access is not enabled yet.
+The Rust server validates the bearer token, authorizes the `{user}` namespace, commits Git history, optionally rebases and pushes to a configured remote, and returns merged file changes. Tokens come from OIDC or host-provisioned local password accounts. Local accounts have separate immutable v1 namespaces. Selected v2 shares currently support safe download-only synchronization; writable share workflows remain under development.
 
 ## Installation overview
 
@@ -338,12 +338,13 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 
 ### Adding another device to a vault
 
-Share discovery and pending selection are implemented; v2 file synchronization remains disabled. See
-[Client share selection](docs/CLIENT_SHARE_SELECTION.md) for selection/cancellation and retained v1 state.
+Share selection and safe download reconciliation are implemented. Selected shares remain download-only, even for
+read-write members, until FEAT-04C. See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for explicit verified
+backup, guarded per-file downloads, durable local conflicts, permission-restoration barriers and retained v1 state.
 The remaining FEAT-04 transition contracts are documented in
 [Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md#approved-client-transition-contract-feat-04-not-yet-implemented).
-They require feature-based v2 negotiation, per-file read-only preservation with explicit reconciliation, and retained
-namespace-authorized legacy DAV/Saber credential management. Current plugin instructions below describe v1 behavior.
+Writable v2 and namespace-authorized legacy DAV/Saber credential management remain for FEAT-04C/D. Current plugin
+instructions below describe v1 behavior; selected-share downloads never register or upload merely to read.
 
 Every device that should carry the same vault talks to the same server and uses the same vault name. There are two kinds of devices:
 

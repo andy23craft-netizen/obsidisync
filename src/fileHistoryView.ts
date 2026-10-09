@@ -212,6 +212,8 @@ export class FileHistoryView extends ItemView {
       detail.style.marginTop = "2px";
       detail.style.color = "var(--text-muted)";
     }
+    const shareStatus = this.gitService.shareDownloadStatus();
+    if (shareStatus) textWrap.createEl("div", { text: shareStatus });
 
     const actions = top.createDiv();
     actions.style.display = "inline-flex";
@@ -389,13 +391,15 @@ export class FileHistoryView extends ItemView {
       actions.style.alignItems = "center";
       actions.style.gap = "4px";
 
-      const nameButton = this.createIconButton(actions, "pencil", "Name version");
-      nameButton.onclick = () => this.nameVersion(entry);
+      if (!this.gitService.isShareDownloadMode()) {
+        const nameButton = this.createIconButton(actions, "pencil", "Name version");
+        nameButton.onclick = () => this.nameVersion(entry);
 
-      if (index > 0) {
-        const intoEntry = visibleHistory[index - 1];
-        const squashButton = this.createIconButton(actions, "combine", `Squash Version ${versionNumber} into Version ${intoEntry.versionNumber}`);
-        squashButton.onclick = () => this.squashVersion(entry, intoEntry);
+        if (index > 0) {
+          const intoEntry = visibleHistory[index - 1];
+          const squashButton = this.createIconButton(actions, "combine", `Squash Version ${versionNumber} into Version ${intoEntry.versionNumber}`);
+          squashButton.onclick = () => this.squashVersion(entry, intoEntry);
+        }
       }
     }
   }
@@ -520,6 +524,9 @@ export class FileHistoryView extends ItemView {
     const localSaved = file ? formatDateFromMs(file.stat.mtime) : "Unknown";
     const currentSource = this.currentDeviceSource();
     const hasConflict = await this.fileHasConflictMarkers(file);
+    const localRecord = this.gitService.localReconciliations().find((entry) => entry.path === this.filePath);
+    if (localRecord) return { state: "local-changes", title: "Local reconciliation required",
+      detail: localRecord.reason, lastSaved: localSaved, source: currentSource, hasConflict: true };
 
     if (!this.filePath || this.history.length === 0) {
       return {

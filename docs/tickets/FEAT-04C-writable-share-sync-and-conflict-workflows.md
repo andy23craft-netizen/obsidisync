@@ -46,7 +46,7 @@ sync/upload/resolve/InkVault/device/version endpoints; share configuration is ho
 ## Dependencies
 
 [Implemented FEAT-04A](../CLIENT_SHARE_SELECTION.md) and
-[FEAT-04B](FEAT-04B-safe-downloads-and-local-reconciliation.md) are hard dependencies.
+[Implemented FEAT-04B](../CLIENT_SHARE_SELECTION.md) are hard dependencies.
 D is independent credential work; it is not needed for native writable sync.
 
 ## Proposed Implementation

@@ -1,7 +1,7 @@
 # FEAT-04 implementation decomposition
 
 The [FEAT-04 contract](FEAT-04-client-share-selection-and-migration.md) remains authoritative and unchanged.
-Implemented FEAT-04A and the three remaining tickets collectively implement it; none independently completes
+Implemented FEAT-04A/B and the two remaining tickets collectively implement it; none independently completes
 FEAT-04 or authorizes deployment. Existing server interfaces are prerequisites, not new implementation work.
 
 ## Tickets and dependencies
@@ -9,11 +9,11 @@ FEAT-04 or authorizes deployment. Existing server interfaces are prerequisites, 
 | Ticket | Behavioral outcome | Hard dependency |
 | --- | --- | --- |
 | [Implemented FEAT-04A](../CLIENT_SHARE_SELECTION.md) | Discover/select a share without silently retargeting existing state | Implemented server |
-| [FEAT-04B](FEAT-04B-safe-downloads-and-local-reconciliation.md) | Safely download and preserve edits through read-only transitions | FEAT-04A |
+| [Implemented FEAT-04B](../CLIENT_SHARE_SELECTION.md) | Safely download and preserve edits through read-only transitions | FEAT-04A |
 | [FEAT-04C](FEAT-04C-writable-share-sync-and-conflict-workflows.md) | Complete writable v2 synchronization and server conflict workflows | FEAT-04A, FEAT-04B |
 | [FEAT-04D](FEAT-04D-legacy-and-share-credential-management.md) | Manage legacy and share-native grants with distinct authorization/lifecycles | FEAT-04A |
 
-Recommended remaining review order is B -> C -> D. D only requires implemented A; B/C ordering before D is a convenience.
+Recommended remaining review order is C -> D. D only requires implemented A; C ordering before D is a convenience.
 FEAT-05 requires all four and the parent acceptance audit, not merely C's working upload path.
 
 ## Coverage and ownership

@@ -1,5 +1,6 @@
 import type { ManifestEntry, ShareEntry } from "./protocol";
 import type { IosGitSyncSettings } from "./settings";
+import type { ShareDownloadState } from "./shareReconciliation";
 
 export interface LegacyManagementContext {
   serverUrl: string;
@@ -26,6 +27,7 @@ export interface PendingShareSelection extends ShareEntry {
   observedHead: string | null;
   /** No share baseline exists until explicit reconciliation completes in a later ticket. */
   syncState: { serverHead: null; localManifest: ManifestEntry[]; initialSyncDone: false };
+  download?: ShareDownloadState;
 }
 
 export function serverIdentity(url: string): string {
@@ -46,8 +48,9 @@ export function captureLegacyContext(settings: IosGitSyncSettings): void {
 }
 
 export function syncDestinationBlocker(settings: IosGitSyncSettings): string | null {
+  if (settings.activeShare) return "Share download mode is active. V2 write synchronization is not enabled; v1 state is retained.";
   if (settings.pendingShareSelection) {
-    return "Share selection requires reconciliation. V2 file synchronization is not enabled yet. Cancel the selection to retain v1 operation.";
+    return "Share selection requires reconciliation. V2 file synchronization is not enabled until you explicitly back up and download in Choose share. Cancel an unstarted selection to retain v1 operation.";
   }
   const binding = settings.legacySyncBinding;
   if (!binding) return null;

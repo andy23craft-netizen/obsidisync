@@ -33,7 +33,7 @@ test("file history view shows sync status, last save, source device, and sync ac
 
   assert.match(serviceSource, /currentDeviceName\(\): string/);
   assert.match(serviceSource, /this\.settings\.lastSyncedAt = new Date\(\)\.toISOString\(\)/);
-  assert.match(mainSource, /lastSyncedAt: \(\) => this\.settings\.lastSyncedAt/);
+  assert.match(mainSource, /lastSyncedAt: \(\) => this\.gitService\.lastSynchronizedAt\(\)/);
   assert.match(viewSource, /sha256Hex/);
   assert.match(viewSource, /`Up to date: version \$\{latest\.versionNumber\}`/);
   assert.match(viewSource, /"File changed"/);

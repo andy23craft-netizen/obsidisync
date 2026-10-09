@@ -12,6 +12,7 @@ import { createClientId, generateComputerName, slugFromName } from "./runtime";
 import { DEFAULT_SETTINGS, IosGitSyncSettings, IosGitSyncSettingTab } from "./settings";
 import { sha256Hex } from "./vaultState";
 import { ShareSelectionModal } from "./shareSelectionModal";
+import { LocalReconciliationModal } from "./localReconciliationModal";
 
 const LOGIN_RENEWAL_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -29,6 +30,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   private lastActiveFilePath: string | null = null;
   private pendingCloseSyncPaths = new Set<string>();
   private appCloseSyncStarted = false;
+  private settingsSave: Promise<void> = Promise.resolve();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -65,7 +67,7 @@ export default class ObsidiSyncPlugin extends Plugin {
         new FileHistoryView(leaf, this.gitService, {
           get: (path) => this.snapshotReference(path),
           save: (reference) => this.saveSnapshotReference(reference),
-          lastSyncedAt: () => this.settings.lastSyncedAt,
+          lastSyncedAt: () => this.gitService.lastSynchronizedAt(),
           openConflictResolver: () => this.openConflictResolver()
         })
     );
@@ -162,7 +164,11 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    // History/login/UI saves may overlap sync. Preserve journal ordering and snapshot each requested state.
+    const snapshot = JSON.parse(JSON.stringify(this.settings)) as IosGitSyncSettings;
+    const saved = this.settingsSave.catch(() => undefined).then(() => this.saveData(snapshot));
+    this.settingsSave = saved;
+    await saved;
     if (this.gitService) this.gitService.updateSettings(this.settings);
   }
 
@@ -393,14 +399,14 @@ export default class ObsidiSyncPlugin extends Plugin {
     try {
       const savedState = await this.mobileFileSavedState(path);
       if (requestId !== this.mobileSyncIndicatorRequestId) return;
-      const label = savedState === "changes" ? "Changed" : formatMobileSyncDate(this.settings.lastSyncedAt);
+      const label = savedState === "changes" ? "Changed" : formatMobileSyncDate(this.gitService.lastSynchronizedAt());
       this.clearMobileSyncIndicator(indicator);
       indicator.createSpan({ cls: "obsidisync-mobile-sync-indicator-row", text: label });
       indicator.createSpan({ cls: "obsidisync-mobile-sync-indicator-row obsidisync-mobile-sync-indicator-state", text: savedState });
       indicator.style.display = "inline-flex";
       indicator.setAttribute("aria-hidden", "false");
       indicator.setAttribute("aria-label", `Last synced ${label}; ${savedState}`);
-      indicator.title = `Last synced: ${formatFullDate(this.settings.lastSyncedAt)}; ${savedState}`;
+      indicator.title = `Last synced: ${formatFullDate(this.gitService.lastSynchronizedAt())}; ${savedState}`;
     } catch {
       if (requestId === this.mobileSyncIndicatorRequestId) {
         this.hideMobileSyncIndicator(indicator);
@@ -413,7 +419,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async fileHasLocalChanges(path: string): Promise<boolean> {
-    const syncedEntry = this.settings.localManifest.find((entry) => entry.path === path);
+    if (this.gitService.localReconciliations().some((entry) => entry.path === path)) return true;
+    const syncedEntry = this.gitService.synchronizedManifest().find((entry) => entry.path === path);
     const exists = await this.app.vault.adapter.exists(path, true);
     if (!exists) return Boolean(syncedEntry);
     if (!syncedEntry) return true;
@@ -537,6 +544,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async syncNow(): Promise<void> {
+    if (this.gitService.isShareDownloadMode()) { await this.gitService.sync(); return; }
     const blocked = this.gitService.destinationBlocker();
     if (blocked) { new Notice(blocked); return; }
     if (this.needsInitialSyncSetup()) {
@@ -586,6 +594,10 @@ export default class ObsidiSyncPlugin extends Plugin {
    * forcing the dialog back open; the clickable conflict notice and the command still work.
    */
   private openConflictResolver(conflicts: SyncConflict[] = [], options: { explicit: boolean } = { explicit: true }): void {
+    if (this.settings.activeShare || this.settings.pendingShareSelection?.download) {
+      new LocalReconciliationModal(this.app, this.gitService).open();
+      return;
+    }
     if (this.conflictResolverOpen) {
       if (options.explicit) new Notice("Conflict resolver is already open");
       return;
@@ -626,6 +638,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   // (never synced between devices). Push them to the server-side registry, then drop them
   // locally. Best-effort: unreachable server or a since-squashed/gone hash just gets skipped.
   private async migrateLocalHistoryVersions(): Promise<void> {
+    // Selected/pending shares retain the legacy registry; neither copy it to another destination nor discard it.
+    if (this.gitService.destinationBlocker()) return;
     const pending = this.settings.historyVersions;
     if (pending.length === 0) return;
     if (!this.settings.serverUrl || !this.settings.oidcAccessToken || !this.settings.userSlug || !this.settings.vaultSlug) {

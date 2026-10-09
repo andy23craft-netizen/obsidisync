@@ -25,12 +25,13 @@ const PORT = 18787;
 const SERVER = `http://127.0.0.1:${PORT}`;
 let TOKEN;
 let SHARE_ID;
+let READER_TOKEN;
 const PASSWORD = "synthetic-harness-password-123";
 const USER = "dev";
 const VAULT = "harness";
 const DATA_DIR = path.join(SCRATCH, "server-data");
 
-function device(name) {
+function device(name, overrides = {}) {
   const dir = path.join(SCRATCH, "vaults", name);
   fs.rmSync(dir, { recursive: true, force: true });
   const vault = new obsidian.Vault(dir, name);
@@ -44,7 +45,8 @@ function device(name) {
     deviceName: name,
     localManifest: [],
     historySnapshots: [],
-    historyVersions: []
+    historyVersions: [],
+    ...overrides
   };
   const service = new GitService(vault, settings, async () => {});
   const write = (rel, text) => {
@@ -75,9 +77,11 @@ async function startServer() {
     return JSON.parse(result.stdout);
   }
   const account = admin(["account", "create", USER], `${PASSWORD}\n`);
+  const reader = admin(["account", "create", "reader"], `${PASSWORD}\n`);
   const share = admin(["share", "create", "Synthetic harness share"]);
   SHARE_ID = share.id;
   admin(["membership", "grant", share.id, "local", account.id, "read-write"]);
+  admin(["membership", "grant", share.id, "local", reader.id, "read"]);
   admin(["publication", "initialize"]);
   const setup = path.join(SCRATCH, "setup.json");
   fs.writeFileSync(setup, JSON.stringify({ registration: { remoteUrl: "", branch: "main",
@@ -103,6 +107,10 @@ async function startServer() {
           headers: { "content-type": "application/json" }, body: JSON.stringify({ username: USER, password: PASSWORD }) });
         if (!login.ok) throw new Error("fixture login failed");
         TOKEN = (await login.json()).accessToken;
+        const readerLogin = await fetch(`${SERVER}/v1/auth/password/login`, { method: "POST",
+          headers: { "content-type": "application/json" }, body: JSON.stringify({ username: "reader", password: PASSWORD }) });
+        if (!readerLogin.ok) throw new Error("fixture reader login failed");
+        READER_TOKEN = (await readerLogin.json()).accessToken;
         return child;
       }
     } catch {}
@@ -116,11 +124,19 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const server = await startServer();
-  try {
-    await (require(path.join(__dirname, process.argv[2] || "scenario-conflicts.js")))({ device, pending, serverFile, log, show, obsidian });
-  } finally {
-    server.kill();
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js"];
+  for (const scenario of scenarios) {
+    const server = await startServer();
+    try {
+      await (require(path.join(__dirname, scenario)))({ device, pending, serverFile, log, show, obsidian,
+        shareId: SHARE_ID, readerToken: READER_TOKEN, shareRoot: path.join(DATA_DIR, "shares", SHARE_ID) });
+    } finally {
+      await new Promise((resolve) => {
+        if (server.exitCode !== null || server.signalCode !== null) { resolve(); return; }
+        server.once("exit", resolve);
+        server.kill();
+      });
+    }
   }
 }
 

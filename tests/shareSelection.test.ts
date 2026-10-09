@@ -42,6 +42,7 @@ Module._load = function(name: string, ...args: any[]) {
 const { GitService, HttpStatusError } = require("../src/gitService");
 const { DEFAULT_SETTINGS, IosGitSyncSettingTab } = require("../src/settings");
 const { ShareSelectionModal } = require("../src/shareSelectionModal");
+const { LocalReconciliationModal } = require("../src/localReconciliationModal");
 const ObsidiSyncPlugin = require("../src/main").default;
 Module._load = load;
 (globalThis as any).crypto ??= webcrypto;
@@ -337,4 +338,86 @@ test("read capability is negotiated without enabling even download-only v2 sync"
   await service.stageShareSelection(share.shareId);
   assert.equal(settings.pendingShareSelection.capability, "read");
   assert.match(service.destinationBlocker(), /not enabled/);
+});
+
+test("initial share download UI requires explicit consent and active chooser cannot retarget", async () => {
+  const { service, settings } = fixture();
+  await service.stageShareSelection(share.shareId);
+  let initializations = 0;
+  service.initializeShareDownload = async () => { initializations++; };
+  (globalThis as any).window = { confirm: () => false };
+  buttons = [];
+  await new ShareSelectionModal({}, service, settings).onOpen();
+  const download = buttons.find((button) => button.text === "Back up and download share")!;
+  await download.click(); assert.equal(initializations, 0);
+  (globalThis as any).window.confirm = () => true;
+  await download.click(); assert.equal(initializations, 1);
+  settings.activeShare = { ...share, download: { reconciliation: [] } };
+  buttons = [];
+  await new ShareSelectionModal({}, service, settings).onOpen();
+  assert.equal(buttons.length, 0);
+});
+
+test("local reconciliation UI offers only local choices and confirms remote replacement", async () => {
+  const calls: string[] = [];
+  const service = {
+    localReconciliations: () => [{ path: "a.md", reason: "local edit", remote: { op: "delete" }, remoteHead: "h2" }],
+    keepLocalReconciliation: async (path: string) => { calls.push(`keep:${path}`); },
+    useRemoteReconciliation: async (path: string) => { calls.push(`remote:${path}`); }
+  };
+  (globalThis as any).window = { confirm: () => false };
+  buttons = []; new LocalReconciliationModal({}, service).onOpen();
+  assert.deepEqual(buttons.map((button) => button.text), ["Keep local (upload blocked)", "Back up and use remote"]);
+  await buttons[0].click(); assert.deepEqual(calls, ["keep:a.md"]);
+  const remote = buttons.find((button) => button.text === "Back up and use remote")!;
+  await remote.click(); assert.equal(calls.length, 1);
+  (globalThis as any).window.confirm = () => true;
+  await remote.click(); assert.deepEqual(calls, ["keep:a.md", "remote:a.md"]);
+});
+
+test("startup metadata migration retains legacy recovery records while selection is pending or active", async () => {
+  const { service, settings } = fixture();
+  settings.historyVersions = [{ sourcePath: "grocery.md", hash: "legacy-head", name: "Retained version" }];
+  await service.stageShareSelection(share.shareId);
+  const old = JSON.stringify(settings.historyVersions);
+  const plugin: any = Object.create(ObsidiSyncPlugin.prototype);
+  plugin.settings = settings; plugin.gitService = service;
+  plugin.saveSettings = async () => assert.fail("Migration must not discard retained metadata");
+  requests = [];
+  await plugin.migrateLocalHistoryVersions();
+  settings.activeShare = { ...share, download: { reconciliation: [] } };
+  settings.pendingShareSelection = null;
+  await plugin.migrateLocalHistoryVersions();
+  assert.equal(JSON.stringify(settings.historyVersions), old);
+  assert.equal(requests.length, 0);
+});
+
+test("overlapping plugin saves snapshot state and cannot overwrite a later recovery journal out of order", async () => {
+  const plugin: any = Object.create(ObsidiSyncPlugin.prototype);
+  plugin.settings = { marker: "before journal" }; plugin.settingsSave = Promise.resolve();
+  const writes: any[] = [];
+  let release: () => void = () => {};
+  plugin.saveData = async (snapshot: any) => {
+    writes.push(snapshot);
+    if (writes.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+  };
+  const first = plugin.saveSettings();
+  await new Promise((resolve) => setImmediate(resolve));
+  plugin.settings.marker = "journal persisted";
+  const second = plugin.saveSettings();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(writes, [{ marker: "before journal" }]);
+  release(); await Promise.all([first, second]);
+  assert.deepEqual(writes, [{ marker: "before journal" }, { marker: "journal persisted" }]);
+});
+
+test("a failed plugin save rejects its caller without poisoning subsequent durable saves", async () => {
+  const plugin: any = Object.create(ObsidiSyncPlugin.prototype);
+  plugin.settings = { marker: "intent" }; plugin.settingsSave = Promise.resolve();
+  plugin.saveData = async () => { throw new Error("synthetic persistence failure"); };
+  await assert.rejects(plugin.saveSettings(), /persistence failure/);
+  let written: any;
+  plugin.saveData = async (snapshot: any) => { written = snapshot; };
+  plugin.settings.marker = "recovered"; await plugin.saveSettings();
+  assert.deepEqual(written, { marker: "recovered" });
 });

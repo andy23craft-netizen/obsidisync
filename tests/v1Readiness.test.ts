@@ -53,7 +53,7 @@ test("plugin queues overlapping sync requests and summarizes local changes", () 
   assert.match(serviceSource, /private syncQueued = false/);
   assert.match(serviceSource, /Git sync queued/);
   assert.match(serviceSource, /localChangeSummary\(\): Promise<\{ changed: number; upserts: number; deletes: number \}>/);
-  assert.match(serviceSource, /diffManifests\(manifest, this\.settings\.localManifest\)/);
+  assert.match(serviceSource, /diffManifests\(manifest, this\.synchronizedManifest\(\)\)/);
   assert.match(mainSource, /changed file/);
 });
 

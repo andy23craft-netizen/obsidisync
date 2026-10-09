@@ -30,6 +30,70 @@ export interface ApplyServerFilesOptions {
 export class VaultState {
   constructor(private readonly vault: Vault) {}
 
+  paths(): string[] { return this.vault.getFiles().map((file) => file.path).filter((path) => !shouldIgnoreVaultPath(path)); }
+
+  /** A folder or unreadable file is uncertainty, never evidence of absence. */
+  async checkedEntryFor(path: string): Promise<ManifestEntry | null> {
+    assertSafeVaultPath(path);
+    const stat = await this.vault.adapter.stat(path);
+    if (!stat) return null;
+    if (stat.type !== "file") throw new Error(`Expected a file at ${path}`);
+    const bytes = await this.vault.adapter.readBinary(path);
+    const sha256 = await sha256Hex(bytes);
+    const after = await this.vault.adapter.stat(path);
+    if (!after || after.type !== "file" || after.mtime !== stat.mtime || after.size !== stat.size) {
+      throw new Error(`File changed while checking ${path}`);
+    }
+    return { path, sha256, size: bytes.byteLength, mtime: after.mtime };
+  }
+
+  /** Backup hashes describe the bytes copied, not a later scan that could include new edits. */
+  async verifiedBackup(folder: string, paths: string[]): Promise<ManifestEntry[]> {
+    assertSafeVaultPath(folder);
+    if (!folder.startsWith(".obsidian-git-sync/backups/")) throw new Error("Backup must use the sync recovery folder");
+    if (await this.vault.adapter.exists(folder, true)) throw new Error("Backup destination already exists");
+    await this.ensureParentFolder(`${folder}/placeholder`);
+    const copied: ManifestEntry[] = [];
+    for (const path of paths) {
+      assertSafeVaultPath(path);
+      if (shouldIgnoreVaultPath(path)) continue;
+      const bytes = await this.vault.adapter.readBinary(path);
+      const hash = await sha256Hex(bytes);
+      const target = `${folder}/${path}`;
+      await this.ensureParentFolder(target);
+      await this.vault.adapter.writeBinary(target, bytes);
+      if (await sha256Hex(await this.vault.adapter.readBinary(target)) !== hash) throw new Error(`Backup verification failed: ${path}`);
+      copied.push({ path, sha256: hash, size: bytes.byteLength, mtime: Date.now() });
+    }
+    return copied;
+  }
+
+  async serverBytes(file: ServerUpsert, download: (file: ServerUpsert) => Promise<ArrayBuffer>): Promise<ArrayBuffer> {
+    const bytes = typeof file.contentBase64 === "string" ? base64ToArrayBuffer(file.contentBase64) : await download(file);
+    if (await sha256Hex(bytes) !== file.sha256) throw new Error(`Download checksum mismatch: ${file.path}`);
+    return bytes;
+  }
+
+  /** Final local check follows download, mkdir, and journal persistence. No awaits between check and adapter call. */
+  async applyGuarded(file: ServerFileChange, expected: ManifestEntry | null, bytes: ArrayBuffer | undefined,
+    assertDestination: () => void): Promise<boolean> {
+    assertSafeVaultPath(file.path);
+    if (shouldIgnoreVaultPath(file.path)) throw new Error("Cannot apply an ignored path");
+    if (file.op === "upsert") await this.ensureParentFolder(file.path);
+    let current: ManifestEntry | null;
+    try { current = await this.checkedEntryFor(file.path); } catch { return false; }
+    if (current?.sha256 !== expected?.sha256) return false;
+    assertDestination();
+    if (file.op === "delete") {
+      if (current) await this.vault.adapter.remove(file.path);
+    } else {
+      if (current?.sha256 === file.sha256) return true;
+      if (!bytes) throw new Error("Missing verified download bytes");
+      await this.vault.adapter.writeBinary(file.path, bytes);
+    }
+    return true;
+  }
+
   async collectChanges(previousManifest: ManifestEntry[], options: CollectChangesOptions = {}): Promise<CollectedVaultChanges> {
     const manifest = await this.computeManifest();
     const diff = diffManifests(manifest, previousManifest.filter((entry) => !shouldIgnoreVaultPath(entry.path)));

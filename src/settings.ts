@@ -4,12 +4,14 @@ import { devicePasswordsAvailabilityMessage } from "./devicePasswords";
 import { ManifestEntry } from "./protocol";
 import type { ClientIdentity, LegacyManagementContext, LegacySyncBinding, PendingShareSelection } from "./shareSelection";
 import { syncDestinationBlocker } from "./shareSelection";
+import type { ActiveShare } from "./shareReconciliation";
 
 export interface IosGitSyncSettings {
   authenticatedIdentity?: ClientIdentity;
   legacyManagementContext?: LegacyManagementContext;
   legacySyncBinding?: LegacySyncBinding;
   pendingShareSelection?: PendingShareSelection | null;
+  activeShare?: ActiveShare | null;
   serverUrl: string;
   oidcIssuer: string;
   oidcClientId: string;
@@ -149,12 +151,17 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server share selection")
-      .setDesc("Discover authorized shares and stage an explicit selection. V2 file synchronization remains disabled.")
+      .setDesc("Choose a share, then explicitly back up and download. V2 uploads remain disabled.")
       .addButton((button) => button.setButtonText("Choose share").onClick(() => this.plugin.openShareSelectionModal()));
 
     if (this.plugin.settings.pendingShareSelection) {
       new Setting(containerEl).setName("Pending share")
         .setDesc(`${this.plugin.settings.pendingShareSelection.label}: reconciliation required; existing v1 state retained.`);
+    }
+    const active = this.plugin.settings.activeShare;
+    if (active) {
+      new Setting(containerEl).setName("Selected share: download-only")
+        .setDesc(`${active.label} (${active.shareId}), capability: ${active.capability}. ${active.download.reconciliation.length} local reconciliation barrier(s). Uploads remain disabled even after write permission returns. Review using Resolve conflicts.`);
     }
 
     new Setting(containerEl)
