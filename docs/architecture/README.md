@@ -172,7 +172,8 @@ recoverable legacy Saber encryption configuration.
 
 Fresh composite mounts keep separate heads, manifests and recovery decisions for each share.
 [Existing-vault conversion/detachment](../LOCAL_CONVERSION_AND_DETACHMENT.md) uses verified backups and local journals.
-Composite history/credential workflows and explicit copy/import remain future client work. Cross-share
+[Composite history/credential workflows](../MOUNT_HISTORY_AND_CREDENTIALS.md) are implemented; explicit copy/import
+remains future client work. Cross-share
 moves require independent endpoint decisions; they are not atomic renames. The
 [FEAT-03 audit](../tickets/FEAT-03-IMPLEMENTATION-AUDIT.md) records implementation and fixture evidence separately from deployment.
 

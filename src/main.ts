@@ -4,7 +4,7 @@ import { ComputerNameModal } from "./computerNameModal";
 import { ConflictResolverModal } from "./conflictResolverModal";
 import { DevicePasswordsModal } from "./devicePasswordsModal";
 import { FILE_HISTORY_VIEW_TYPE, FileHistoryView, HistorySnapshotReference } from "./fileHistoryView";
-import { GitService, LoginStatus } from "./gitService";
+import { GitService, LoginStatus, type FileContext } from "./gitService";
 import { validateLifecycle } from "./localLifecycle";
 import { InitialSyncModal } from "./initialSyncModal";
 import { OidcDeviceLoginModal } from "./oidcModal";
@@ -84,7 +84,7 @@ export default class ObsidiSyncPlugin extends Plugin {
           get: (path) => this.snapshotReference(path),
           save: (reference) => this.saveSnapshotReference(reference),
           lastSyncedAt: () => this.gitService.lastSynchronizedAt(),
-          openConflictResolver: () => this.openConflictResolver()
+          openConflictResolver: (context) => this.openHistoryReconciliation(context)
         })
     );
 
@@ -214,6 +214,15 @@ export default class ObsidiSyncPlugin extends Plugin {
 
   openConversionModal(): void { new ConversionModal(this.app, this.gitService).open(); }
 
+  private openHistoryReconciliation(context?: FileContext): void {
+    context?.guard();
+    if (!context?.mountId) { this.openConflictResolver(); return; }
+    if (this.gitService.localReconciliations(context.mountId).some((entry) => entry.path === context.path)) {
+      new LocalReconciliationModal(this.app, this.gitService, context.mountId).open();
+    } else if (this.gitService.hasLocalBarrier(context.localPath)) this.openCompositeMountsModal();
+    else new ConflictResolverModal(this.app, this.gitService, [], undefined, context.mountId).open();
+  }
+
   openLoginModal(): void {
     new AuthLoginModal(this.app, this.gitService, async () => {
       await this.saveSettings();
@@ -221,7 +230,6 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   openDevicePasswordsModal(): void {
-    if (this.gitService.hasComposite()) { new Notice("Credential management is not yet available in composite mode."); return; }
     new DevicePasswordsModal(this.app, this.gitService, this.settings.serverUrl).open();
   }
 

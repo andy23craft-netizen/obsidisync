@@ -346,8 +346,9 @@ Fresh empty local vaults can use independent `Personal/` and `Harmony/` share mo
 explicitly enabled writable synchronization. See [Composite mount synchronization](docs/COMPOSITE_MOUNT_DOWNLOADS.md)
 for initialization, backups, conflicts, move endpoint reconciliation and recovery limits.
 [Existing-vault conversion and detachment](docs/LOCAL_CONVERSION_AND_DETACHMENT.md) provide verified local backups,
-journaled recovery and fresh reconciliation after re-add. Composite history/credential management and explicit import
-remain later work; single-share and v1 remain available until explicitly converted or detached.
+journaled recovery and fresh reconciliation after re-add. [Mount history and credentials](docs/MOUNT_HISTORY_AND_CREDENTIALS.md)
+provide owned snapshots, guarded local restoration and explicit grant selection. Explicit import remains later work;
+single-share and v1 remain available until explicitly converted or detached.
 
 Share selection, safe downloads and writable synchronization are implemented. Download initialization remains
 download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.

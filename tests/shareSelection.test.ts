@@ -8,6 +8,7 @@ let requests: any[] = [];
 let respond: (request: any) => any;
 let buttons: { text: string; click: () => any }[] = [];
 let textChanges: { name: string; change: (value: string) => any }[] = [];
+let dropdownChanges: { name: string; change: (value: string) => any }[] = [];
 const element = (): any => ({ empty() {}, createDiv: () => element(), createEl: () => element(), setText() {}, remove() {} });
 class Setting {
   private name = "";
@@ -27,7 +28,8 @@ class Setting {
   }
   addTextArea(callback: (text: any) => void) { return this.addText(callback); }
   addDropdown(callback: (dropdown: any) => void) {
-    const dropdown: any = { addOption: () => dropdown, onChange: () => dropdown };
+    const dropdown: any = { addOption: () => dropdown,
+      onChange: (change: (value: string) => any) => { dropdownChanges.push({ name: this.name, change }); return dropdown; } };
     callback(dropdown); return this;
   }
   addToggle(callback: (toggle: any) => void) {
@@ -145,11 +147,12 @@ test("retained legacy routes work after v2 selection without registration or ret
   const context = JSON.stringify(settings.legacyManagementContext);
   const old = respond;
   requests = [];
-  respond = request => request.url.includes("/device-passwords") ? ok(request.method === "GET" ? [] : { id: "synthetic" }) : old(request);
+  respond = request => request.url.includes("/device-passwords") ? { ...ok(request.method === "GET" ? [] : { id: "synthetic" }),
+    headers: { "x-obsidisync-legacy-grant-management": "allowed" } } : old(request);
   await service.listDevicePasswords();
   await service.createDevicePassword("Synthetic", "Tablet");
   await service.revokeDevicePassword("synthetic");
-  assert.deepEqual(requests.map(request => request.method), ["GET", "POST", "DELETE"]);
+  assert.deepEqual(requests.map(request => request.method), ["GET", "GET", "POST", "GET", "DELETE"]);
   assert.ok(requests.every(request => request.url.includes("/v1/users/andy/vaults/notes/device-passwords")));
   assert.equal(JSON.stringify(settings.legacyManagementContext), context);
   delete settings.legacyManagementContext;
@@ -179,7 +182,7 @@ test("legacy inventory cannot deliver an in-flight response after account or con
       else settings.legacyManagementContext.vaultSlug = "different-vault";
       return { ...ok([]), headers: { "x-obsidisync-legacy-grant-management": "allowed" } };
     };
-    await assert.rejects(service.legacyCredentialInventory(), /context changed/);
+    await assert.rejects(service.legacyCredentialInventory(), /context changed|stale/);
     assert.equal(requests.length, 1);
   }
 });
@@ -224,6 +227,45 @@ test("only authorized discovered IDs can be negotiated; labels are not aliases",
   await assert.rejects(service.stageShareSelection("Harmony"), /unavailable/);
   assert.equal(settings.pendingShareSelection, undefined);
   assert.ok(!requests.some((request) => request.url.endsWith("/sync-state")));
+});
+
+test("credential UI requires a mount and invalidates old creation callbacks and secret copies", async () => {
+  buttons = []; textChanges = []; dropdownChanges = [];
+  const inventories: string[] = []; const creations: string[] = [];
+  const service = {
+    credentialContextKey: (mountId?: string) => mountId || "session",
+    loginStatus: () => ({ state: "logged-in" }), hasComposite: () => true,
+    compositeMounts: () => ["personal", "harmony"].map(mountId => ({ mountId, localPrefix: mountId,
+      label: mountId, shareId: mountId })),
+    legacyCredentialContext: () => { throw new Error("No retained context"); },
+    shareCredentialInventory: async (mountId: string) => {
+      inventories.push(mountId); return { shareId: mountId, capability: "read", entries: [] };
+    },
+    createShareCredential: async (_label: string, _folder: string, _cap: string, mountId: string) => {
+      creations.push(mountId); return { id: "grant", shareId: mountId, username: mountId,
+        webdavPath: "/dav", nextcloudPath: "/nextcloud", password: "synthetic-once" };
+    }
+  };
+  const modal = new DevicePasswordsModal({}, service, "http://localhost");
+  await modal.onOpen();
+  assert.deepEqual(inventories, []);
+  const choose = dropdownChanges.find(item => item.name === "Share-native grant destination")!.change;
+  await choose("personal");
+  textChanges.find(item => item.name === "Device name")!.change("Tablet");
+  const staleCreate = buttons.find(item => item.text === "Create staged read grant")!.click;
+  await choose("harmony");
+  await staleCreate();
+  assert.deepEqual(creations, []);
+  textChanges.filter(item => item.name === "Device name").at(-1)!.change("Tablet");
+  await buttons.filter(item => item.text === "Create staged read grant").at(-1)!.click();
+  assert.deepEqual(creations, ["harmony"]);
+  const holders = [...modal.secrets];
+  assert.ok(holders.some((holder: any) => holder.value === "synthetic-once"));
+  const copy = buttons.filter(item => item.text === "Copy").at(-1)!.click;
+  modal.onClose();
+  assert.ok(holders.every((holder: any) => holder.value === ""));
+  assert.equal(modal.secrets.length, 0);
+  await assert.rejects(copy(), /destination changed/);
 });
 
 for (const status of [403, 404]) {

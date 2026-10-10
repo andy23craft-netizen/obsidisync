@@ -2,7 +2,7 @@
 
 The plugin implements FEAT-10's fresh composite setup and scoped downloads and FEAT-11's explicitly writable mounts.
 FEAT-12 adds [journaled conversion, recovery and detachment](LOCAL_CONVERSION_AND_DETACHMENT.md).
-Composite history/credential management and explicit import remain FEAT-13/14 work.
+FEAT-13 adds [mount history and credentials](MOUNT_HISTORY_AND_CREDENTIALS.md). Explicit import remains FEAT-14 work.
 Existing v1 and single selected-share workflows retain their previous behavior until explicitly converted/detached.
 This describes repository implementation and synthetic automated evidence, not desktop/mobile human acceptance
 or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md).
@@ -49,8 +49,8 @@ local reconciliation. An observed remote head is not proof of synchronized local
 
 Edited, deleted, unreadable or conflicting local files stay blocked while safe files/mounts continue. Downgrade,
 restart, re-login and restored write membership do not clear barriers or approve uploads. Authorization denial never
-selects legacy v1 as a fallback. Do not hand-edit state to bypass reconciliation. History metadata and credential
-management remain unavailable in composite mode.
+selects legacy v1 as a fallback. Do not hand-edit state to bypass reconciliation. History metadata uses fresh mount
+write authority; credential management has explicit, independent mount and retained legacy contexts.
 
 Writable scans, staged chunks, sync/resolve submissions, baselines and server conflicts use only share-relative
 paths within their mount. Exact captured hashes/deletions are saved before staging. Completion never acknowledges

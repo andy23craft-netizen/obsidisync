@@ -62,6 +62,7 @@ export interface HistorySnapshotEntry {
   snapshotPath: string;
   sourcePath: string;
   hash: string;
+  ownership?: import("./gitService").HistoryOwnership;
 }
 
 export interface HistoryVersionEntry {
@@ -164,7 +165,7 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("Choose share").onClick(() => this.plugin.openShareSelectionModal()));
 
     new Setting(containerEl).setName("Composite mounts")
-      .setDesc("Independent share folders with safe downloads and separately enabled writes. Fresh setup needs a new empty vault; existing vaults require conversion. Composite history and credential management remain unavailable.")
+      .setDesc("Independent share folders, histories and separately enabled writes. Fresh setup needs an empty vault; existing vaults require conversion. Device passwords explicitly select a mount and retain the separate original legacy inventory.")
       .addButton((button) => button.setButtonText("Manage mounts").onClick(() => this.plugin.openCompositeMountsModal()));
     new Setting(containerEl).setName("Conversion and detachment")
       .setDesc("Preview a journaled conversion, recover an interrupted conversion, or detach a binding while retaining files and unresolved evidence.")

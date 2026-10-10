@@ -8,6 +8,8 @@ import type { CreatedDevicePassword, CreatedShareCredential } from "./protocol";
 export class DevicePasswordsModal extends Modal {
   private closed = false;
   private contextKey = "";
+  private mountId?: string;
+  private secrets: Array<{ value: string }> = [];
 
   constructor(app: App, private readonly gitService: GitService, private readonly serverUrl: string) {
     super(app);
@@ -27,13 +29,27 @@ export class DevicePasswordsModal extends Modal {
     const legacy = this.contentEl.createDiv();
     const native = this.contentEl.createDiv();
     await this.renderLegacy(legacy);
-    if (!this.closed) await this.renderShare(native);
+    if (!this.closed && this.gitService.hasComposite()) {
+      new Setting(this.contentEl).setName("Share-native grant destination").addDropdown((dropdown) => {
+        dropdown.addOption("", "Choose a mount");
+        for (const mount of this.gitService.compositeMounts()) dropdown.addOption(mount.mountId,
+          `${mount.localPrefix}/ - ${mount.label} (${mount.shareId})`);
+        dropdown.onChange(async (mountId) => {
+          try { this.assertContext(); this.clearSecrets(); this.mountId = mountId || undefined; await this.renderShare(native); }
+          catch (error) { native.setText(errorMessage(error)); }
+        });
+      });
+      native.createEl("p", { text: "Choose a mount explicitly. Detaching it never revokes independent grants." });
+    } else if (!this.closed) await this.renderShare(native);
   }
 
   onClose(): void {
     this.closed = true;
+    this.clearSecrets();
     this.contentEl.empty();
   }
+
+  private clearSecrets(): void { for (const secret of this.secrets) secret.value = ""; this.secrets = []; }
 
   private async renderLegacy(container: HTMLElement): Promise<void> {
     if (this.closed) return;
@@ -80,9 +96,16 @@ export class DevicePasswordsModal extends Modal {
     container.createEl("h3", { text: "Share-native DAV grants" });
     try {
       this.assertContext();
-      const inventory = await this.gitService.shareCredentialInventory();
+      const mountId = this.mountId;
+      if (this.gitService.hasComposite() && !mountId) { container.createEl("p", { text: "Choose a mount." }); return; }
+      const key = this.gitService.credentialContextKey(mountId);
+      const guard = () => {
+        this.assertContext();
+        if (this.mountId !== mountId || key !== this.gitService.credentialContextKey(mountId)) throw new Error("Grant mount changed; reopen this dialog");
+      };
+      const inventory = await this.gitService.shareCredentialInventory(mountId);
       if (this.closed) return;
-      this.assertContext();
+      guard();
       const writable = inventory.capability === "read-write";
       container.createEl("p", { text: `Share ID / Basic and OCS username: ${inventory.shareId}. ` +
         "New grants are staged until explicit offline host-operator activation. Activation preserves the ID and secret. " +
@@ -92,8 +115,9 @@ export class DevicePasswordsModal extends Modal {
         "write membership or the host operator." });
       const created = container.createDiv();
       this.creationForm(container, true, writable, async (label, folder, capability) => {
-        const result = await this.gitService.createShareCredential(label, folder, capability);
-        this.assertContext();
+        guard();
+        const result = await this.gitService.createShareCredential(label, folder, capability, mountId);
+        guard();
         if (!this.closed) this.renderCreated(created, result, this.serverUrl);
       });
       if (!inventory.entries.length) container.createEl("p", { text: "No share-native grants." });
@@ -103,8 +127,8 @@ export class DevicePasswordsModal extends Modal {
           .setDesc(`${entry.id} | ${entry.lifecycle} | ${entry.capability} | folder ${entry.folder}`);
         this.copyButton(row, "Copy DAV URL", webdavUrl(this.serverUrl, paths.webdavPath));
         this.copyButton(row, "Copy Nextcloud URL", webdavUrl(this.serverUrl, paths.nextcloudPath));
-        if (writable) this.revokeButton(row, () => this.gitService.revokeShareCredential(entry.id),
-          () => this.renderShare(container));
+        if (writable) this.revokeButton(row, async () => { guard(); await this.gitService.revokeShareCredential(entry.id, mountId); },
+          async () => { guard(); await this.renderShare(container); });
       }
     } catch (error) {
       if (!this.closed) container.createEl("p", { text: `Share-native management unavailable: ${errorMessage(error)}` });
@@ -155,12 +179,14 @@ export class DevicePasswordsModal extends Modal {
   }
 
   private renderCopyRow(container: HTMLElement, name: string, value: string): void {
-    this.copyButton(new Setting(container).setName(name).setDesc(value), "Copy", value);
+    const secret = { value }; this.secrets.push(secret);
+    this.copyButton(new Setting(container).setName(name).setDesc(value), "Copy", () => secret.value);
   }
 
-  private copyButton(row: Setting, label: string, value: string): void {
+  private copyButton(row: Setting, label: string, value: string | (() => string)): void {
     row.addButton(button => button.setButtonText(label).onClick(async () => {
-      await navigator.clipboard.writeText(value);
+      this.assertContext();
+      await navigator.clipboard.writeText(typeof value === "function" ? value() : value);
       new Notice("Copied");
     }));
   }

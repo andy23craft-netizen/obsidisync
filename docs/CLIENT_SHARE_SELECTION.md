@@ -216,5 +216,6 @@ conservative ambiguous-write reconciliation and non-resumable partial upload sta
 
 FEAT-04 is ready for final human acceptance review. [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md)
 defines the full composite initiative. FEAT-10/11 fresh mount downloads and writable synchronization and
-[FEAT-12 conversion/detachment](LOCAL_CONVERSION_AND_DETACHMENT.md) are implemented; FEAT-13/14 remain;
+[FEAT-12 conversion/detachment](LOCAL_CONVERSION_AND_DETACHMENT.md) and
+[FEAT-13 mount history/credentials](MOUNT_HISTORY_AND_CREDENTIALS.md) are implemented; FEAT-14 remains;
 household deployment and coordinated production migration remain later, separately authorized operations.

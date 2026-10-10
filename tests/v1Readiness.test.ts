@@ -62,10 +62,10 @@ test("sidebar exposes conflict resolution when current file has conflict markers
   const mainSource = readFileSync(join(root, "src", "main.ts"), "utf8");
 
   assert.match(viewSource, /hasConflict: boolean/);
-  assert.match(viewSource, /openConflictResolver\(\): void/);
+  assert.match(viewSource, /openConflictResolver\(context\?: FileContext\): void/);
   assert.match(viewSource, /aria-label": "Resolve conflicts"/);
   assert.match(viewSource, /hasConflictMarkers\(await this\.app\.vault\.cachedRead\(file\)\)/);
-  assert.match(mainSource, /openConflictResolver: \(\) => this\.openConflictResolver\(\)/);
+  assert.match(mainSource, /openConflictResolver: \(context\) => this\.openHistoryReconciliation\(context\)/);
   assert.match(mainSource, /refreshFileHistoryViews/);
 });
 

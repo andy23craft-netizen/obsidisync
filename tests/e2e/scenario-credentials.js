@@ -59,8 +59,8 @@ module.exports = async ({ device, shareId, readerToken, log, setCapability, offl
   log("D3. Read-only management boundaries and independent grants across downgrade and restart");
   await setCapability("read");
   assert.equal((await A.service.legacyCredentialInventory()).managementAllowed, false);
-  await assert.rejects(A.service.createDevicePassword("Denied", "Tablet"), error => error.status === 404 || error.status === 403);
-  await assert.rejects(A.service.revokeDevicePassword(legacy.id), error => error.status === 404 || error.status === 403);
+  await assert.rejects(A.service.createDevicePassword("Denied", "Tablet"), /explicit allowed header/);
+  await assert.rejects(A.service.revokeDevicePassword(legacy.id), /explicit allowed header/);
   const readGrant = await A.service.createShareCredential("Synthetic reader grant", "Tablet", "read");
   await assert.rejects(A.service.createShareCredential("Denied", "Tablet", "read-write"), /read-only/);
   await assert.rejects(A.service.revokeShareCredential(readGrant.id), /host-operator/);

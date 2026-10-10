@@ -1,6 +1,6 @@
 import { App, ItemView, MarkdownView, Modal, Notice, setIcon, Setting, TFile, WorkspaceLeaf } from "obsidian";
 import { base64ToArrayBuffer } from "./base64";
-import { GitService } from "./gitService";
+import { GitService, type FileContext, type HistoryOwnership } from "./gitService";
 import { HISTORY_SNAPSHOT_DIR } from "./ignore";
 import { DeviceVersionEntry, HistoryEntry } from "./protocol";
 import { sha256Hex } from "./vaultState";
@@ -29,13 +29,14 @@ export interface HistorySnapshotReference {
   snapshotPath: string;
   sourcePath: string;
   hash: string;
+  ownership?: HistoryOwnership;
 }
 
 export interface HistorySnapshotStore {
   get(path: string): HistorySnapshotReference | null;
   save(reference: HistorySnapshotReference): Promise<void>;
   lastSyncedAt(): string | null;
-  openConflictResolver(): void;
+  openConflictResolver(context?: FileContext): void;
 }
 
 export class FileHistoryView extends ItemView {
@@ -46,6 +47,7 @@ export class FileHistoryView extends ItemView {
   private selectedHash: string | null = null;
   private requestId = 0;
   private syncing = false;
+  private context: FileContext | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -108,10 +110,6 @@ export class FileHistoryView extends ItemView {
 
   async showFile(path: string | null): Promise<void> {
     const resolved = this.resolveHistorySnapshot(path);
-    if (path && !resolved.path && this.filePath) {
-      await this.refresh();
-      return;
-    }
 
     if (resolved.path === this.filePath) {
       this.selectedHash = resolved.hash;
@@ -131,6 +129,7 @@ export class FileHistoryView extends ItemView {
     const { contentEl } = this;
     contentEl.empty();
     this.applyLayoutStyles(contentEl);
+    this.context = null;
 
     if (!this.filePath) {
       this.renderNoActiveFile(contentEl);
@@ -152,13 +151,23 @@ export class FileHistoryView extends ItemView {
 
     listEl.createEl("p", { text: "Loading history..." });
     try {
+      this.context = this.gitService.fileContext(this.filePath);
+      const context = this.context;
+      if (!context) {
+        this.history = []; this.deviceVersions = [];
+        listEl.empty(); listEl.createEl("p", { text: "Local-only file: no remote history is requested." });
+        this.renderStatus(statusEl, { state: "not-synced", title: "Local-only file", detail: "Outside synchronized mounts",
+          lastSaved: "Local", source: "Local", hasConflict: false });
+        return;
+      }
       const [history, deviceVersions] = await Promise.all([
-        this.gitService.history(this.filePath),
-        this.gitService.deviceVersions(this.filePath)
+        this.gitService.history(this.filePath, context),
+        this.gitService.deviceVersions(this.filePath, context)
       ]);
+      context.guard();
+      if (currentRequest !== this.requestId) return;
       this.history = history;
       this.deviceVersions = deviceVersions;
-      if (currentRequest !== this.requestId) return;
       this.fileStatus = await this.computeFileStatus();
       if (currentRequest !== this.requestId) return;
       this.renderStatus(statusEl, this.fileStatus);
@@ -195,6 +204,7 @@ export class FileHistoryView extends ItemView {
     top.style.gap = "10px";
 
     const textWrap = top.createDiv();
+    if (this.context) textWrap.createEl("div", { text: this.context.label });
     textWrap.style.minWidth = "0";
     const title = textWrap.createEl("div", { text: status?.title ?? "Checking sync status..." });
     title.style.fontWeight = "700";
@@ -228,7 +238,11 @@ export class FileHistoryView extends ItemView {
       resolveButton.style.gap = "6px";
       setIcon(resolveButton.createEl("span"), "git-pull-request");
       resolveButton.createEl("span", { text: "Resolve" });
-      resolveButton.onclick = () => this.snapshots.openConflictResolver();
+      const context = this.context;
+      resolveButton.onclick = () => {
+        try { context?.guard(); this.snapshots.openConflictResolver(context ?? undefined); }
+        catch (error) { new Notice(error instanceof Error ? error.message : String(error)); }
+      };
     }
 
     const syncButton = actions.createEl("button", { attr: { type: "button", "aria-label": "Sync now" } });
@@ -384,21 +398,31 @@ export class FileHistoryView extends ItemView {
         setIcon(pinEl, "monitor-check");
       }
 
-      button.onclick = () => this.openVersion(entry, versionNumber);
+      const context = this.context;
+      button.onclick = () => this.openVersion(entry, versionNumber, context);
 
       const actions = item.createDiv();
       actions.style.display = "flex";
       actions.style.alignItems = "center";
       actions.style.gap = "4px";
 
-      if (this.gitService.canWriteSelectedShare()) {
+      if (context && this.gitService.hasSelectedShare()) {
+        const restore = this.createIconButton(actions, "rotate-ccw", "Restore locally with backup");
+        restore.onclick = async () => {
+          if (!window.confirm(`Restore ${context.label}: ${context.path} at ${entry.hash} locally? Current bytes are backed up. Reconciliation stays required; nothing is uploaded.`)) return;
+          try { context.guard(); await this.gitService.restoreHistoricalFile(context.localPath, entry.hash, context); await this.refresh(); }
+          catch (error) { new Notice(`Historical restoration stopped: ${error instanceof Error ? error.message : String(error)}`); }
+        };
+      }
+
+      if (context && this.gitService.canWriteSelectedShare(context.mountId)) {
         const nameButton = this.createIconButton(actions, "pencil", "Name version");
-        nameButton.onclick = () => this.nameVersion(entry);
+        nameButton.onclick = () => this.nameVersion(entry, context);
 
         if (index > 0) {
           const intoEntry = visibleHistory[index - 1];
           const squashButton = this.createIconButton(actions, "combine", `Squash Version ${versionNumber} into Version ${intoEntry.versionNumber}`);
-          squashButton.onclick = () => this.squashVersion(entry, intoEntry);
+          squashButton.onclick = () => this.squashVersion(entry, intoEntry, context);
         }
       }
     }
@@ -434,36 +458,40 @@ export class FileHistoryView extends ItemView {
       .map((device) => (sameDevice(device.deviceName, currentDevice) ? "This device" : device.deviceName));
   }
 
-  private nameVersion(entry: HistoryEntry): void {
-    if (!this.filePath) return;
-    const sourcePath = this.filePath;
+  private nameVersion(entry: HistoryEntry, context = this.context): void {
+    if (!context) return;
+    const sourcePath = context.localPath;
     const hash = entry.hash;
     const current = this.versionName(entry) ?? "";
     new VersionNameModal(this.app, current, async (name) => {
       const trimmed = name.trim();
-      await this.gitService.saveVersionMetadata({ path: sourcePath, hash, name: trimmed || null, clearName: !trimmed });
+      context.guard();
+      await this.gitService.saveVersionMetadata({ path: sourcePath, hash, name: trimmed || null, clearName: !trimmed }, context);
       await this.refresh();
-    }).open();
+    }, `${context.label}: ${context.path}`).open();
   }
 
-  private async squashVersion(entry: HistoryEntry, intoEntry: HistoryEntry): Promise<void> {
-    if (!this.filePath) return;
-    const ok = window.confirm(`Squash Version ${entry.versionNumber} into Version ${intoEntry.versionNumber}? This only collapses the history list; nothing is deleted.`);
+  private async squashVersion(entry: HistoryEntry, intoEntry: HistoryEntry, context = this.context): Promise<void> {
+    if (!context) return;
+    const ok = window.confirm(`${context.label}: ${context.path}. Squash Version ${entry.versionNumber} into Version ${intoEntry.versionNumber}? This only collapses the history list; nothing is deleted.`);
     if (!ok) return;
-    await this.gitService.saveVersionMetadata({ path: this.filePath, hash: entry.hash, squashedIntoHash: intoEntry.hash });
+    context.guard();
+    await this.gitService.saveVersionMetadata({ path: context.localPath, hash: entry.hash, squashedIntoHash: intoEntry.hash }, context);
     if (this.selectedHash === entry.hash) this.selectedHash = intoEntry.hash;
     await this.refresh();
   }
 
-  private async openVersion(entry: HistoryEntry, versionNumber: number): Promise<void> {
-    if (!this.filePath) return;
+  private async openVersion(entry: HistoryEntry, versionNumber: number, context = this.context): Promise<void> {
+    if (!context) return;
     const currentRequest = ++this.requestId;
     try {
-      const version = await this.gitService.fileAtVersion(this.filePath, entry.hash);
+      context.guard();
+      const version = await this.gitService.fileAtVersion(context.localPath, entry.hash, context);
       if (currentRequest !== this.requestId) return;
       const content = base64ToArrayBuffer(version.contentBase64);
       this.selectedHash = entry.hash;
-      const snapshot = await this.writeVersionSnapshot(entry, content, versionNumber);
+      const snapshot = await this.writeVersionSnapshot(entry, content, versionNumber, context);
+      context.guard();
       const leaf = this.app.workspace.getLeaf("tab");
       await leaf.openFile(snapshot, { active: true, state: { mode: "preview" } });
       await this.refresh();
@@ -473,31 +501,43 @@ export class FileHistoryView extends ItemView {
     }
   }
 
-  private async writeVersionSnapshot(entry: HistoryEntry, content: ArrayBuffer, versionNumber: number): Promise<TFile> {
+  private async writeVersionSnapshot(entry: HistoryEntry, content: ArrayBuffer, versionNumber: number, context = this.context): Promise<TFile> {
+    if (!context) throw new Error("History source is unavailable");
+    context.guard();
     await this.ensureSnapshotFolder();
+    context.guard();
     const source = this.describeSource(entry);
 
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const path = snapshotPath(this.filePath ?? "version", entry, source.device, versionNumber, attempt);
+      const path = snapshotPath(context.localPath, entry, source.device, versionNumber, attempt);
       const existing = this.app.vault.getAbstractFileByPath(path);
       if (existing instanceof TFile) {
-        await this.app.vault.modifyBinary(existing, content);
-        await this.saveSnapshotReference(existing.path, entry.hash);
-        return existing;
+        const reference = this.snapshots.get(path);
+        if (reference?.sourcePath === context.localPath && reference.hash === entry.hash &&
+            JSON.stringify(reference.ownership) === JSON.stringify(context.ownership) &&
+            await sha256Hex(await this.app.vault.adapter.readBinary(path)) === await sha256Hex(content)) {
+          context.guard(); return existing;
+        }
+        continue; // Preserve edited, sibling-owned and unbound snapshots.
       }
 
       if (await this.app.vault.adapter.exists(path, true)) continue;
+      context.guard();
       const created = await this.app.vault.createBinary(path, content);
-      await this.saveSnapshotReference(created.path, entry.hash);
+      context.guard();
+      if (await sha256Hex(await this.app.vault.adapter.readBinary(created.path)) !== await sha256Hex(content)) {
+        throw new Error("Written history snapshot checksum mismatch; unbound copy retained");
+      }
+      await this.saveSnapshotReference(created.path, entry.hash, context);
       return created;
     }
 
     throw new Error("Could not create a unique history snapshot file");
   }
 
-  private async saveSnapshotReference(snapshotPath: string, hash: string): Promise<void> {
-    if (!this.filePath) return;
-    await this.snapshots.save({ snapshotPath, sourcePath: this.filePath, hash });
+  private async saveSnapshotReference(snapshotPath: string, hash: string, context: FileContext): Promise<void> {
+    context.guard();
+    await this.snapshots.save({ snapshotPath, sourcePath: context.localPath, hash, ownership: context.ownership });
   }
 
   private resolveHistorySnapshot(path: string | null): { path: string | null; hash: string | null } {
@@ -505,6 +545,7 @@ export class FileHistoryView extends ItemView {
 
     const reference = this.snapshots.get(path);
     if (!reference) return { path: null, hash: null };
+    if (!this.gitService.snapshotOwnershipMatches(reference.sourcePath, reference.ownership)) return { path: null, hash: null };
 
     return { path: reference.sourcePath, hash: reference.hash };
   }
@@ -524,9 +565,11 @@ export class FileHistoryView extends ItemView {
     const localSaved = file ? formatDateFromMs(file.stat.mtime) : "Unknown";
     const currentSource = this.currentDeviceSource();
     const hasConflict = await this.fileHasConflictMarkers(file);
-    const localRecord = this.gitService.localReconciliations().find((entry) => entry.path === this.filePath);
-    if (localRecord) return { state: "local-changes", title: "Local reconciliation required",
-      detail: localRecord.reason, lastSaved: localSaved, source: currentSource, hasConflict: true };
+    const context = this.context;
+    const barrier = context && this.gitService.historyBarrierReason(context);
+    if (barrier) return { state: "local-changes",
+      title: "Local reconciliation required", detail: barrier, lastSaved: localSaved,
+      source: currentSource, hasConflict: true };
 
     if (!this.filePath || this.history.length === 0) {
       return {
@@ -546,7 +589,7 @@ export class FileHistoryView extends ItemView {
     try {
       const [localBuffer, latestVersion] = await Promise.all([
         this.app.vault.adapter.readBinary(this.filePath),
-        this.gitService.fileAtVersion(this.filePath, latest.hash)
+        this.gitService.fileAtVersion(this.filePath, latest.hash, context ?? undefined)
       ]);
       const localSha = await sha256Hex(localBuffer);
       if (localSha === latestVersion.sha256) {
@@ -651,7 +694,8 @@ class VersionNameModal extends Modal {
   constructor(
     app: App,
     currentName: string,
-    private readonly saveName: (name: string) => Promise<void>
+    private readonly saveName: (name: string) => Promise<void>,
+    private readonly source: string
   ) {
     super(app);
     this.value = currentName;
@@ -661,6 +705,7 @@ class VersionNameModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Name version" });
+    contentEl.createEl("p", { text: this.source });
 
     let input: HTMLInputElement | null = null;
     new Setting(contentEl).setName("Name").addText((text) => {

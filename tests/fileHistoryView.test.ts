@@ -21,7 +21,7 @@ test("plugin registers a dockable ObsidiSync file history view", () => {
   assert.match(mainSource, /addRibbonIcon\("history", "Open file history"/);
   assert.match(viewSource, /this\.showFile\(file\?\.path \?\? null\)/);
   assert.match(viewSource, /this\.showFile\(null\)/);
-  assert.match(viewSource, /if \(path && !resolved\.path && this\.filePath\)/);
+  assert.match(viewSource, /snapshotOwnershipMatches\(reference\.sourcePath, reference\.ownership\)/);
   assert.doesNotMatch(viewSource, /else if \(!this\.app\.workspace\.getActiveViewOfType\(MarkdownView\)\?\.file\)/);
   assert.doesNotMatch(mainSource, /FileVersionsModal/);
 });
@@ -71,19 +71,19 @@ test("file history view shows centered last sync status and sync action when no 
 test("file history view opens selected versions with the regular Obsidian file UI", () => {
   const viewSource = readFileSync(join(root, "src", "fileHistoryView.ts"), "utf8");
 
-  assert.match(viewSource, /gitService\.history\(this\.filePath\)/);
-  assert.match(viewSource, /gitService\.fileAtVersion\(this\.filePath, entry\.hash\)/);
+  assert.match(viewSource, /gitService\.history\(this\.filePath, context\)/);
+  assert.match(viewSource, /gitService\.fileAtVersion\(context\.localPath, entry\.hash, context\)/);
   assert.match(viewSource, /HISTORY_SNAPSHOT_DIR/);
   assert.match(viewSource, /createBinary\(path, content\)/);
-  assert.match(viewSource, /modifyBinary\(existing, content\)/);
+  assert.doesNotMatch(viewSource, /modifyBinary\(existing, content\)/);
   assert.match(viewSource, /adapter\.exists\(path, true\)/);
-  assert.match(viewSource, /openVersion\(entry, versionNumber\)/);
-  assert.match(viewSource, /snapshotPath\(this\.filePath \?\? "version", entry, source\.device, versionNumber, attempt\)/);
+  assert.match(viewSource, /openVersion\(entry, versionNumber, context\)/);
+  assert.match(viewSource, /snapshotPath\(context\.localPath, entry, source\.device, versionNumber, attempt\)/);
   assert.match(viewSource, /`\$\{HISTORY_SNAPSHOT_DIR\}\/Version \$\{version\} - \$\{date\} - \$\{computer\} - \$\{title\}\$\{suffix\}\$\{extension\}`/);
   assert.match(viewSource, /formatSnapshotDate/);
   assert.match(viewSource, /snapshotTitle/);
   assert.match(viewSource, /snapshotExtension/);
-  assert.match(viewSource, /saveSnapshotReference\(created\.path, entry\.hash\)/);
+  assert.match(viewSource, /saveSnapshotReference\(created\.path, entry\.hash, context\)/);
   assert.match(viewSource, /resolveHistorySnapshot/);
   assert.match(viewSource, /this\.snapshots\.get\(path\)/);
   assert.match(viewSource, /return \{ path: reference\.sourcePath, hash: reference\.hash \}/);
@@ -105,18 +105,18 @@ test("file history list shows version numbers and keeps device status compact", 
   assert.match(viewSource, /`Version \$\{versionNumber\}: \$\{name\}`/);
   assert.match(viewSource, /versionEl\.style\.color = this\.selectedHash === entry\.hash \? "var\(--text-accent\)" : "var\(--text-normal\)"/);
   assert.match(viewSource, /private versionName\(entry: HistoryEntry\): string \| null/);
-  assert.match(viewSource, /await this\.gitService\.saveVersionMetadata\(\{ path: sourcePath, hash, name: trimmed \|\| null, clearName: !trimmed \}\)/);
+  assert.match(viewSource, /await this\.gitService\.saveVersionMetadata\(\{ path: sourcePath, hash, name: trimmed \|\| null, clearName: !trimmed \}, context\)/);
   assert.match(viewSource, /entry\.squashedIntoHash == null/);
   assert.match(viewSource, /private visibleHistoryEntries\(\): HistoryEntry\[\]/);
   assert.match(viewSource, /this\.fileStatus\?\.state === "up-to-date" \? this\.history\[0\]\?\.hash : null/);
   assert.match(viewSource, /entry\.hash !== latestHash/);
   assert.match(viewSource, /"No earlier versions for this file yet\."/);
-  assert.match(viewSource, /private async squashVersion\(entry: HistoryEntry, intoEntry: HistoryEntry\): Promise<void>/);
+  assert.match(viewSource, /private async squashVersion\(entry: HistoryEntry, intoEntry: HistoryEntry, context = this\.context\): Promise<void>/);
   assert.match(viewSource, /class VersionNameModal extends Modal/);
   assert.match(viewSource, /contentEl\.createEl\("h2", \{ text: "Name version" \}\)/);
   assert.match(viewSource, /setButtonText\("Save"\)/);
   assert.match(viewSource, /const intoEntry = visibleHistory\[index - 1\]/);
-  assert.match(viewSource, /window\.confirm\(`Squash Version \$\{entry\.versionNumber\} into Version \$\{intoEntry\.versionNumber\}\?/);
+  assert.match(viewSource, /window\.confirm\(`\$\{context\.label\}: \$\{context\.path\}\. Squash Version \$\{entry\.versionNumber\} into Version \$\{intoEntry\.versionNumber\}\?/);
   assert.match(viewSource, /button\.style\.display = "flex"/);
   assert.match(viewSource, /button\.style\.alignItems = "center"/);
   assert.match(viewSource, /button\.style\.justifyContent = "stretch"/);

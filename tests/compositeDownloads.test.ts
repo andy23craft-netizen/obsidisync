@@ -14,6 +14,7 @@ Module._load = function(name: string, ...rest: any[]) {
     : originalLoad.call(this, name, ...rest);
 };
 const { GitService } = require("../src/gitService");
+const { FileHistoryView } = require("../src/fileHistoryView");
 const { DEFAULT_SETTINGS } = require("../src/settings");
 const { assertMountPrefixes, captureMountAction, assertMountAction, resolveMount, validateComposite } = require("../src/composite");
 Module._load = originalLoad;
@@ -43,8 +44,10 @@ function fixture(t: any, writable = false) {
   const uploads = new Map<string, { index: number; path: string; sha256: string; bytes: Buffer }>();
   let uploadSequence = 0;
   const conflicts: any[][] = ids.map(() => []);
+  const grants: any[][] = ids.map(() => []);
   let inline = false;
   let damagedBytes = false;
+  let legacyHeader: string | undefined = "allowed";
   const respond = async (options: any) => {
     requests.push(options);
     await hook?.(options);
@@ -55,11 +58,38 @@ function fixture(t: any, writable = false) {
     if (url.pathname === "/v1/auth/config") return ok({ type: "password", passwordConfigured: true });
     if (url.pathname === "/v2/shares") return ok(ids.map((id, i) =>
       ({ shareId: id, label: `Share ${i}`, capability: capabilities[i] })));
+    if (url.pathname.startsWith("/v1/users/") && url.pathname.endsWith("/device-passwords")) {
+      if (options.method !== "GET") { assert.equal(legacyHeader, "allowed"); return ok({ id: "synthetic-legacy" }); }
+      return { ...ok([]), headers: legacyHeader === undefined ? {} : { "x-obsidisync-legacy-grant-management": legacyHeader } };
+    }
+    if (url.pathname.startsWith("/v1/users/") && url.pathname.includes("/device-passwords/")) {
+      assert.equal(options.method, "DELETE"); assert.equal(legacyHeader, "allowed"); return ok({});
+    }
     const index = ids.indexOf(url.pathname.split("/")[3]);
     assert.notEqual(index, -1, `Unexpected route ${options.method} ${url.pathname}`);
     if (denied.has(index)) return { status: 404, json: {}, text: "not found" };
     if (url.pathname.endsWith("/sync-state")) return ok({ shareId: ids[index], apiVersion: 2,
       capability: capabilities[index], serverHead: heads[index] });
+    if (url.pathname.endsWith("/history")) return ok([{ hash: heads[index], date: "2026-10-10T00:00:00Z", versionNumber: 1,
+      message: `history ${index}`, subject: `history ${index}`, author: `author ${index}` }]);
+    if (url.pathname.endsWith("/devices")) return ok([{ clientId: `device-${index}`, deviceName: `device ${index}` }]);
+    if (url.pathname.endsWith("/files/device-versions")) return ok([{ clientId: `device-${index}`, hash: heads[index] }]);
+    if (url.pathname.endsWith("/file")) {
+      const path = url.searchParams.get("path")!, bytes = remotes[index][path];
+      assert.equal(url.searchParams.get("hash"), heads[index]); assert.notEqual(bytes, undefined);
+      return ok({ path, hash: heads[index], sha256: sha(bytes), readOnly: true,
+        contentBase64: Buffer.from(damagedBytes ? "damaged" : bytes).toString("base64") });
+    }
+    if (url.pathname.endsWith("/files/version-metadata")) return ok({});
+    if (url.pathname.includes("/device-passwords")) {
+      if (options.method === "GET") return ok(grants[index]);
+      if (options.method === "DELETE") { grants[index] = grants[index].filter((entry) => !url.pathname.endsWith(entry.id)); return ok({}); }
+      const body = JSON.parse(options.body), id = `grant-${index}-${grants[index].length}`;
+      const entry = { id, ...body, shareId: ids[index], lifecycle: "staged" };
+      grants[index].push(entry);
+      return ok({ ...entry, username: ids[index], password: "synthetic-once", webdavPath: `/dav/${ids[index]}/${body.folder}/`,
+        nextcloudPath: `/remote.php/dav/files/${ids[index]}/${body.folder}/` });
+    }
     if (writable && url.pathname.endsWith("/conflicts")) return ok(conflicts[index]);
     if (writable && url.pathname.includes("/uploads")) {
       const body = JSON.parse(options.body);
@@ -130,6 +160,7 @@ function fixture(t: any, writable = false) {
     hook: (value?: typeof hook) => { hook = value; }, saveHook: (value?: typeof saveHook) => { saveHook = value; },
     afterHook: (value?: typeof afterHook) => { afterHook = value; },
     inline: () => { inline = true; }, corruptBytes: (value: boolean) => { damagedBytes = value; },
+    legacyHeader: (value?: string) => { legacyHeader = value; },
     saved: () => JSON.parse(readFileSync(settingsPath, "utf8"))
   };
 }
@@ -170,8 +201,173 @@ test("fresh selection changes no files; two mounts isolate downloads, backup evi
   assert.equal(f.service().canWriteSelectedShare(), false);
   for (const req of f.requests) assert.equal(req.headers?.["x-obsidisync-client-features"], undefined);
   await assert.rejects(f.service().forcePushLocal(), /Composite/);
-  await assert.rejects(f.service().history("Personal/same.md"), /not yet available/);
-  await assert.rejects(f.service().listDevicePasswords(), /not yet available/);
+  assert.equal((await f.service().history("Personal/same.md"))[0].message, "history 0");
+  assert.deepEqual(await f.service().listDevicePasswords(), []);
+});
+
+test("history, blobs, devices and metadata resolve equal filenames to independent owning mounts", async (t) => {
+  const f = fixture(t, true);
+  f.remote(0, { "same.md": "private history", "same.bin": Buffer.from([0, 255]) });
+  f.remote(1, { "same.md": "shared history" });
+  const a = await f.add(0, "Personal"), b = await f.add(1, "Harmony");
+  await f.initialize(a); await f.initialize(b);
+  for (const [prefix, mount, index] of [["Personal", a, 0], ["Harmony", b, 1]] as const) {
+    const context = f.service().fileContext(`${prefix}/same.md`);
+    assert.equal(context.mountId, mount.mountId); assert.equal(context.path, "same.md");
+    const history = await f.service().history(`${prefix}/same.md`, context);
+    assert.equal(history[0].message, `history ${index}`);
+    assert.equal((await f.service().devices(mount.mountId))[0].clientId, `device-${index}`);
+    assert.equal((await f.service().deviceVersions(`${prefix}/same.md`, context))[0].clientId, `device-${index}`);
+    const bytes = await f.service().blobAtVersion(`${prefix}/same.md`, history[0].hash, context);
+    assert.equal(Buffer.from(bytes).toString(), index === 0 ? "private history" : "shared history");
+    await assert.rejects(f.service().saveVersionMetadata({ path: `${prefix}/same.md`, hash: history[0].hash, name: "denied" }, context), /read-only/);
+    await f.service().enableShareWrites(mount.mountId);
+    await f.service().saveVersionMetadata({ path: `${prefix}/same.md`, hash: history[0].hash, name: `name ${index}` }, context);
+  }
+  const mutations = f.requests.filter((request: any) => request.url.endsWith("/files/version-metadata"));
+  assert.deepEqual(mutations.map((request: any) => JSON.parse(request.body).path), ["same.md", "same.md"]);
+  assert.ok(mutations[0].url.includes(ids[0])); assert.ok(mutations[1].url.includes(ids[1]));
+  const before = f.requests.length;
+  assert.deepEqual(await f.service().history("outside.md"), []);
+  assert.deepEqual(await f.service().deviceVersions("outside.md"), []);
+  await assert.rejects(f.service().fileAtVersion("outside.md", "unused"), /Local-only/);
+  assert.equal(f.requests.length, before);
+  await assert.rejects(f.service().devices(), /name a composite mount/);
+});
+
+test("historical checksum failures and stale ownership stop reads and metadata without v1 fallback", async (t) => {
+  const f = fixture(t, true); f.remote(0, { "same.md": "original" });
+  const a = await f.add(0, "Personal"); await f.initialize(a); await f.service().enableShareWrites(a.mountId);
+  const context = f.service().fileContext("Personal/same.md"), hash = (await f.service().history("Personal/same.md"))[0].hash;
+  f.corruptBytes(true); await assert.rejects(f.service().fileAtVersion("Personal/same.md", hash), /checksum/); f.corruptBytes(false);
+  let changed = false;
+  f.afterHook(async (request: any) => {
+    if (!changed && request.url.includes("/history?")) { changed = true; await f.service().observeCompositeRename("Personal/missing.md", "outside.md"); }
+  });
+  await assert.rejects(f.service().history("Personal/same.md", context), /stale/);
+  f.afterHook();
+  const count = f.requests.length;
+  await assert.rejects(f.service().saveVersionMetadata({ path: "Personal/same.md", hash, name: "stale" }, context), /stale/);
+  assert.equal(f.requests.length, count);
+  f.denied.add(0); await assert.rejects(f.service().history("Personal/same.md"), (error: any) => error.status === 404);
+  assert.ok(!f.requests.some((request: any) => request.url.includes("/v1/users/")));
+});
+
+test("historical restoration backs up current local bytes and retains reconciliation without changing siblings", async (t) => {
+  const f = fixture(t, true); f.remote(0, { "same.md": "historical" }); f.remote(1, { "same.md": "shared" });
+  const a = await f.add(0, "Personal"), b = await f.add(1, "Harmony"); await f.initialize(a); await f.initialize(b);
+  const sibling = JSON.stringify(b), baseline = JSON.stringify(a.download.baseline);
+  f.write("Personal/same.md", "current edited bytes");
+  const hash = (await f.service().history("Personal/same.md"))[0].hash;
+  await f.service().restoreHistoricalFile("Personal/same.md", hash);
+  assert.equal(f.read("Personal/same.md"), "historical");
+  const record = a.download.reconciliation[0]; assert.equal(record.uploadBlocked, true);
+  assert.equal(f.read(`${record.backupFolder}/Personal/same.md`), "current edited bytes");
+  assert.equal(JSON.stringify(a.download.baseline), baseline); assert.equal(JSON.stringify(b), sibling);
+  assert.equal(a.status, "download-only"); assert.equal(a.download.applying, undefined);
+  a.download.writing = { stage: "submitted", entries: [{ path: "same.md", entry: a.download.baseline[0] }],
+    mountAction: captureMountAction(f.settings().composite, a) };
+  await assert.rejects(f.service().restoreHistoricalFile("Personal/same.md", hash), /Recover existing/);
+  assert.equal(a.download.writing.stage, "submitted");
+});
+
+test("historical restore preserves edits after backup and leaves durable recovery evidence", async (t) => {
+  const f = fixture(t); f.remote(0, { "same.md": "historical" });
+  const mount = await f.add(0, "Personal"); await f.initialize(mount);
+  f.write("Personal/same.md", "before backup");
+  const hash = (await f.service().history("Personal/same.md"))[0].hash;
+  const requestStart = f.requests.length;
+  f.saveHook(async () => {
+    if (mount.download.applying) f.write("Personal/same.md", "edit after backup");
+  });
+  await assert.rejects(f.service().restoreHistoricalFile("Personal/same.md", hash), /Local contents changed/);
+  assert.equal(f.read("Personal/same.md"), "edit after backup");
+  assert.equal(f.read(`${mount.download.applying.backupFolder}/Personal/same.md`), "before backup");
+  f.saveHook(); f.restart();
+  const restored = f.settings().composite.mounts[0];
+  assert.ok(restored.download.applying);
+  assert.equal(restored.download.reconciliation[0].uploadBlocked, true);
+  assert.equal(restored.status, "download-only");
+  assert.ok(f.requests.slice(requestStart).every((request: any) => request.method === "GET"));
+});
+
+test("snapshot ownership prevents sibling/unbound reuse and preserves edited root snapshots", async (t) => {
+  const f = fixture(t); f.remote(0, { "same.md": "private" }); f.remote(1, { "same.md": "shared" });
+  const a = await f.add(0, "Personal"), b = await f.add(1, "Harmony"); await f.initialize(a); await f.initialize(b);
+  const references: any[] = [];
+  const view: any = Object.create(FileHistoryView.prototype);
+  view.gitService = f.service(); view.filePath = "Personal/same.md";
+  view.snapshots = { get: (path: string) => references.find((entry) => entry.snapshotPath === path),
+    save: async (reference: any) => { references.push(reference); } };
+  view.app = { vault: f.vault };
+  f.vault.createFolder = async (path: string) => f.vault.adapter.mkdir(path);
+  f.vault.createBinary = async (path: string, bytes: ArrayBuffer) => {
+    assert.equal(await f.vault.adapter.exists(path), false); await f.vault.adapter.writeBinary(path, bytes);
+    return f.vault.getAbstractFileByPath(path);
+  };
+  const context = f.service().fileContext("Personal/same.md");
+  const entry = { hash: "equal-revision", date: "2026-10-10T00:00:00Z", versionNumber: 1, subject: "same revision", author: "fixture" };
+  const bytes = new TextEncoder().encode("private").buffer;
+  const first = await view.writeVersionSnapshot(entry, bytes, 1, context);
+  assert.equal(references[0].ownership.mountId, a.mountId);
+  assert.equal((await view.writeVersionSnapshot(entry, bytes, 1, context)).path, first.path);
+  f.write(first.path, "edited local evidence");
+  const second = await view.writeVersionSnapshot(entry, bytes, 1, context);
+  assert.notEqual(second.path, first.path); assert.equal(f.read(first.path), "edited local evidence");
+  const siblingContext = f.service().fileContext("Harmony/same.md");
+  const third = await view.writeVersionSnapshot(entry, new TextEncoder().encode("shared").buffer, 1, siblingContext);
+  assert.notEqual(third.path, first.path); assert.notEqual(third.path, second.path);
+  assert.equal(f.service().snapshotOwnershipMatches("Harmony/same.md", context.ownership), false);
+  references.push({ snapshotPath: "ObsidiSync History/unbound.md", sourcePath: "Personal/same.md", hash: "equal-revision" });
+  assert.equal(view.resolveHistorySnapshot("ObsidiSync History/unbound.md").path, null);
+  assert.equal(view.resolveHistorySnapshot(second.path).path, "Personal/same.md");
+});
+
+test("mount grant inventories and read issuance remain independent of file journals and stale actions", async (t) => {
+  const f = fixture(t, true); f.remote(0, { "same.md": "private" }); f.remote(1, { "same.md": "shared" });
+  const a = await f.add(0, "Personal"), b = await f.add(1, "Harmony"); await f.initialize(a); await f.initialize(b);
+  f.capabilities[0] = "read";
+  const before = JSON.stringify([a.download, b.download]);
+  const created = await f.service().createShareCredential("Reader", "Tablet", "read", a.mountId);
+  assert.equal(created.shareId, ids[0]); assert.equal(created.username, ids[0]); assert.equal(created.lifecycle, "staged");
+  assert.equal(JSON.stringify([a.download, b.download]), before); assert.ok(!JSON.stringify(f.settings()).includes("synthetic-once"));
+  await assert.rejects(f.service().createShareCredential("Writer", "Tablet", "read-write", a.mountId), /read-only/);
+  await assert.rejects(f.service().revokeShareCredential(created.id, a.mountId), /host-operator/);
+  assert.equal((await f.service().shareCredentialInventory(a.mountId)).entries.length, 1);
+  assert.equal((await f.service().shareCredentialInventory(b.mountId)).entries.length, 0);
+  await assert.rejects(f.service().shareCredentialInventory(), /name a composite mount/);
+  let moved = false;
+  f.afterHook(async (request: any) => {
+    if (!moved && request.method === "POST" && request.url.endsWith("/device-passwords")) {
+      moved = true; await f.service().observeCompositeRename("Harmony/missing.md", "outside.md");
+    }
+  });
+  await assert.rejects(f.service().createShareCredential("Lost response", "Tablet", "read", b.mountId), /stale/);
+  f.afterHook();
+  assert.equal((await f.service().shareCredentialInventory(b.mountId)).entries.length, 1, "Review inventory; never automatically reissue a lost secret");
+});
+
+test("composite legacy mutations require the original namespace allowed header independent of mount capability", async (t) => {
+  const f = fixture(t); const a = await f.add(0, "Personal");
+  f.capabilities[0] = "read";
+  for (const header of [undefined, "unknown", "denied", "allowed"]) {
+    f.legacyHeader(header);
+    const inventory = await f.service().legacyCredentialInventory();
+    assert.deepEqual(inventory.entries, []); assert.equal(inventory.managementAllowed, header === "allowed");
+    const start = f.requests.length;
+    if (header === "allowed") {
+      await f.service().createDevicePassword("Legacy", "Tablet"); await f.service().revokeDevicePassword("synthetic-legacy");
+      assert.equal(f.requests.slice(start).filter((request: any) => request.method !== "GET").length, 2);
+    } else {
+      await assert.rejects(f.service().createDevicePassword("Legacy", "Tablet"), /allowed header/);
+      await assert.rejects(f.service().revokeDevicePassword("synthetic-legacy"), /allowed header/);
+      assert.ok(f.requests.slice(start).every((request: any) => request.method === "GET"));
+    }
+  }
+  delete f.settings().legacyManagementContext;
+  const before = f.requests.length;
+  await assert.rejects(f.service().legacyCredentialInventory(), /Original legacy namespace/);
+  assert.equal(f.requests.length, before); assert.equal(a.shareId, ids[0]);
 });
 
 test("existing files, history, recovery directories or legacy state require explicit conversion", async (t) => {

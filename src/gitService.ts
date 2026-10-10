@@ -60,6 +60,16 @@ export interface ConversionPreview {
   exclusions: string[];
 }
 
+export interface HistoryOwnership { mountId: string; shareId: string; destination: string }
+export interface FileContext {
+  localPath: string;
+  path: string;
+  mountId?: string;
+  ownership?: HistoryOwnership;
+  label: string;
+  guard: () => void;
+}
+
 type SaveSettings = () => Promise<void>;
 interface ShareAction {
   token?: MountActionToken;
@@ -309,6 +319,61 @@ export class GitService {
   }
 
   compositeActionGuard(mountId: string): () => void { return this.shareAction(this.selectedShare(mountId)).guard; }
+
+  fileContext(localPath: string): FileContext | null {
+    this.assertEngine();
+    if (this.hasComposite()) {
+      const resolved = resolveMount(validateComposite(this.settings), localPath);
+      if (!resolved) return null;
+      const token = captureMountAction(validateComposite(this.settings), resolved.mount);
+      return { localPath, path: resolved.path, mountId: resolved.mount.mountId,
+        ownership: { mountId: resolved.mount.mountId, shareId: resolved.mount.shareId, destination: token.destination },
+        label: `${resolved.mount.localPrefix}/ - ${resolved.mount.label} (${resolved.mount.shareId})`, guard: this.mountGuard(token) };
+    }
+    if (!sharePathSupported(localPath)) return null;
+    if (this.settings.activeShare) return { localPath, path: localPath,
+      ownership: { mountId: `single:${this.settings.activeShare.shareId}`, shareId: this.settings.activeShare.shareId,
+        destination: JSON.stringify([this.settings.activeShare.serverUrl, this.settings.activeShare.shareId,
+          this.settings.activeShare.identity, this.settings.activeShare.authentication]) },
+      label: `${this.settings.activeShare.label} (${this.settings.activeShare.shareId})`,
+      guard: this.shareAction(this.settings.activeShare).guard };
+    this.requireConfigured();
+    const binding = JSON.stringify([this.settings.legacySyncBinding, this.settings.authenticatedIdentity]);
+    const epoch = this.operationEpoch;
+    return { localPath, path: localPath, label: `${this.settings.userSlug}/${this.settings.vaultSlug}`, guard: () => {
+      this.assertEngine(epoch); this.requireConfigured();
+      if (binding !== JSON.stringify([this.settings.legacySyncBinding, this.settings.authenticatedIdentity])) throw new Error("History binding changed");
+    } };
+  }
+
+  snapshotOwnershipMatches(path: string, ownership?: HistoryOwnership): boolean {
+    try {
+      const context = this.fileContext(path);
+      return Boolean(context && JSON.stringify(context.ownership) === JSON.stringify(ownership));
+    } catch { return false; } // Detached/unavailable snapshots remain local evidence.
+  }
+
+  historyBarrierReason(context: FileContext): string | null {
+    context.guard();
+    if (!this.hasComposite() && !this.settings.activeShare) return null;
+    const selected = this.selectedShare(context.mountId);
+    const record = selected.download.reconciliation.find((entry) => entry.path === context.path);
+    if (record) return record.reason;
+    if (!selected.download.initial.complete) return "Initial reconciliation required";
+    if (selected.download.applying?.path === context.path) return "Interrupted application requires recovery";
+    if (selected.download.writing?.entries.some((entry) => entry.path === context.path)) return "Captured write outcome requires recovery";
+    return this.hasLocalBarrier(context.localPath) ? "Move barrier requires explicit endpoint reconciliation in Manage mounts" : null;
+  }
+
+  private async historyDestination(path: string, captured?: FileContext): Promise<{ context: FileContext; root: string } | null> {
+    const context = captured ?? this.fileContext(path);
+    if (!context) return null;
+    if (context.localPath !== path) throw new Error("History source changed");
+    context.guard();
+    const root = await this.readVaultPath(context.mountId, context.guard);
+    context.guard();
+    return { context, root };
+  }
 
   compositeMoveDescription(moveId: string): string {
     const move = validateComposite(this.settings).moves.find((entry) => entry.id === moveId);
@@ -684,11 +749,10 @@ export class GitService {
     return `/v2/shares/${encodeURIComponent(selected.shareId)}`;
   }
 
-  private async readVaultPath(): Promise<string> {
-    if (this.hasComposite()) throw new Error("History and metadata reads are not yet available in composite mode");
-    if (this.settings.activeShare) {
-      const selected = this.settings.activeShare;
-      await this.negotiateShare(selected);
+  private async readVaultPath(mountId?: string, guard?: () => void): Promise<string> {
+    if (this.settings.activeShare || this.hasComposite()) {
+      const selected = this.selectedShare(mountId);
+      await this.negotiateShare(selected, guard ?? this.shareAction(selected).guard);
       return this.sharePath(selected);
     }
     this.requireConfigured();
@@ -1552,44 +1616,107 @@ export class GitService {
     return { serverHead: response.serverHead, files: response.files };
   }
 
-  async history(path?: string): Promise<HistoryEntry[]> {
-    const root = await this.readVaultPath();
-    const suffix = path ? `?path=${encodeURIComponent(path)}` : "";
-    return this.getJson<HistoryEntry[]>(`${root}/history${suffix}`);
+  async history(path?: string, captured?: FileContext): Promise<HistoryEntry[]> {
+    if (!path) return this.getJson<HistoryEntry[]>(`${await this.readVaultPath()}/history`);
+    const destination = await this.historyDestination(path, captured);
+    if (!destination) return [];
+    const { context, root } = destination;
+    const result = await this.getJson<HistoryEntry[]>(`${root}/history?path=${encodeURIComponent(context.path)}`);
+    context.guard(); return result;
   }
 
-  async devices(): Promise<DeviceEntry[]> {
-    return this.getJson<DeviceEntry[]>(`${await this.readVaultPath()}/devices`);
+  async devices(mountId?: string): Promise<DeviceEntry[]> {
+    const guard = this.hasComposite() ? this.compositeActionGuard(mountId!) : undefined;
+    const root = await this.readVaultPath(mountId, guard);
+    const result = await this.getJson<DeviceEntry[]>(`${root}/devices`);
+    guard?.(); return result;
   }
 
-  async deviceVersions(path: string): Promise<DeviceVersionEntry[]> {
-    const root = await this.readVaultPath();
+  async deviceVersions(path: string, captured?: FileContext): Promise<DeviceVersionEntry[]> {
+    const destination = await this.historyDestination(path, captured);
+    if (!destination) return [];
+    const { context, root } = destination;
     try {
-      return await this.getJson<DeviceVersionEntry[]>(`${root}/files/device-versions?path=${encodeURIComponent(path)}`);
+      const result = await this.getJson<DeviceVersionEntry[]>(`${root}/files/device-versions?path=${encodeURIComponent(context.path)}`);
+      context.guard(); return result;
     } catch (error) {
-      if (this.settings.activeShare) throw error;
+      if (this.settings.activeShare || this.hasComposite()) throw error;
       // Older servers don't have this endpoint yet; degrade to no badges.
       return [];
     }
   }
 
-  async saveVersionMetadata(request: VersionMetadataRequest): Promise<void> {
-    if (this.settings.activeShare) {
-      if (!this.canWriteSelectedShare()) throw new Error("Share metadata is read-only");
-      await this.shareWrite(this.settings.activeShare, "/files/version-metadata", request);
+  async saveVersionMetadata(request: VersionMetadataRequest, captured?: FileContext): Promise<void> {
+    const context = captured ?? this.fileContext(request.path);
+    if (!context || context.localPath !== request.path) throw new Error("Local-only or mismatched metadata source");
+    context.guard();
+    if (this.settings.activeShare || this.hasComposite()) {
+      const selected = this.selectedShare(context.mountId);
+      if (!this.canWriteSelectedShare(context.mountId)) throw new Error("Share metadata is read-only");
+      const action = this.shareAction(selected);
+      await this.shareWrite(selected, "/files/version-metadata", { ...request, path: context.path },
+        { ...action, guard: () => { context.guard(); action.guard(); } }, [context.path]);
       return;
     }
     this.requireConfigured();
     await this.postJson<void>(`${this.vaultPath()}/files/version-metadata`, request);
   }
 
-  async fileAtVersion(path: string, hash: string): Promise<VersionFileResponse> {
-    const root = await this.readVaultPath();
-    const file = await this.getJson<VersionFileResponse>(`${root}/file?path=${encodeURIComponent(path)}&hash=${encodeURIComponent(hash)}`);
-    if (this.settings.activeShare && await sha256Hex(base64ToArrayBuffer(file.contentBase64)) !== file.sha256) {
+  async fileAtVersion(path: string, hash: string, captured?: FileContext): Promise<VersionFileResponse> {
+    const destination = await this.historyDestination(path, captured);
+    if (!destination) throw new Error("Local-only files have no remote history");
+    const { context, root } = destination;
+    const file = await this.getJson<VersionFileResponse>(`${root}/file?path=${encodeURIComponent(context.path)}&hash=${encodeURIComponent(hash)}`);
+    context.guard();
+    if ((this.settings.activeShare || this.hasComposite()) && (file.path !== context.path || file.hash !== hash ||
+        await sha256Hex(base64ToArrayBuffer(file.contentBase64)) !== file.sha256)) {
       throw new Error(`History download checksum mismatch: ${path}`);
     }
-    return file;
+    context.guard(); return file;
+  }
+
+  async blobAtVersion(path: string, hash: string, captured?: FileContext): Promise<ArrayBuffer> {
+    const context = captured ?? this.fileContext(path);
+    if (!context) throw new Error("Local-only files have no remote blobs");
+    const metadata = await this.fileAtVersion(path, hash, context);
+    const destination = await this.historyDestination(path, context);
+    const bytes = await this.requestBinary("GET", `${destination!.root}/blob?path=${encodeURIComponent(context.path)}&hash=${encodeURIComponent(hash)}`);
+    context.guard();
+    if (await sha256Hex(bytes) !== metadata.sha256) throw new Error("Historical blob checksum mismatch");
+    context.guard(); return bytes;
+  }
+
+  async restoreHistoricalFile(path: string, hash: string, captured?: FileContext): Promise<void> {
+    const context = captured ?? this.fileContext(path);
+    if (!context || context.localPath !== path || (!this.hasComposite() && !this.settings.activeShare)) {
+      throw new Error("Historical restoration requires an owning initialized share");
+    }
+    context.guard();
+    await this.exclusive(async () => {
+      context.guard();
+      const selected = this.selectedShare(context.mountId), action = this.shareAction(selected);
+      if (!action.canApply(context.path)) throw new Error("Reconcile the move barrier before historical restoration");
+      if (!selected.download.initial.complete || selected.download.applying || selected.download.writing) {
+        throw new Error("Recover existing initialization/application/write work before historical restoration");
+      }
+      const before = await action.vault.checkedEntryFor(context.path);
+      const version = await this.fileAtVersion(path, hash, context);
+      const bytes = base64ToArrayBuffer(version.contentBase64);
+      const backupFolder = this.recoveryFolder();
+      await action.vault.verifiedBackup(backupFolder, before ? [context.path] : []);
+      context.guard();
+      const record: LocalReconciliation = { path: context.path,
+        baseline: selected.download.baseline.find((entry) => entry.path === context.path) ?? null,
+        remote: { path: context.path, op: "upsert", sha256: version.sha256, size: bytes.byteLength },
+        remoteHead: hash, reason: "Historical contents restored locally; explicit reconciliation required", uploadBlocked: true, backupFolder };
+      if (!selected.download.reconciliation.some((entry) => entry.path === context.path)) selected.download.reconciliation.push(record);
+      selected.download.applying = record;
+      await action.save(); context.guard();
+      if (!await action.vault.applyGuarded(record.remote, before, bytes, () => { context.guard(); action.guard(); })) {
+        throw new Error("Local contents changed during historical restoration; copies and barrier retained");
+      }
+      context.guard(); delete selected.download.applying; await action.save();
+    });
   }
 
   /**
@@ -1743,8 +1870,6 @@ export class GitService {
   }
 
   legacyCredentialContext(): LegacyManagementContext {
-    if (this.hasComposite()) throw new Error("Credential management is not yet available in composite mode");
-    captureLegacyContext(this.settings);
     const context = this.settings.legacyManagementContext;
     if (!context || context.serverUrl !== serverIdentity(this.settings.serverUrl)) {
       throw new Error("Original legacy namespace is unavailable on this server. Retained context has not been changed.");
@@ -1759,16 +1884,28 @@ export class GitService {
   }
 
   /** Bind modal intent to the account and both independent destinations, not their mutable capabilities. */
-  credentialContextKey(): string {
+  credentialContextKey(mountId?: string): string {
     return JSON.stringify([serverIdentity(this.settings.serverUrl), this.settings.userSlug,
-      this.settings.authenticatedIdentity, this.settings.legacyManagementContext,
+      this.settings.authenticatedIdentity, this.settings.oidcAccessToken, this.settings.legacyManagementContext,
+      this.operationEpoch, this.settings.composite?.revision,
+      this.settings.composite?.mounts.map((mount) => [mount.mountId, mount.moveGeneration, captureMountAction(this.settings.composite!, mount).destination]), mountId,
       (this.settings.activeShare ?? this.settings.pendingShareSelection)?.shareId]);
+  }
+
+  private credentialGuard(mountId?: string): () => void {
+    const key = this.credentialContextKey(mountId);
+    return () => {
+      if (this.lifecycleBusy || this.lifecycleUncertain || this.settings.conversionGate || key !== this.credentialContextKey(mountId)) {
+        throw new Error("Credential action is stale; reopen its original context");
+      }
+    };
   }
 
   async legacyCredentialInventory(): Promise<{ entries: DevicePasswordEntry[]; managementAllowed: boolean }> {
     const context = this.legacyCredentialContext();
+    const guard = this.credentialGuard();
     const response = await this.devicePasswordRequest(() =>
-      this.requestWithAuth("GET", this.legacyCredentialPath(context), undefined, context));
+      this.requestWithAuth("GET", this.legacyCredentialPath(context), undefined, context, guard));
     const header = Object.entries(response.headers ?? {}).find(([key]) =>
       key.toLowerCase() === "x-obsidisync-legacy-grant-management")?.[1];
     return { entries: response.json as DevicePasswordEntry[], managementAllowed: header === "allowed" };
@@ -1780,43 +1917,60 @@ export class GitService {
 
   async createDevicePassword(label: string, folder: string): Promise<CreatedDevicePassword> {
     const context = this.legacyCredentialContext();
+    const guard = this.credentialGuard();
+    const inventory = await this.legacyCredentialInventory(); guard();
+    if (!inventory.managementAllowed) throw new Error("Legacy grant management requires an explicit allowed header; ask the host operator");
     const request: CreateDevicePasswordRequest = { label, folder };
     const response = await this.devicePasswordRequest(() =>
-      this.requestWithAuth("POST", this.legacyCredentialPath(context), request, context));
+      this.requestWithAuth("POST", this.legacyCredentialPath(context), request, context, guard));
     return response.json as CreatedDevicePassword;
   }
 
   async revokeDevicePassword(id: string): Promise<void> {
     const context = this.legacyCredentialContext();
+    const guard = this.credentialGuard();
+    const inventory = await this.legacyCredentialInventory(); guard();
+    if (!inventory.managementAllowed) throw new Error("Legacy grant management requires an explicit allowed header; ask the host operator");
     await this.devicePasswordRequest(() => this.requestWithAuth("DELETE",
-      `${this.legacyCredentialPath(context)}/${encodeURIComponent(id)}`, undefined, context));
+      `${this.legacyCredentialPath(context)}/${encodeURIComponent(id)}`, undefined, context, guard));
   }
 
-  async shareCredentialInventory(): Promise<{ shareId: string; capability: "read" | "read-write";
+  private credentialShare(mountId?: string): PendingShareSelection | ActiveShare {
+    const selected = this.hasComposite() ? this.selectedShare(mountId) : this.settings.activeShare ?? this.settings.pendingShareSelection;
+    if (!selected) throw new Error("Choose a share to manage share-native grants");
+    return selected;
+  }
+
+  async shareCredentialInventory(mountId?: string): Promise<{ shareId: string; capability: "read" | "read-write";
       entries: ShareCredentialEntry[] }> {
-    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
-    if (!selected) throw new Error("Choose a share to manage share-native grants.");
-    await this.negotiateShare(selected);
+    const selected = this.credentialShare(mountId);
+    const action = this.shareAction(selected), credentialGuard = this.credentialGuard(mountId);
+    const guard = () => { action.guard(); credentialGuard(); };
+    await this.negotiateShare(selected, guard);
     const entries = await this.getJson<ShareCredentialEntry[]>(`${this.sharePath(selected)}/device-passwords`);
+    guard();
     return { shareId: selected.shareId, capability: selected.capability, entries };
   }
 
-  async createShareCredential(label: string, folder: string, capability: "read" | "read-write"):
+  async createShareCredential(label: string, folder: string, capability: "read" | "read-write", mountId?: string):
       Promise<CreatedShareCredential> {
-    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
-    if (!selected) throw new Error("Choose a share first.");
-    await this.negotiateShare(selected);
+    const selected = this.credentialShare(mountId);
+    const action = this.shareAction(selected), credentialGuard = this.credentialGuard(mountId);
+    const guard = () => { action.guard(); credentialGuard(); };
+    await this.negotiateShare(selected, guard);
     if (capability !== "read" && capability !== "read-write") throw new Error("Invalid credential capability");
     if (capability === "read-write" && selected.capability !== "read-write") throw new Error("Share is read-only");
-    return this.postJson<CreatedShareCredential>(`${this.sharePath(selected)}/device-passwords`, { label, folder, capability });
+    const response = await this.requestWithAuth("POST", `${this.sharePath(selected)}/device-passwords`, { label, folder, capability }, undefined, guard);
+    guard(); return response.json as CreatedShareCredential;
   }
 
-  async revokeShareCredential(id: string): Promise<void> {
-    const selected = this.settings.activeShare ?? this.settings.pendingShareSelection;
-    if (!selected) throw new Error("Choose a share first.");
-    await this.negotiateShare(selected);
+  async revokeShareCredential(id: string, mountId?: string): Promise<void> {
+    const selected = this.credentialShare(mountId);
+    const action = this.shareAction(selected), credentialGuard = this.credentialGuard(mountId);
+    const guard = () => { action.guard(); credentialGuard(); };
+    await this.negotiateShare(selected, guard);
     if (selected.capability !== "read-write") throw new Error("Read-only membership requires host-operator revocation.");
-    await this.deleteJson(`${this.sharePath(selected)}/device-passwords/${encodeURIComponent(id)}`);
+    await this.requestWithAuth("DELETE", `${this.sharePath(selected)}/device-passwords/${encodeURIComponent(id)}`, undefined, undefined, guard);
   }
 
   /** An old server has no device-password routes at all and answers 404; say so instead of "not found". */
