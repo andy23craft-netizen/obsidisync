@@ -214,8 +214,9 @@ attachments and the two credential sections. Supported CORS behavior is router-t
 and third-party DAV clients have not been exercised here. Keep the documented external-writer filesystem race,
 conservative ambiguous-write reconciliation and non-resumable partial upload staging in mind.
 
-FEAT-04 is ready for final human acceptance review. [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md)
-defines the full composite initiative. FEAT-10/11 fresh mount downloads and writable synchronization and
+FEAT-04 is ready for final human acceptance review. [Composite synchronization](COMPOSITE_MOUNT_DOWNLOADS.md)
+describes the implemented composite initiative. FEAT-10/11 fresh mount downloads and writable synchronization and
 [FEAT-12 conversion/detachment](LOCAL_CONVERSION_AND_DETACHMENT.md) and
-[FEAT-13 mount history/credentials](MOUNT_HISTORY_AND_CREDENTIALS.md) are implemented; FEAT-14 remains;
+[FEAT-13 mount history/credentials](MOUNT_HISTORY_AND_CREDENTIALS.md) and
+[FEAT-14 cross-mount import](CROSS_MOUNT_IMPORT.md) are implemented;
 household deployment and coordinated production migration remain later, separately authorized operations.

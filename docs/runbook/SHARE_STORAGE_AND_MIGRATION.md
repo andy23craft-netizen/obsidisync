@@ -1,8 +1,8 @@
 # Share storage, independent grants, and offline publication
 
 This describes the server interfaces introduced by FEAT-03. Local fixture validation is distinct from deployment.
-Complete FEAT-03, FEAT-04, then [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md) (FEAT-10 through
-FEAT-14) before one separately authorized coordinated production migration.
+Server, share selection and composite client implementation are present. Follow the
+reviewed migration procedure below before one separately authorized coordinated production migration.
 
 ## Authentication and storage boundary
 
@@ -193,4 +193,4 @@ Use disposable directories/volumes and synthetic authentication for all migratio
 `npm run test:e2e`, build the actual Dockerfile, and `python3 tests/packaged_commands.py --image IMAGE` against a locally
 loaded image. Packaged fixtures use unique volumes and `--network none`, then remove only their own fixtures.
 Automated checks do not replace human verification or authorize a production migration/deployment.
-See the [implementation audit](SERVER_IMPLEMENTATION_AUDIT.md) for the inspected surfaces and fixture evidence.
+See the [implementation audit](../maintainers/SERVER_IMPLEMENTATION_AUDIT.md) for the inspected surfaces and fixture evidence.

@@ -6,7 +6,7 @@ FEAT-13 adds [mount history and credentials](MOUNT_HISTORY_AND_CREDENTIALS.md).
 FEAT-14 adds [explicit cross-mount import and separate source-deletion consent](CROSS_MOUNT_IMPORT.md).
 Existing v1 and single selected-share workflows retain their previous behavior until explicitly converted/detached.
 This describes repository implementation and synthetic automated evidence, not desktop/mobile human acceptance
-or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md).
+or production rollout. See the [migration runbook](SHARE_STORAGE_AND_MIGRATION.md).
 
 ## Fresh setup
 

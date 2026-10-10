@@ -126,7 +126,7 @@ do not enable Saber; legacy DAV/Saber credentials retain their reviewed original
 Native session revocation and independent device-grant revocation have different lifecycles. Disabling a local
 account blocks login/refresh, but existing access tokens may remain valid until expiration. Current membership
 checks still apply to native share access. Previously synchronized local copies cannot be securely erased remotely.
-The [storage and migration runbook](../SHARE_STORAGE_AND_MIGRATION.md) gives the precise compatibility and grant rules.
+The [storage and migration runbook](../runbook/SHARE_STORAGE_AND_MIGRATION.md) gives the precise compatibility and grant rules.
 
 ## Persistent data and recovery
 
@@ -153,7 +153,7 @@ they do not describe production startup behavior.
 Migration is an offline, explicitly reviewed copy-and-publication operation. It retains legacy sources, validates
 staged share roots, and commits the reviewed set through a single durable publication-manifest rename. Individual
 JSON file writes are not a general multi-file transaction. Upgrade does not automatically publish storage, activate
-credentials or reset client state. See the [runbook](../SHARE_STORAGE_AND_MIGRATION.md#reviewed-migration) for backup,
+credentials or reset client state. See the [runbook](../runbook/SHARE_STORAGE_AND_MIGRATION.md#reviewed-migration) for backup,
 dry-run, apply, interruption and rollback procedures; this overview is not an operator command checklist.
 
 Backups must preserve the complete data directory consistently, including auth/grants, Git, attachment objects and
@@ -166,16 +166,16 @@ recoverable legacy Saber encryption configuration.
 | Area | Current repository | Planned work |
 | --- | --- | --- |
 | Server privacy boundary | Published independent shares, typed membership, v2 API | Production migration requires separate operator action |
-| Obsidian routing | [One selected v2 share or intentional mapped v1 namespace](../CLIENT_SHARE_SELECTION.md) | Human desktop/mobile acceptance |
-| Local vault composition | Fresh scoped mounts with explicitly enabled writes and independent recovery; v1/single-share retained | [PLAN-02 remaining work](../tickets/PLAN-02-composite-local-vault-synchronization.md), [implemented synchronization](../COMPOSITE_MOUNT_DOWNLOADS.md) |
+| Obsidian routing | [One selected v2 share or intentional mapped v1 namespace](../runbook/CLIENT_SHARE_SELECTION.md) | Human desktop/mobile acceptance |
+| Local vault composition | Fresh scoped mounts with explicitly enabled writes and independent recovery; v1/single-share retained | [Migration runbook](../runbook/SHARE_STORAGE_AND_MIGRATION.md), [implemented synchronization](../runbook/COMPOSITE_MOUNT_DOWNLOADS.md) |
 | Device integration | Independent share DAV grants plus retained legacy DAV/Saber | Share-native Saber configuration remains deferred |
 
 Fresh composite mounts keep separate heads, manifests and recovery decisions for each share.
-[Existing-vault conversion/detachment](../LOCAL_CONVERSION_AND_DETACHMENT.md) uses verified backups and local journals.
-[Composite history/credential workflows](../MOUNT_HISTORY_AND_CREDENTIALS.md) are implemented; explicit copy/import
+[Existing-vault conversion/detachment](../runbook/LOCAL_CONVERSION_AND_DETACHMENT.md) uses verified backups and local journals.
+[Composite history/credential workflows](../runbook/MOUNT_HISTORY_AND_CREDENTIALS.md) are implemented; explicit copy/import
 remains future client work. Cross-share
 moves require independent endpoint decisions; they are not atomic renames. The
-[Server audit](../SERVER_IMPLEMENTATION_AUDIT.md) records implementation and fixture evidence separately from deployment.
+[Server audit](../maintainers/SERVER_IMPLEMENTATION_AUDIT.md) records implementation and fixture evidence separately from deployment.
 
 ## Reproducing the diagrams
 

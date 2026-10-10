@@ -188,6 +188,9 @@ rust-server/target/release/obsidian-git-sync-server
 
 ## Release checklist
 
+For a direct GitHub tag release, follow the [maintainer release runbook](docs/maintainers/RELEASING.md).
+The [documentation index](docs/README.md) separates operational guides, technical references and outstanding tickets.
+
 The Forgejo repository releases automatically: every push to `main` runs `semantic-release` (see `.releaserc.json`), which inspects the commits since the last release using [Conventional Commits](https://www.conventionalcommits.org/) to decide the next version, updates `package.json`, `package-lock.json`, and `manifest.json` in the CI workspace, tags the triggering commit as `vX.Y.Z`, and publishes a Forgejo release with `main.js` and `manifest.json` as assets. No manual version bump or tag is needed for that repository.
 
 To trigger a release, just merge Conventional Commit messages (`feat:`, `fix:`, etc.) into `main`. A commit type that doesn't map to a version bump (`chore:`, `docs:`, `refactor:`, ...) will not produce a release.
@@ -343,21 +346,21 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 ### Adding another device to a vault
 
 Fresh empty local vaults can use independent `Personal/` and `Harmony/` share mounts with safe downloads and
-explicitly enabled writable synchronization. See [Composite mount synchronization](docs/COMPOSITE_MOUNT_DOWNLOADS.md)
+explicitly enabled writable synchronization. See [Composite mount synchronization](docs/runbook/COMPOSITE_MOUNT_DOWNLOADS.md)
 for initialization, backups, conflicts, move endpoint reconciliation and recovery limits.
-[Existing-vault conversion and detachment](docs/LOCAL_CONVERSION_AND_DETACHMENT.md) provide verified local backups,
-journaled recovery and fresh reconciliation after re-add. [Mount history and credentials](docs/MOUNT_HISTORY_AND_CREDENTIALS.md)
+[Existing-vault conversion and detachment](docs/runbook/LOCAL_CONVERSION_AND_DETACHMENT.md) provide verified local backups,
+journaled recovery and fresh reconciliation after re-add. [Mount history and credentials](docs/runbook/MOUNT_HISTORY_AND_CREDENTIALS.md)
 provide owned snapshots, guarded local restoration and explicit grant selection.
-[Explicit cross-mount import](docs/CROSS_MOUNT_IMPORT.md) previews selected files, conditionally creates destinations,
+[Explicit cross-mount import](docs/runbook/CROSS_MOUNT_IMPORT.md) previews selected files, conditionally creates destinations,
 and verifies acceptance before separately confirmed source deletion;
 single-share and v1 remain available until explicitly converted or detached.
 
 Share selection, safe downloads and writable synchronization are implemented. Download initialization remains
 download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.
-See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for verified backups, guarded per-file application,
+See [Client share selection](docs/runbook/CLIENT_SHARE_SELECTION.md) for verified backups, guarded per-file application,
 durable local/server conflicts, upload recovery, permission-restoration barriers and retained v1 state.
 Legacy DAV/Saber and staged/active share credential management use separate authorization contexts, described below.
-See [Share storage and migration](docs/SHARE_STORAGE_AND_MIGRATION.md) for the server transition contracts.
+See [Share storage and migration](docs/runbook/SHARE_STORAGE_AND_MIGRATION.md) for the server transition contracts.
 The legacy namespace instructions below describe v1 behavior; selected-share downloads never register or upload merely to read.
 
 Every device that should carry the same vault talks to the same server and uses the same vault name. There are two kinds of devices:
@@ -428,7 +431,7 @@ The endpoint implements WebDAV class 1 (`OPTIONS`, `PROPFIND` with depth 0 or 1,
 
 Native InkVault clients can publish editable source packages and server-rendered
 PDFs as one recoverable Git revision. Ordinary Obsidian clients receive the PDF.
-See [the InkVault notes v1 protocol](docs/INKVAULT_NOTES_V1.md) for negotiation,
+See [the InkVault notes v1 protocol](docs/technical-reference/INKVAULT_NOTES_V1.md) for negotiation,
 annotation, conflict resolution, recovery, and rendering limits.
 
 ### Saber handwritten notes (Nextcloud emulation)
@@ -606,7 +609,7 @@ remain compatible; legacy issuer-less sessions require the separate re-login des
 New local sessions carry immutable account IDs but expose the same username to v1. Re-login retains the client
 vault slug, head, manifest, registration and conflicts; do not reset registration, force-push, or overwrite local.
 Authentication import does not migrate document storage. Publication requires the separate explicit offline
-[share migration workflow](docs/SHARE_STORAGE_AND_MIGRATION.md); an upgrade never migrates data automatically.
+[share migration workflow](docs/runbook/SHARE_STORAGE_AND_MIGRATION.md); an upgrade never migrates data automatically.
 
 OIDC identity upgrade has an approved compatibility exception: legacy server sessions without a persisted verified
 issuer cannot authenticate or refresh. Sign in again through OIDC on each plugin/browser. No offline issuer binding
@@ -644,7 +647,7 @@ Nextcloud with the exact opaque share ID as Basic/OCS identity. It never becomes
 Active grants survive creator membership removal/account disable and require explicit revocation; Harmony's service
 credential follows this independent grant model. Upgrade/publication never autoactivates it. Existing legacy
 hashes/grants/Saber settings are never silently converted or retargeted. See the
-[storage, compatibility, activation and recovery runbook](docs/SHARE_STORAGE_AND_MIGRATION.md).
+[storage, compatibility, activation and recovery runbook](docs/runbook/SHARE_STORAGE_AND_MIGRATION.md).
 
 The server and every admin command hold an exclusive lifetime OS lock on the stable `/data/.obsidisync.lock`.
 Competing processes fail before reading stores or starting a listener. Do not delete/replace that lock file.

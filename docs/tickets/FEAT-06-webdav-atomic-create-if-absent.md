@@ -13,7 +13,7 @@ capability. Harmony owns project semantics, document editing, operation journali
 ## Context
 
 The [architecture guide](../architecture/README.md) describes the current share/storage boundary. The
-[verified investigation](../WEBDAV_CREATE_IF_ABSENT_RESEARCH.md) traces source, tests, standards and failure cases.
+[verified investigation](../technical-reference/WEBDAV_CREATE_IF_ABSENT_RESEARCH.md) traces source, tests, standards and failure cases.
 PUT currently supports a single exact quoted If-Match tag, repeats its check under the storage mutex, and otherwise
 writes unconditionally. If-None-Match is ignored. The production service already serializes v1/v2/DAV operations by
 opaque share ID; `for_share` preserves the shared lock map. Current PUT responses carry no revision receipt.

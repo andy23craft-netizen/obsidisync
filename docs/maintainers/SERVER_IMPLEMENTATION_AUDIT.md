@@ -52,6 +52,6 @@ been accessed or verified. Production needs separately authorized inventory, app
 OIDC re-login communication, explicit authentication configuration and the coordinated migration runbook.
 
 The audited implementation has no unresolved product decisions. Legacy share-native Saber provisioning remains
-explicitly deferred; completed legacy Saber compatibility is retained. Implementation order remains
-FEAT-03 -> FEAT-04 -> PLAN-02 (FEAT-10 through FEAT-14), followed by one separately authorized production migration
-after validation. See [the composite plan](tickets/PLAN-02-composite-local-vault-synchronization.md).
+explicitly deferred; completed legacy Saber compatibility is retained. Server and composite client implementation
+are present; one separately authorized production migration follows validation. See the
+[migration runbook](../runbook/SHARE_STORAGE_AND_MIGRATION.md).
