@@ -215,6 +215,6 @@ and third-party DAV clients have not been exercised here. Keep the documented ex
 conservative ambiguous-write reconciliation and non-resumable partial upload staging in mind.
 
 FEAT-04 is ready for final human acceptance review. [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md)
-defines the full composite initiative. FEAT-10/11 fresh mount downloads and writable synchronization are implemented;
-FEAT-12 to FEAT-14 remain;
+defines the full composite initiative. FEAT-10/11 fresh mount downloads and writable synchronization and
+[FEAT-12 conversion/detachment](LOCAL_CONVERSION_AND_DETACHMENT.md) are implemented; FEAT-13/14 remain;
 household deployment and coordinated production migration remain later, separately authorized operations.

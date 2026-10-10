@@ -1,8 +1,9 @@
 # Composite mount synchronization
 
 The plugin implements FEAT-10's fresh composite setup and scoped downloads and FEAT-11's explicitly writable mounts.
-Existing-vault conversion/detachment, composite history/credential management and explicit import remain separate
-FEAT-12 through FEAT-14 work. Existing v1 and single selected-share workflows retain their previous behavior.
+FEAT-12 adds [journaled conversion, recovery and detachment](LOCAL_CONVERSION_AND_DETACHMENT.md).
+Composite history/credential management and explicit import remain FEAT-13/14 work.
+Existing v1 and single selected-share workflows retain their previous behavior until explicitly converted/detached.
 This describes repository implementation and synthetic automated evidence, not desktop/mobile human acceptance
 or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md).
 
@@ -10,7 +11,7 @@ or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synch
 
 Use a new empty local Obsidian vault with no previous synchronization, history or recovery state. Normal root
 `.obsidian` configuration is allowed. A populated vault or retained sync/recovery evidence requires explicit
-conversion, which this stage does not provide. Do not clear settings or move files to bypass that check.
+conversion through Conversion and recovery. Do not clear settings or move files to bypass that check.
 
 1. Configure the server and log in normally. Open Settings -> Composite mounts -> Manage mounts.
 2. Enter a nonempty local folder prefix, such as `Personal`, and add the authorized private share by stable ID.
@@ -107,10 +108,11 @@ The real-server writable scenario covers three mounts, text/binary conflicts, ed
 committed-but-stale responses, membership changes, concurrent initial replacement and inaccessible reads/mutations.
 Existing legacy/writable/history/credential and server authorization regressions remain.
 
-Ubuntu/WSL automated results on 2026-10-10: `npm run test:plugin` passed 194 tests; `npm run build:plugin` passed;
-`npm run test:server` passed 145 tests with one existing ignored sample-PDF test; `npm run test:e2e` passed all seven
-scenarios. The first Rust run hit an existing conflict test's filesystem error; that test passed in isolation and
-the full Rust rerun passed. Tests use disposable synthetic data, not household documents or deployed services.
+Ubuntu/WSL automated results on 2026-10-10: `npm run test:plugin` passed 229 tests; `npm run build:plugin` passed;
+`npm run test:server` passed 145 tests with one existing ignored sample-PDF test; `npm run test:e2e` passed all eight
+scenarios, including conversion/detachment. After the final original-conflict gate and UI changes, the plugin/build
+checks and real-server lifecycle scenario passed again. Tests use disposable synthetic data, not household
+documents or deployed services.
 
 No server migration is required for this client feature. Install the updated plugin through the normal operator
 workflow. A previous download-only composite build rejects writable/journal state; do not reset that state to

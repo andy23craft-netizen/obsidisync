@@ -344,8 +344,10 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 
 Fresh empty local vaults can use independent `Personal/` and `Harmony/` share mounts with safe downloads and
 explicitly enabled writable synchronization. See [Composite mount synchronization](docs/COMPOSITE_MOUNT_DOWNLOADS.md)
-for initialization, backups, conflicts, move endpoint reconciliation and recovery limits. Existing-vault conversion,
-composite history/credential management and explicit import remain later work; single-share and v1 remain available.
+for initialization, backups, conflicts, move endpoint reconciliation and recovery limits.
+[Existing-vault conversion and detachment](docs/LOCAL_CONVERSION_AND_DETACHMENT.md) provide verified local backups,
+journaled recovery and fresh reconciliation after re-add. Composite history/credential management and explicit import
+remain later work; single-share and v1 remain available until explicitly converted or detached.
 
 Share selection, safe downloads and writable synchronization are implemented. Download initialization remains
 download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.

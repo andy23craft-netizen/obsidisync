@@ -25,6 +25,11 @@ class Setting {
       onChange: (change: (value: string) => any) => { textChanges.push({ name: this.name, change }); return text; } };
     callback(text); return this;
   }
+  addTextArea(callback: (text: any) => void) { return this.addText(callback); }
+  addDropdown(callback: (dropdown: any) => void) {
+    const dropdown: any = { addOption: () => dropdown, onChange: () => dropdown };
+    callback(dropdown); return this;
+  }
   addToggle(callback: (toggle: any) => void) {
     const toggle: any = { setValue: () => toggle, onChange: () => toggle };
     callback(toggle); return this;
@@ -43,6 +48,7 @@ const { GitService, HttpStatusError } = require("../src/gitService");
 const { DEFAULT_SETTINGS, IosGitSyncSettingTab } = require("../src/settings");
 const { ShareSelectionModal } = require("../src/shareSelectionModal");
 const { CompositeMountsModal } = require("../src/compositeMountsModal");
+const { ConversionModal } = require("../src/conversionModal");
 const { LocalReconciliationModal } = require("../src/localReconciliationModal");
 const { DevicePasswordsModal } = require("../src/devicePasswordsModal");
 const ObsidiSyncPlugin = require("../src/main").default;
@@ -538,9 +544,9 @@ test("overlapping plugin saves snapshot state and cannot overwrite a later recov
   plugin.settings.marker = "journal persisted";
   const second = plugin.saveSettings();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(writes, [{ marker: "before journal" }]);
+  assert.deepEqual(writes, [{ marker: "before journal", settingsRevision: 1 }]);
   release(); await Promise.all([first, second]);
-  assert.deepEqual(writes, [{ marker: "before journal" }, { marker: "journal persisted" }]);
+  assert.deepEqual(writes, [{ marker: "before journal", settingsRevision: 1 }, { marker: "journal persisted", settingsRevision: 2 }]);
 });
 
 test("a failed plugin save rejects its caller without poisoning subsequent durable saves", async () => {
@@ -551,7 +557,53 @@ test("a failed plugin save rejects its caller without poisoning subsequent durab
   let written: any;
   plugin.saveData = async (snapshot: any) => { written = snapshot; };
   plugin.settings.marker = "recovered"; await plugin.saveSettings();
-  assert.deepEqual(written, { marker: "recovered" });
+  assert.deepEqual(written, { marker: "recovered", settingsRevision: 2 });
+});
+
+test("an uncertain lifecycle snapshot blocks ordinary saves without publishing speculative memory", async () => {
+  const plugin: any = Object.create(ObsidiSyncPlugin.prototype);
+  plugin.settings = { marker: "original" }; plugin.settingsSave = Promise.resolve();
+  let durable: any;
+  plugin.saveData = async (snapshot: any) => { durable = snapshot; throw new Error("ambiguous save"); };
+  await assert.rejects(plugin.saveLifecycleSnapshot({ marker: "activated" }), /ambiguous/);
+  assert.equal(durable.marker, "activated"); assert.equal(plugin.settings.marker, "original");
+  await assert.rejects(plugin.saveSettings(), /uncertain/);
+});
+
+test("conversion cannot bypass unresolved or inaccessible original server conflicts", async () => {
+  for (const response of [ok([{ path: "grocery.md", reason: "unresolved" }]), { status: 404, text: "not found" }]) {
+    const { service, settings } = fixture();
+    const current = respond;
+    respond = (request) => request.url.includes("/conflicts?") ? response : current(request);
+    await assert.rejects(service.convertBinding({ configuration: JSON.stringify(settings) }), /conflicts|not found/);
+    assert.equal(settings.conversionGate, undefined); assert.equal(settings.serverHead, "old-head");
+    assert.ok(requests.every(request => request.method === "GET"));
+  }
+});
+
+test("conversion UI separates preview consent, detachment and pre-activation recovery", async () => {
+  buttons = []; textChanges = [];
+  let consent = false, conversions = 0, detachments = 0, recovered = 0;
+  (globalThis as any).window = { confirm: () => consent };
+  let state: any = { serverUrl: "http://localhost:8787", userSlug: "andy", vaultSlug: "old" };
+  const preview = { proposed: { mounts: [] }, mappings: [], exclusions: [] };
+  const service: any = {
+    lifecycleState: () => state, discoverShares: async () => [share],
+    previewConversion: async () => preview, convertBinding: async (value: any) => { assert.equal(value, preview); conversions++; },
+    detachBinding: async () => { detachments++; }, recoverConversion: async () => { recovered++; }
+  };
+  const modal = new ConversionModal({}, service); await modal.onOpen();
+  await buttons.find(button => button.text === "Back up, relocate and activate")!.click(); assert.equal(conversions, 0);
+  await buttons.find(button => button.text === "Preview")!.click();
+  await buttons.find(button => button.text === "Back up, relocate and activate")!.click(); assert.equal(conversions, 0);
+  consent = true; await buttons.find(button => button.text === "Back up, relocate and activate")!.click(); assert.equal(conversions, 1);
+  consent = false; await buttons.find(button => button.text === "Detach and keep files")!.click(); assert.equal(detachments, 0);
+  consent = true; await buttons.find(button => button.text === "Detach and keep files")!.click(); assert.equal(detachments, 1);
+  state = { conversionGate: "journal", conversion: { id: "journal", phase: "relocating", mappings: [], backupFolder: "local" } };
+  buttons = []; await modal.onOpen();
+  assert.ok(!buttons.some(button => button.text === "Preview"));
+  consent = false; await buttons.find(button => button.text === "Reverse to original binding")!.click(); assert.equal(recovered, 0);
+  consent = true; await buttons.find(button => button.text === "Reverse to original binding")!.click(); assert.equal(recovered, 1);
 });
 
 test("composite chooser separates mount selection from explicit per-mount download consent", async () => {

@@ -5,6 +5,7 @@ import { ConflictResolverModal } from "./conflictResolverModal";
 import { DevicePasswordsModal } from "./devicePasswordsModal";
 import { FILE_HISTORY_VIEW_TYPE, FileHistoryView, HistorySnapshotReference } from "./fileHistoryView";
 import { GitService, LoginStatus } from "./gitService";
+import { validateLifecycle } from "./localLifecycle";
 import { InitialSyncModal } from "./initialSyncModal";
 import { OidcDeviceLoginModal } from "./oidcModal";
 import { ServerInfoResponse, SyncConflict } from "./protocol";
@@ -15,6 +16,7 @@ import { ShareSelectionModal } from "./shareSelectionModal";
 import { CompositeMountsModal } from "./compositeMountsModal";
 import { validateComposite } from "./composite";
 import { LocalReconciliationModal } from "./localReconciliationModal";
+import { ConversionModal } from "./conversionModal";
 
 const LOGIN_RENEWAL_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -33,6 +35,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   private pendingCloseSyncPaths = new Set<string>();
   private appCloseSyncStarted = false;
   private settingsSave: Promise<void> = Promise.resolve();
+  private lifecycleSnapshotPending = false;
+  private lifecycleSaveUncertain = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -53,15 +57,25 @@ export default class ObsidiSyncPlugin extends Plugin {
       this.settings.branch = DEFAULT_SETTINGS.branch;
       shouldSaveSettings = true;
     }
-    if (shouldSaveSettings) await this.saveSettings();
+    if (shouldSaveSettings && !this.settings.conversionGate) await this.saveSettings();
 
     this.gitService = new GitService(
       this.app.vault,
       this.settings,
       () => this.saveSettings(),
       (conflicts) => this.openConflictResolver(conflicts, { explicit: true }),
-      () => (this.conflictResolverOpen ? "Finish conflict resolution before starting another sync." : null)
+      () => (this.conflictResolverOpen ? "Finish conflict resolution before starting another sync." : null),
+      (snapshot) => this.saveLifecycleSnapshot(snapshot)
     );
+    let recoveryGate = Boolean(this.settings.conversionGate || this.settings.disabledBinding);
+    this.register(this.gitService.onSyncStateChange(() => {
+      const next = Boolean(this.settings.conversionGate || this.settings.disabledBinding);
+      if (next !== recoveryGate) {
+        recoveryGate = next;
+        this.resetSyncTimer();
+        this.resetLoginRenewalTimer();
+      }
+    }));
 
     this.registerView(
       FILE_HISTORY_VIEW_TYPE,
@@ -79,7 +93,7 @@ export default class ObsidiSyncPlugin extends Plugin {
     this.addRibbonIcon("history", "Open file history", () => this.openFileHistoryView());
     this.setupMobileSyncIndicator();
     this.setupSyncOnClose();
-    void this.migrateLocalHistoryVersions();
+    if (!this.settings.conversionGate && !this.settings.disabledBinding) void this.migrateLocalHistoryVersions();
 
     this.addCommand({
       id: "sync-now",
@@ -136,7 +150,8 @@ export default class ObsidiSyncPlugin extends Plugin {
     this.resetSyncTimer();
     this.resetLoginRenewalTimer();
 
-    if (this.settings.syncOnStartup) {
+    if (this.settings.conversionGate) new Notice("Interrupted local conversion: open Settings > Conversion and recovery. Synchronization is stopped.", 10000);
+    if (this.settings.syncOnStartup && !this.settings.conversionGate && !this.settings.disabledBinding) {
       this.app.workspace.onLayoutReady(() => {
         window.setTimeout(() => {
           this.runCommand(() => this.syncNow());
@@ -159,6 +174,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const loaded = ((await this.loadData()) ?? {}) as Partial<IosGitSyncSettings> & { authToken?: string; vaultId?: string };
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    validateLifecycle(this.settings);
     if (this.settings.composite !== undefined) validateComposite(this.settings);
     this.settings.branch = DEFAULT_SETTINGS.branch;
     if (!this.settings.oidcAccessToken && loaded.authToken) {
@@ -167,6 +183,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    if (this.lifecycleSnapshotPending || this.lifecycleSaveUncertain || this.settings.conversionGate) throw new Error("Lifecycle save pending, gated or uncertain; reload the plugin before recovery");
+    this.settings.settingsRevision = (this.settings.settingsRevision ?? 0) + 1;
     // History/login/UI saves may overlap sync. Preserve journal ordering and snapshot each requested state.
     const snapshot = JSON.parse(JSON.stringify(this.settings)) as IosGitSyncSettings;
     const saved = this.settingsSave.catch(() => undefined).then(() => this.saveData(snapshot));
@@ -175,12 +193,26 @@ export default class ObsidiSyncPlugin extends Plugin {
     if (this.gitService) this.gitService.updateSettings(this.settings);
   }
 
+  private async saveLifecycleSnapshot(snapshot: IosGitSyncSettings): Promise<void> {
+    if (this.lifecycleSnapshotPending || this.lifecycleSaveUncertain) throw new Error("Lifecycle snapshot pending or uncertain; reload before recovery");
+    this.lifecycleSnapshotPending = true;
+    try {
+      const candidate = JSON.parse(JSON.stringify(snapshot)) as IosGitSyncSettings;
+      const saved = this.settingsSave.catch(() => undefined).then(() => this.saveData(candidate));
+      this.settingsSave = saved;
+      await saved;
+    } catch (error) { this.lifecycleSaveUncertain = true; throw error; }
+    finally { this.lifecycleSnapshotPending = false; }
+  }
+
   openShareSelectionModal(): void {
     if (this.gitService.hasComposite()) { this.openCompositeMountsModal(); return; }
     new ShareSelectionModal(this.app, this.gitService, this.settings).open();
   }
 
   openCompositeMountsModal(): void { new CompositeMountsModal(this.app, this.gitService).open(); }
+
+  openConversionModal(): void { new ConversionModal(this.app, this.gitService).open(); }
 
   openLoginModal(): void {
     new AuthLoginModal(this.app, this.gitService, async () => {
@@ -222,7 +254,8 @@ export default class ObsidiSyncPlugin extends Plugin {
       this.timer = null;
     }
 
-    if (!this.settings.syncIntervalMinutes || this.settings.syncIntervalMinutes < 1) return;
+    if (this.settings.conversionGate || (this.settings.disabledBinding && !this.settings.composite) ||
+        !this.settings.syncIntervalMinutes || this.settings.syncIntervalMinutes < 1) return;
 
     this.timer = window.setInterval(() => {
       this.runCommand(() => this.syncNow());
@@ -236,6 +269,7 @@ export default class ObsidiSyncPlugin extends Plugin {
       this.loginRenewalTimer = null;
     }
 
+    if (this.settings.conversionGate) return;
     const renew = () => {
       this.gitService.renewLoginIfNeeded().catch((error) => {
         console.error("ObsidiSync login renewal failed", error);

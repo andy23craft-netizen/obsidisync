@@ -49,6 +49,16 @@ import { assertFreshCompositeVault, assertMountAction, assertMountPrefixes, capt
   compositePathSupported, mountPathBlocked, pathKey, recordCompositeMove, resolveMount, validateComposite } from "./composite";
 import type { CompositeMount, MountActionToken } from "./composite";
 import { MountedVaultState } from "./mountedVaultState";
+import { LocalLifecycle, cloneSettings, lifecycleBlocker } from "./localLifecycle";
+import type { ConversionMapping } from "./localLifecycle";
+import type { CompositeState } from "./composite";
+
+export interface ConversionPreview {
+  configuration: string;
+  proposed: CompositeState;
+  mappings: ConversionMapping[];
+  exclusions: string[];
+}
 
 type SaveSettings = () => Promise<void>;
 interface ShareAction {
@@ -136,6 +146,9 @@ export interface LoginStatus {
 }
 
 export class GitService {
+  private lifecycleBusy = false;
+  private lifecycleUncertain = false;
+  private operationEpoch = 0;
   private compositeUnsavedMoves = new Map<string, number>();
   private running = false;
   private syncQueued = false;
@@ -152,11 +165,107 @@ export class GitService {
     private settings: IosGitSyncSettings,
     private readonly saveSettings: SaveSettings,
     private readonly onConflictNotice?: ConflictNoticeHandler,
-    private readonly syncBlocker?: SyncBlocker
+    private readonly syncBlocker?: SyncBlocker,
+    private readonly persistLifecycle?: (snapshot: IosGitSyncSettings) => Promise<void>
   ) { captureLegacyContext(this.settings); }
 
   destinationBlocker(): string | null {
+    if (this.lifecycleBusy || this.lifecycleUncertain) return "Local lifecycle operation active or save outcome uncertain; reload before recovery";
     return syncDestinationBlocker(this.settings);
+  }
+
+  lifecycleState(): IosGitSyncSettings { return cloneSettings(this.settings); }
+
+  private assertEngine(epoch = this.operationEpoch): void {
+    if (epoch !== this.operationEpoch) throw new Error("Binding operation invalidated; recovery evidence retained");
+    const blocked = this.lifecycleBusy || this.lifecycleUncertain
+      ? "Local lifecycle operation active or save outcome uncertain; reload before recovery" : lifecycleBlocker(this.settings);
+    // Ordinary composite routing has its own destination checks; lifecycle gates apply to every engine.
+    if (blocked) throw new Error(blocked);
+  }
+
+  private lifecycle(): LocalLifecycle {
+    if (!this.persistLifecycle) throw new Error("Atomic settings persistence is unavailable");
+    return new LocalLifecycle(this.vault, this.settings, async (snapshot) => {
+      try { await this.persistLifecycle!(snapshot); }
+      catch (error) { this.lifecycleUncertain = true; throw error; }
+    });
+  }
+
+  private async lifecycleOperation(operation: (lifecycle: LocalLifecycle) => Promise<void>): Promise<void> {
+    if (this.lifecycleBusy || this.lifecycleUncertain) throw new Error("Reload persisted settings before another lifecycle operation");
+    this.lifecycleBusy = true;
+    this.operationEpoch++;
+    this.selectionRevision++;
+    this.syncQueued = false;
+    try {
+      // Invalidate before waiting. A dispatched write may have committed, but cannot apply a late response.
+      if (this.running) await new Promise<void>((resolve) => {
+        const listener = (running: boolean) => { if (!running) { this.syncStateListeners.delete(listener); resolve(); } };
+        this.syncStateListeners.add(listener);
+      });
+      await operation(this.lifecycle());
+    } finally { this.lifecycleBusy = false; this.emitSyncState(); }
+  }
+
+  async detachBinding(mountId?: string): Promise<void> {
+    await this.lifecycleOperation(async (lifecycle) => {
+      await lifecycle.detach(mountId);
+      if (mountId) this.compositeUnsavedMoves.delete(mountId);
+    });
+  }
+
+  async recoverConversion(reverse = false): Promise<void> {
+    await this.lifecycleOperation(async (lifecycle) => reverse ? lifecycle.reverse() : lifecycle.activate());
+  }
+
+  async previewConversion(targets: Array<{ shareId: string; localPrefix: string }>,
+    mappings: Array<{ source: string; destination: string }>): Promise<ConversionPreview> {
+    if (this.lifecycleBusy || this.lifecycleUncertain || this.settings.conversionGate) throw new Error("Recover or reload first");
+    const shares = await this.discoverShares();
+    const identity = { ...this.settings.authenticatedIdentity! };
+    const config = await this.authConfig();
+    const authentication = config.type === "oidc" ? `oidc:${config.issuer}` : config.type;
+    const original = JSON.stringify(this.settings);
+    const mounts = this.settings.composite?.mounts ?? [];
+    assertMountPrefixes([...mounts, ...targets]);
+    const proposed: CompositeState = { version: 1, revision: (this.settings.composite?.revision ?? 0) + 1,
+      mounts: JSON.parse(JSON.stringify(mounts)), moves: JSON.parse(JSON.stringify(this.settings.composite?.moves ?? [])) };
+    for (const target of targets) {
+      const share = shares.find((entry) => entry.shareId === target.shareId);
+      if (!share) throw new Error("Share unavailable or inaccessible");
+      const state = await this.getJson<ShareSyncState>(`/v2/shares/${encodeURIComponent(target.shareId)}/sync-state`);
+      if (state.shareId !== target.shareId || state.apiVersion !== 2 || !["read", "read-write"].includes(state.capability)) throw new Error("Invalid target negotiation");
+      proposed.mounts.push({ ...share, capability: state.capability, serverUrl: identity.serverUrl, identity,
+        authentication, mountId: createClientId(), localPrefix: target.localPrefix, moveGeneration: 0,
+        initialized: false, status: "download-only", barriers: [], download: { observedHead: null, baseline: [],
+          reconciliation: [], initial: { backupFolder: "", appliedPaths: [], complete: false } } });
+    }
+    if (JSON.stringify(this.settings) !== original) throw new Error("Configuration changed during preview; retry");
+    const captured = await this.lifecycle().preview(proposed, mappings);
+    return { configuration: original, proposed, mappings: captured,
+      exclusions: this.vault.getFiles().map((file) => file.path).filter((path) => !captured.some((mapping) => mapping.source === path)) };
+  }
+
+  async convertBinding(preview: ConversionPreview): Promise<void> {
+    if (JSON.stringify(this.settings) !== preview.configuration) throw new Error("Configuration changed since preview; preview again");
+    // Read without acknowledging/clearing the original conflict state. Detachment is the explicit offline escape.
+    if (!this.settings.composite && !this.settings.disabledBinding && !this.settings.pendingShareSelection &&
+        (this.settings.activeShare || this.settings.initialSyncDone)) {
+      const root = this.settings.activeShare ? this.sharePath(this.settings.activeShare) : this.vaultPath();
+      const conflicts = await this.getJson<SyncConflict[]>(`${root}/conflicts?clientId=${encodeURIComponent(this.settings.clientId)}`);
+      if (!Array.isArray(conflicts) || conflicts.length) throw new Error("Recover original server conflicts first, or explicitly detach the binding");
+    }
+    await this.lifecycleOperation(async (lifecycle) => {
+      if (JSON.stringify(this.settings) !== preview.configuration) throw new Error("Configuration changed since preview; preview again");
+      const original = this.settings.activeShare ?? this.settings.pendingShareSelection;
+      if (original && (!original.download?.initial.complete || original.download.writing || original.download.applying ||
+          original.download.reconciliation.length || original.download.serverConflicts?.length)) {
+        throw new Error("Recover original binding journals and conflicts first, or explicitly detach it");
+      }
+      await lifecycle.plan(preview.proposed, preview.mappings);
+      await lifecycle.activate();
+    });
   }
 
   hasComposite(): boolean { return this.settings.composite !== undefined; }
@@ -175,7 +284,9 @@ export class GitService {
   }
 
   private mountGuard(token: MountActionToken): () => void {
+    const epoch = this.operationEpoch;
     return () => {
+      this.assertEngine(epoch);
       if (this.compositeUnsavedMoves.has(token.mountId)) throw new Error("Move barrier persistence failed; retry synchronization to save recovery evidence");
       assertMountAction(this.settings, token);
     };
@@ -227,8 +338,9 @@ export class GitService {
     allowedBarriers: Array<{ moveId: string; path: string }> = []): ShareAction {
     const mount = this.hasComposite() ? selected as CompositeMount : undefined;
     const token = mount ? captureMountAction(validateComposite(this.settings), mount) : undefined;
-    const guard = token ? this.mountGuard(token)
-      : () => this.assertShareContext(selected);
+    const epoch = this.operationEpoch;
+    const check = token ? this.mountGuard(token) : () => this.assertShareContext(selected);
+    const guard = () => { this.assertEngine(epoch); check(); };
     const canApply = (path: string) => !mount || !mount.barriers.some((barrier) =>
       (barrier.path === "" || path === barrier.path || path.startsWith(`${barrier.path}/`) || barrier.path.startsWith(`${path}/`)) &&
       !allowedBarriers.includes(barrier));
@@ -289,6 +401,7 @@ export class GitService {
 
   /** Post-mutation notification: invalidate synchronously, persist both endpoints before permitting more work. */
   async observeCompositeRename(from: string, to: string): Promise<void> {
+    this.assertEngine();
     if (!this.hasComposite()) return;
     const state = validateComposite(this.settings);
     if (!recordCompositeMove(state, from, to, createClientId())) return;
@@ -361,6 +474,7 @@ export class GitService {
       } catch (error) { errors.push(`Move evidence could not be saved: ${String(error)}`); }
     }
     for (const mount of mounts) {
+      this.assertEngine();
       if (!mount.initialized) continue; // Background work cannot supply initial replacement consent.
       try {
         if (mount.status === "writable") {
@@ -372,6 +486,7 @@ export class GitService {
         } else await this.attemptCompositeDownload(mount, false);
       }
       catch (error) {
+        if (this.lifecycleBusy || this.lifecycleUncertain) throw error;
         mount.lastError = error instanceof Error ? error.message : String(error);
         await this.saveSettings();
         errors.push(`${mount.label}: ${mount.lastError ?? String(error)}`);
@@ -416,6 +531,7 @@ export class GitService {
   }
 
   async stageShareSelection(shareId: string): Promise<void> {
+    this.assertEngine();
     if (this.hasComposite()) throw new Error("Use Composite mounts; legacy selection is disabled");
     if (this.running) throw new Error("Wait for synchronization to finish before selecting a share");
     if (this.settings.activeShare || this.settings.pendingShareSelection?.download) {
@@ -423,6 +539,7 @@ export class GitService {
     }
     const revision = ++this.selectionRevision;
     const shares = await this.discoverShares();
+    this.assertEngine();
     const share = shares.find((entry) => entry.shareId === shareId);
     if (!share) throw new Error("Share is unavailable or inaccessible");
     const identity = { ...this.settings.authenticatedIdentity! };
@@ -430,6 +547,7 @@ export class GitService {
     const config = await this.authConfig();
     if (!["password", "oidc", "token"].includes(config.type)) throw new Error("Invalid authentication configuration");
     const state = await this.getJson<ShareSyncState>(`/v2/shares/${encodeURIComponent(share.shareId)}/sync-state`);
+    this.assertEngine();
     if (this.running || revision !== this.selectionRevision || token !== this.settings.oidcAccessToken ||
         serverIdentity(this.settings.serverUrl) !== identity.serverUrl ||
         JSON.stringify(this.settings.authenticatedIdentity) !== JSON.stringify(identity) || this.settings.userSlug !== identity.user) {
@@ -449,6 +567,7 @@ export class GitService {
   }
 
   async cancelShareSelection(): Promise<void> {
+    this.assertEngine();
     if (this.running) throw new Error("Wait for synchronization to finish before cancelling a selection");
     if (this.settings.pendingShareSelection?.download) throw new Error("Initial download has started. Resume reconciliation; cancellation cannot safely restore v1 files.");
     ++this.selectionRevision;
@@ -1224,6 +1343,7 @@ export class GitService {
   }
 
   async renewLoginIfNeeded(): Promise<boolean> {
+    if (this.lifecycleBusy || this.lifecycleUncertain || this.settings.conversionGate) return false;
     if (!this.settings.oidcRefreshToken) return false;
 
     const expiresAt = this.settings.oidcAccessTokenExpiresAt ? Date.parse(this.settings.oidcAccessTokenExpiresAt) : NaN;
@@ -1240,6 +1360,7 @@ export class GitService {
   }
 
   async sync(): Promise<SyncConflict[]> {
+    this.assertEngine();
     if (this.running) {
       this.syncQueued = true;
       this.settings.syncStatus = "queued";
@@ -2028,6 +2149,7 @@ export class GitService {
 
   private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown,
       legacyCredential?: LegacyManagementContext, dispatchGuard?: () => void): Promise<RequestUrlResponse> {
+    const epoch = this.operationEpoch;
     const selected = path.startsWith("/v2/shares/") ? (this.hasComposite()
       ? this.compositeMounts().find((mount) => path.startsWith(`/v2/shares/${encodeURIComponent(mount.shareId)}/`))
       : this.settings.activeShare ?? this.settings.pendingShareSelection) : null;
@@ -2035,6 +2157,11 @@ export class GitService {
       ? captureMountAction(validateComposite(this.settings), selected as CompositeMount) : null;
     const legacyAccount = legacyCredential ? JSON.stringify([this.settings.userSlug, this.settings.authenticatedIdentity]) : null;
     const assertDestination = () => {
+      if (path.startsWith("/v1/users/") || path.startsWith("/v2/shares/")) {
+        if (epoch !== this.operationEpoch || this.lifecycleBusy || this.lifecycleUncertain || this.settings.conversionGate) {
+          throw new Error("Binding request invalidated by local lifecycle operation");
+        }
+      }
       dispatchGuard?.();
       if (path.startsWith("/v1/users/")) {
         if (legacyCredential) {
@@ -2133,6 +2260,7 @@ export class GitService {
   }
 
   private async exclusive<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    this.assertEngine();
     if (this.running) {
       new Notice("Git sync is already running");
       return undefined;

@@ -100,7 +100,7 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
   const state = settings.composite;
   const invalid = (): never => { throw new Error("Invalid composite state; synchronization stopped, no v1 fallback"); };
   if (!state || state.version !== 1 || !Number.isSafeInteger(state.revision) || state.revision < 1 ||
-      !Array.isArray(state.mounts) || !state.mounts.length || !Array.isArray(state.moves) ||
+      !Array.isArray(state.mounts) || (!state.mounts.length && !settings.bindingArchives?.entries.length) || !Array.isArray(state.moves) ||
       settings.activeShare || settings.pendingShareSelection) return invalid();
   if (state.mounts.some((mount) => !mount || typeof mount.localPrefix !== "string" || typeof mount.shareId !== "string") ||
       state.moves.some((move) => !move || typeof move.id !== "string" || !move.id ||

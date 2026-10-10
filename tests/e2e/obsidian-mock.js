@@ -37,6 +37,7 @@ class Vault {
     const abs = (p) => path.join(root, normalizePath(p));
     const toArrayBuffer = (buf) => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     this.adapter = {
+      getBasePath: () => this.root,
       list: async (p) => {
         const files = [], folders = [];
         for (const entry of fs.readdirSync(abs(p), { withFileTypes: true })) {
@@ -119,7 +120,7 @@ async function requestUrl(options) {
 class Generic {
   constructor() {}
 }
-const Platform = { isMobile: false, isDesktop: true, isIosApp: false, isAndroidApp: false, isMacOS: true };
+const Platform = { isMobile: false, isDesktop: true, isDesktopApp: true, isIosApp: false, isAndroidApp: false, isMacOS: true };
 
 module.exports = new Proxy(
   { Notice, notices, normalizePath, TFile, Vault, requestUrl, Platform, setIcon: () => {} },

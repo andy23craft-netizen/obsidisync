@@ -48,13 +48,15 @@ function device(name, overrides = {}) {
     historyVersions: [],
     ...overrides
   };
-  const service = new GitService(vault, settings, async () => {});
+  const settingsPath = path.join(SCRATCH, `${name}-settings.json`);
+  const persist = async (snapshot) => fs.writeFileSync(settingsPath, JSON.stringify(snapshot));
+  const service = new GitService(vault, settings, async () => persist(settings), undefined, undefined, persist);
   const write = (rel, text) => {
     fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
     fs.writeFileSync(path.join(dir, rel), text);
   };
   const read = (rel) => (fs.existsSync(path.join(dir, rel)) ? fs.readFileSync(path.join(dir, rel), "utf8") : null);
-  return { name, dir, vault, settings, service, write, read };
+  return { name, dir, vault, settings, service, write, read, persist, settingsPath };
 }
 
 function pending() {
@@ -126,7 +128,7 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js", "scenario-composite-writes.js"];
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js", "scenario-composite-writes.js", "scenario-conversion.js"];
   for (const scenario of scenarios) {
     let server = await startServer();
     const stop = async () => {

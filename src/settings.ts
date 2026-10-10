@@ -6,8 +6,15 @@ import type { ClientIdentity, LegacyManagementContext, LegacySyncBinding, Pendin
 import { syncDestinationBlocker } from "./shareSelection";
 import type { ActiveShare } from "./shareReconciliation";
 import type { CompositeState } from "./composite";
+import type { BindingArchive, ConversionJournal } from "./localLifecycle";
 
 export interface IosGitSyncSettings {
+  settingsRevision?: number;
+  conversion?: ConversionJournal;
+  conversionGate?: string;
+  conversionActivation?: { id: string; revision: number };
+  disabledBinding?: { archiveId: string };
+  bindingArchives?: { version: 1; entries: BindingArchive[] };
   composite?: CompositeState;
   authenticatedIdentity?: ClientIdentity;
   legacyManagementContext?: LegacyManagementContext;
@@ -159,6 +166,9 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Composite mounts")
       .setDesc("Independent share folders with safe downloads and separately enabled writes. Fresh setup needs a new empty vault; existing vaults require conversion. Composite history and credential management remain unavailable.")
       .addButton((button) => button.setButtonText("Manage mounts").onClick(() => this.plugin.openCompositeMountsModal()));
+    new Setting(containerEl).setName("Conversion and detachment")
+      .setDesc("Preview a journaled conversion, recover an interrupted conversion, or detach a binding while retaining files and unresolved evidence.")
+      .addButton((button) => button.setButtonText("Conversion and recovery").onClick(() => this.plugin.openConversionModal()));
 
     if (this.plugin.settings.pendingShareSelection) {
       new Setting(containerEl).setName("Pending share")

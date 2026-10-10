@@ -1,6 +1,7 @@
 import type { ManifestEntry, ShareEntry } from "./protocol";
 import type { IosGitSyncSettings } from "./settings";
 import type { ShareDownloadState } from "./shareReconciliation";
+import { lifecycleBlocker } from "./localLifecycle";
 
 export interface LegacyManagementContext {
   serverUrl: string;
@@ -35,6 +36,7 @@ export function serverIdentity(url: string): string {
 }
 
 export function captureLegacyContext(settings: IosGitSyncSettings): void {
+  if (lifecycleBlocker(settings)) return;
   if (settings.composite !== undefined || settings.activeShare || settings.pendingShareSelection) return;
   if (!settings.serverUrl || !settings.userSlug || !settings.vaultSlug) return;
   const context = {
@@ -49,6 +51,8 @@ export function captureLegacyContext(settings: IosGitSyncSettings): void {
 }
 
 export function syncDestinationBlocker(settings: IosGitSyncSettings): string | null {
+  const lifecycle = lifecycleBlocker(settings);
+  if (lifecycle) return lifecycle;
   if (settings.composite !== undefined) return "Composite mount mode is active; legacy file operations are disabled.";
   if (settings.activeShare) return "Share download mode is active. V2 write synchronization is not enabled; v1 state is retained.";
   if (settings.pendingShareSelection) {

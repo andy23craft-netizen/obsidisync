@@ -26,6 +26,11 @@ test("plugin source does not import desktop-only Node or Electron APIs", () => {
   for (const file of sourceFiles(join(root, "src"))) {
     const source = readFileSync(file, "utf8");
     for (const pattern of forbidden) {
+      // Conversion alone uses desktop filesystem inspection to reject symlinks. Mobile adapters never load it.
+      if (file.endsWith("localLifecycle.ts") && pattern.source.includes("require")) {
+        assert.match(source, /if \(Platform\.isDesktopApp && typeof adapter\.getBasePath === "function"\)/);
+        continue;
+      }
       assert.doesNotMatch(source, pattern, file + " matches " + pattern);
     }
   }
