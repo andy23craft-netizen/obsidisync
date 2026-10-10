@@ -2,7 +2,8 @@
 
 The plugin implements FEAT-10's fresh composite setup and scoped downloads and FEAT-11's explicitly writable mounts.
 FEAT-12 adds [journaled conversion, recovery and detachment](LOCAL_CONVERSION_AND_DETACHMENT.md).
-FEAT-13 adds [mount history and credentials](MOUNT_HISTORY_AND_CREDENTIALS.md). Explicit import remains FEAT-14 work.
+FEAT-13 adds [mount history and credentials](MOUNT_HISTORY_AND_CREDENTIALS.md).
+FEAT-14 adds [explicit cross-mount import and separate source-deletion consent](CROSS_MOUNT_IMPORT.md).
 Existing v1 and single selected-share workflows retain their previous behavior until explicitly converted/detached.
 This describes repository implementation and synthetic automated evidence, not desktop/mobile human acceptance
 or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md).
@@ -84,7 +85,7 @@ Back up and use remote restores the selected endpoint after a fresh target read 
 upload endpoint explicitly approves current contents, including local deletions, for that endpoint only. Conflicts,
 new edits, another covering move barrier or uncertain outcomes retain the move barrier. Overlapping move barriers
 can first use Keep local to retain preservation records. The other endpoint remains blocked until its own decision.
-This is reconciliation of an already detected move, not the FEAT-14 copy/import workflow.
+This endpoint reconciliation is also available separately from the explicit copy/import workflow.
 
 If saving a move barrier fails, affected mounts stop in memory and show a persistence error. Retry synchronization
 after fixing storage to save retained evidence before more work. Preserve settings/recovery copies and the moved

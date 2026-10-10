@@ -46,12 +46,14 @@ import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./
 import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported, sameFile } from "./shareReconciliation";
 import type { PendingShareSelection, LegacyManagementContext } from "./shareSelection";
 import { assertFreshCompositeVault, assertMountAction, assertMountPrefixes, captureMountAction,
-  compositePathSupported, mountPathBlocked, pathKey, recordCompositeMove, resolveMount, validateComposite } from "./composite";
+  compositePathSupported, mountDestination, mountPathBlocked, moveBarrierBlocks, pathKey, recordCompositeMove, resolveMount, validateComposite } from "./composite";
 import type { CompositeMount, MountActionToken } from "./composite";
 import { MountedVaultState } from "./mountedVaultState";
 import { LocalLifecycle, cloneSettings, lifecycleBlocker } from "./localLifecycle";
 import type { ConversionMapping } from "./localLifecycle";
 import type { CompositeState } from "./composite";
+import { CrossMountImport, importPathBlocked, validateImports } from "./crossMountImport";
+import type { ImportMapping, ImportRecord } from "./crossMountImport";
 
 export interface ConversionPreview {
   configuration: string;
@@ -71,7 +73,7 @@ export interface FileContext {
 }
 
 type SaveSettings = () => Promise<void>;
-interface ShareAction {
+export interface ShareAction {
   token?: MountActionToken;
   guard: () => void;
   save: SaveSettings;
@@ -187,6 +189,7 @@ export class GitService {
   lifecycleState(): IosGitSyncSettings { return cloneSettings(this.settings); }
 
   private assertEngine(epoch = this.operationEpoch): void {
+    validateImports(this.settings);
     if (epoch !== this.operationEpoch) throw new Error("Binding operation invalidated; recovery evidence retained");
     const blocked = this.lifecycleBusy || this.lifecycleUncertain
       ? "Local lifecycle operation active or save outcome uncertain; reload before recovery" : lifecycleBlocker(this.settings);
@@ -290,6 +293,7 @@ export class GitService {
     if (!this.hasComposite()) return this.localReconciliations().some((entry) => entry.path === path);
     const resolved = resolveMount(validateComposite(this.settings), path);
     return Boolean(resolved && (mountPathBlocked(resolved.mount, resolved.path) ||
+      importPathBlocked(this.settings, resolved.mount.mountId, resolved.path) ||
       resolved.mount.download.reconciliation.some((entry) => entry.path === resolved.path)));
   }
 
@@ -400,15 +404,14 @@ export class GitService {
 
   /** One captured authority for the entire operation, including preparation, transport retries and acknowledgement. */
   private shareAction(selected: PendingShareSelection | ActiveShare,
-    allowedBarriers: Array<{ moveId: string; path: string }> = []): ShareAction {
+    allowedBarriers: Array<{ moveId: string; path: string }> = [], importId?: string, replacedId?: string): ShareAction {
     const mount = this.hasComposite() ? selected as CompositeMount : undefined;
     const token = mount ? captureMountAction(validateComposite(this.settings), mount) : undefined;
     const epoch = this.operationEpoch;
     const check = token ? this.mountGuard(token) : () => this.assertShareContext(selected);
     const guard = () => { this.assertEngine(epoch); check(); };
-    const canApply = (path: string) => !mount || !mount.barriers.some((barrier) =>
-      (barrier.path === "" || path === barrier.path || path.startsWith(`${barrier.path}/`) || barrier.path.startsWith(`${path}/`)) &&
-      !allowedBarriers.includes(barrier));
+    const canApply = (path: string) => !mount || (!importPathBlocked(this.settings, mount.mountId, path, importId, replacedId) &&
+      !mount.barriers.some((barrier) => moveBarrierBlocks(barrier, path) && !allowedBarriers.includes(barrier)));
     const supported = mount ? compositePathSupported : sharePathSupported;
     return { token, guard, vault: this.vaultForShare(selected), supported, canApply,
       save: async () => { guard(); await this.saveSettings(); guard(); },
@@ -417,6 +420,116 @@ export class GitService {
         if (selected.capability !== "read-write" || selected.status !== "writable") throw new Error("Writable share access required");
         if (paths.some((path) => !supported(path) || !canApply(path))) throw new Error("Write blocked by mount path or move barrier");
       } };
+  }
+
+  private imports(): CrossMountImport {
+    return new CrossMountImport({ vault: this.vault, settings: this.settings,
+      save: async () => {
+        try { await this.saveSettings(); }
+        catch (error) { this.lifecycleUncertain = true; throw error; }
+      },
+      action: (mount, record) => this.importAction(mount, record),
+      negotiate: (mount, action) => this.negotiateShare(mount, action.guard),
+      snapshot: async (mount, action) => { const result = await this.shareSnapshot(mount); action.guard(); return result; },
+      conflicts: (mount, action) => this.readShareConflicts(mount, [], action),
+      recover: async (mount) => {
+        const action = this.shareAction(mount);
+        await this.negotiateShare(mount, action.guard);
+        if (mount.download.applying) await this.downloadSnapshot(mount, false, action);
+        await this.recoverShareWrite(mount, action);
+      },
+      submit: (mount, path, entry, bytes, head, record, beforeDispatch, conditional) =>
+        this.submitShareChanges(mount, [{ path, entry, bytes }], head, false,
+          this.importAction(mount, record), conditional ? "absent" : undefined, beforeDispatch)
+    });
+  }
+
+  private importAction(mount: CompositeMount, record?: ImportRecord): ShareAction {
+    const action = this.shareAction(mount, record?.moveId
+      ? mount.barriers.filter((barrier) => barrier.moveId === record.moveId) : [], record?.id, record?.replacesId);
+    if (!record) return action;
+    const selectedPath = (path: string) => record.files.some((file) =>
+      [file.source, file.destination].some((endpoint) => endpoint.token?.mountId === mount.mountId && endpoint.path === path));
+    const ordinary = this.shareAction(mount), permitted = action.canApply;
+    action.canApply = (path) => ordinary.canApply(path) || (selectedPath(path) && permitted(path));
+    const save = action.save;
+    action.save = async () => {
+      try { await save(); }
+      catch (error) { this.lifecycleUncertain = true; throw error; }
+    };
+    const write = action.write;
+    action.write = (paths) => {
+      if (paths.some((path) => !selectedPath(path))) {
+        throw new Error("Import approval covers only selected files");
+      }
+      write(paths);
+    };
+    return action;
+  }
+
+  importRecords(): ImportRecord[] {
+    this.assertEngine();
+    return JSON.parse(JSON.stringify(this.settings.imports?.entries ?? [])) as ImportRecord[];
+  }
+
+  async previewImport(mappings: ImportMapping[], moveId?: string, replacesId?: string): Promise<ImportRecord> {
+    const result = await this.exclusive(() => this.imports().preview(mappings, moveId, replacesId));
+    if (!result) throw new Error("Wait for synchronization before previewing an import");
+    return result;
+  }
+
+  async approveImport(preview: ImportRecord, replaceLocal = false): Promise<void> {
+    await this.exclusive(() => this.imports().approve(preview, replaceLocal));
+  }
+
+  async resumeImport(id: string): Promise<void> { await this.exclusive(() => this.imports().resume(id)); }
+  async deleteImportSources(id: string): Promise<void> { await this.exclusive(() => this.imports().deleteSources(id)); }
+
+  /** End an import without deleting anything, handing exact endpoints to ordinary explicit reconciliation. */
+  async preserveImportEndpoints(id: string): Promise<void> {
+    await this.exclusive(async () => {
+      const record = this.settings.imports?.entries.find((entry) => entry.id === id);
+      if (!record || record.closed ||
+          this.settings.imports?.entries.some((entry) => entry.replacesId === id)) {
+        throw new Error("Use the current import journal for preservation and outcome recovery");
+      }
+      const handled = new Set<string>();
+      for (const file of record.files) for (const endpoint of [file.source, file.destination, file.currentEndpoint]) {
+        if (!endpoint.token) continue;
+        const key = JSON.stringify([endpoint.token.mountId, endpoint.path]);
+        if (handled.has(key)) continue;
+        handled.add(key);
+        // This new preservation decision grants no disk/remote mutation. A later move/revision may have
+        // invalidated old import consent, but cannot prevent handing the original paths to reconciliation.
+        const mount = this.compositeMounts().find((entry) => entry.mountId === endpoint.token!.mountId);
+        if (!mount || mountDestination(mount) !== endpoint.token.destination) {
+          throw new Error("Original binding changed; retain archived import evidence and reconcile that binding explicitly");
+        }
+        const action = this.importAction(mount, record);
+        await this.negotiateShare(mount, action.guard);
+        if (mount.download.applying) await this.downloadSnapshot(mount, false, this.shareAction(mount));
+        await this.recoverShareWrite(mount, this.shareAction(mount));
+        const snapshot = await this.shareSnapshot(mount); action.guard();
+        if (!mount.download.reconciliation.some((entry) => entry.path === endpoint.path)) {
+          mount.download.reconciliation.push({ path: endpoint.path,
+            baseline: mount.download.baseline.find((entry) => entry.path === endpoint.path) ?? null,
+            remote: snapshot.files.find((entry) => entry.path === endpoint.path) ?? { path: endpoint.path, op: "delete" },
+            remoteHead: snapshot.serverHead, uploadBlocked: true,
+            reason: "Import ended without source-deletion approval; local bytes/deletions retained for explicit reconciliation" });
+        }
+        await action.save();
+      }
+      record.closed = true;
+      try { await this.saveSettings(); } catch (error) { this.lifecycleUncertain = true; throw error; }
+    });
+  }
+
+  detectedImportMoves(): Array<{ id: string; from: string; to: string; mappings: ImportMapping[] }> {
+    this.assertEngine();
+    return validateComposite(this.settings).moves.map((move) => ({ ...move,
+      mappings: this.vault.getFiles().filter((file) => (file.path === move.to || file.path.startsWith(`${move.to}/`)) &&
+        compositePathSupported(file.path)).map((file) => ({ source: `${move.from}${file.path.slice(move.to.length)}`,
+          current: file.path, destination: file.path })) }));
   }
 
   async addCompositeMount(shareId: string, localPrefix: string): Promise<void> {
@@ -457,10 +570,29 @@ export class GitService {
         authentication, mountId: createClientId(), localPrefix, moveGeneration: 0, initialized: false,
         status: "download-only", barriers: [], download: { observedHead: null, baseline: [], reconciliation: [],
           initial: { backupFolder: "", appliedPaths: [], complete: false } } };
-      this.settings.composite = { version: 1, revision: (priorRevision ?? 0) + 1,
+      this.settings.composite = { version: prior?.version ?? 1, revision: (priorRevision ?? 0) + 1,
         mounts: [...mounts, mount], moves: prior?.moves ?? [] };
       validateComposite(this.settings);
       await this.saveSettings();
+    });
+  }
+
+  /** Plugin-initiated renames cannot cross an authorization/storage boundary. */
+  async renameCompositePath(from: string, to: string): Promise<void> {
+    await this.exclusive(async () => {
+      const state = validateComposite(this.settings);
+      const source = resolveMount(state, from), destination = resolveMount(state, to);
+      if (!source || !destination || source.mount !== destination.mount) {
+        throw new Error("Cross-mount rename is unavailable; use explicit copy/import and separate source-deletion consent");
+      }
+      const action = this.shareAction(source.mount);
+      action.guard();
+      if (!action.canApply(source.path) || !action.canApply(destination.path)) throw new Error("Reconcile the path barrier first");
+      const file = this.vault.getAbstractFileByPath(from);
+      if (!file) throw new Error("Rename source is missing");
+      if (await this.vault.adapter.exists(to)) throw new Error("Rename destination already exists");
+      action.guard();
+      await this.vault.rename(file, to);
     });
   }
 
@@ -788,7 +920,7 @@ export class GitService {
     if (downgraded && selected.download) await new ShareReconciler(this.vaultForShare(selected), selected.download,
       async () => { guard(); await this.saveSettings(); guard(); }, guard,
       this.hasComposite() ? compositePathSupported : sharePathSupported,
-      (path) => !this.hasComposite() || !mountPathBlocked(selected as CompositeMount, path)).preserveLocalChanges();
+      (path) => !this.hasComposite() || this.shareAction(selected).canApply(path)).preserveLocalChanges();
   }
 
   private async requireShareWrite(selected: PendingShareSelection | ActiveShare, action = this.shareAction(selected)): Promise<void> {
@@ -796,9 +928,19 @@ export class GitService {
     if (selected.capability !== "read-write") throw new Error("Share is read-only; local edits and recovery state retained");
   }
 
-  private async shareWrite<T>(selected: PendingShareSelection | ActiveShare, path: string, body: unknown, action = this.shareAction(selected), paths: string[] = []): Promise<T> {
+  private async shareWrite<T>(selected: PendingShareSelection | ActiveShare, path: string, body: unknown,
+    action = this.shareAction(selected), paths: string[] = [], beforeDispatch?: () => Promise<void>): Promise<T> {
     await this.requireShareWrite(selected, action); action.write(paths);
-    try { return (await this.requestWithAuth("POST", `${this.sharePath(selected)}${path}`, body, undefined, () => action.write(paths))).json as T; }
+    const dispatchGuard = () => {
+      action.write(paths);
+      if ((body as SyncRequest)?.destinationCondition && !this.settings.serverFeatures.includes("nativeSyncConditionalCreate")) {
+        throw new Error("Server lacks nativeSyncConditionalCreate; no fallback");
+      }
+    };
+    dispatchGuard();
+    await beforeDispatch?.();
+    dispatchGuard();
+    try { return (await this.requestWithAuth("POST", `${this.sharePath(selected)}${path}`, body, undefined, dispatchGuard)).json as T; }
     catch (error) {
       if (error instanceof HttpStatusError && error.status === 403) {
         action.guard(); selected.capability = "read";
@@ -935,7 +1077,10 @@ export class GitService {
 
   private async submitShareChanges(selected: ActiveShare,
     captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }>, baseHead: string | null,
-    resolve = false, action = this.shareAction(selected)): Promise<void> {
+    resolve = false, action = this.shareAction(selected), destinationCondition?: "absent",
+    beforeDispatch?: () => Promise<void>): Promise<void> {
+    if (destinationCondition && (resolve || captured.length !== 1 || !captured[0].entry ||
+        !this.settings.serverFeatures.includes("nativeSyncConditionalCreate"))) throw new Error("Conditional import unavailable; no fallback");
     action.write(captured.map((file) => file.path));
     const state = selected.download;
     if (state.writing || state.applying) throw new Error("Recover interrupted work before writing");
@@ -954,6 +1099,7 @@ export class GitService {
     action.write(captured.map((file) => file.path));
     state.writing.stage = "submitted";
     await action.save();
+    action.write(captured.map((file) => file.path));
     const response = resolve
       ? await this.shareWrite<SyncResponse>(selected, "/resolve", {
         clientId: this.settings.clientId, deviceName: this.deviceName(), fileContent: this.fileContentMode(),
@@ -961,7 +1107,8 @@ export class GitService {
           : { path: change.path, uploadId: change.uploadId }) } satisfies ResolveRequest, action, captured.map((file) => file.path))
       : await this.shareWrite<SyncResponse>(selected, "/sync", {
         baseHead, clientId: this.settings.clientId, deviceName: this.deviceName(), changes,
-        clientManifest: state.baseline, fileContent: this.fileContentMode() } satisfies SyncRequest, action, captured.map((file) => file.path));
+        clientManifest: state.baseline, fileContent: this.fileContentMode(),
+        ...(destinationCondition ? { destinationCondition } : {}) } satisfies SyncRequest, action, captured.map((file) => file.path), beforeDispatch);
     action.write(captured.map((file) => file.path));
     if (!["ok", "conflict"].includes(response.status) || !Array.isArray(response.conflicts) ||
         !Array.isArray(response.files)) throw new Error("Invalid write response; journal retained");

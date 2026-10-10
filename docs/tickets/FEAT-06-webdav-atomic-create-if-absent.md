@@ -18,6 +18,10 @@ PUT currently supports a single exact quoted If-Match tag, repeats its check und
 writes unconditionally. If-None-Match is ignored. The production service already serializes v1/v2/DAV operations by
 opaque share ID; `for_share` preserves the shared lock map. Current PUT responses carry no revision receipt.
 
+Native v2 sync already supports [conditional destination creation](../../README.md#api). Its locked checks reuse
+`vault/dav.rs::stat_unlocked` for logical presence. Reuse that existing lookup and share lock for DAV enforcement;
+the native JSON condition does not implement PUT header handling, parent rules or DAV completion receipts.
+
 ## Scope
 
 - Enforce wildcard absence in every mounted DAV PUT path, including Nextcloud mounts, using the existing writer.

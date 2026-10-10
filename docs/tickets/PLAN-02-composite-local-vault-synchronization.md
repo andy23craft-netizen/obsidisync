@@ -1,6 +1,6 @@
 # PLAN-02: Composite Local Vault Synchronization
 
-**Status:** Explicit import remains; FEAT-15 is its server prerequisite
+**Status:** Explicit client import remains
 **Owner:** Obsidian plugin
 **Parent:** [FEAT-01](FEAT-01-multi-user-shares-and-composite-vault-sync.md)
 **Remaining implementation:** [FEAT-14](FEAT-14-explicit-cross-mount-import.md)
@@ -24,9 +24,10 @@ progress, current destination acceptance and separately confirmed source deletio
 the special handling of observed moves, local-only endpoints, read-only endpoints and protected/InkVault paths.
 Use existing action tokens, serialized settings saves, adapter guards and share sync journals.
 
-Implement [FEAT-15](FEAT-15-native-sync-conditional-create.md) before FEAT-14. It supplies server-enforced conditional
-native destination creation; FEAT-14 retains its collision-safety guarantee and owns client consumption. FEAT-06
-remains a separate DAV contract and is not a substitute or hard dependency.
+The [native conditional creation API](../../README.md#api) supplies server-enforced destination collision protection.
+FEAT-14 owns client consumption, capability gating and import recovery; it must not fall back to ordinary writes.
+FEAT-06 remains separate DAV work and is not a substitute or hard dependency. Runtime server capability must be
+checked independently of repository implementation and pending CI or deployment verification.
 
 ## Validation and Completion
 

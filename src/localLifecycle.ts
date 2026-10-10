@@ -7,6 +7,22 @@ import { sha256Hex, VaultState } from "./vaultState";
 import { createClientId } from "./runtime";
 import { MountedVaultState } from "./mountedVaultState";
 
+/** Reject filesystem links before conversion/import disk effects; mobile uses its vault adapter. */
+export async function assertRegularLocalPath(vault: Vault, path: string): Promise<void> {
+  assertSafeVaultPath(path);
+  const adapter = vault.adapter as typeof vault.adapter & { getBasePath?: () => string };
+  if (Platform.isDesktopApp && typeof adapter.getBasePath === "function") {
+    const fs = require("fs") as typeof import("fs");
+    const nodePath = require("path") as typeof import("path");
+    let current = adapter.getBasePath();
+    for (const part of path.split("/")) {
+      current = nodePath.join(current, part);
+      try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error("Symlink conversion/import is unsupported"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; break; }
+    }
+  }
+}
+
 export interface ConversionMapping { source: string; destination: string; sha256: string; size: number; destinationAbsent: true;
   intent?: "copy" | "remove-source" | "restore-source" | "remove-destination"; verified?: boolean }
 export interface ConversionJournal {
@@ -110,18 +126,7 @@ export class LocalLifecycle {
   }
 
   private async regular(path: string): Promise<void> {
-    assertSafeVaultPath(path);
-    const adapter = this.vault.adapter as typeof this.vault.adapter & { getBasePath?: () => string };
-    if (Platform.isDesktopApp && typeof adapter.getBasePath === "function") {
-      const fs = require("fs") as typeof import("fs");
-      const nodePath = require("path") as typeof import("path");
-      let current = adapter.getBasePath();
-      for (const part of path.split("/")) {
-        current = nodePath.join(current, part);
-        try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error("Symlink conversion is unsupported"); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; break; }
-      }
-    }
+    await assertRegularLocalPath(this.vault, path);
   }
 
   private async bytes(path: string): Promise<ArrayBuffer | null> {

@@ -19,9 +19,8 @@ detachment, mounted history and independent credentials. See [composite synchron
 ## Remaining Implementation
 
 Deliver explicit cross-mount copy/import with verified destination acceptance before separately confirmed source
-deletion, as specified by FEAT-14, after its [FEAT-15 server prerequisite](FEAT-15-native-sync-conditional-create.md).
-Preserve
-recoverable copies after partial failure, unchanged Markdown links, explicit attachment selection and independent
+deletion, as specified by FEAT-14, using the implemented [native conditional creation API](../../README.md#api).
+Preserve recoverable copies after partial failure, unchanged Markdown links, explicit attachment selection and independent
 mount recovery. Links grant no access and must not trigger copying inaccessible content.
 
 Keep private and shared content/history isolated by opaque share identity. Never infer authorization from labels

@@ -347,7 +347,9 @@ explicitly enabled writable synchronization. See [Composite mount synchronizatio
 for initialization, backups, conflicts, move endpoint reconciliation and recovery limits.
 [Existing-vault conversion and detachment](docs/LOCAL_CONVERSION_AND_DETACHMENT.md) provide verified local backups,
 journaled recovery and fresh reconciliation after re-add. [Mount history and credentials](docs/MOUNT_HISTORY_AND_CREDENTIALS.md)
-provide owned snapshots, guarded local restoration and explicit grant selection. Explicit import remains later work;
+provide owned snapshots, guarded local restoration and explicit grant selection.
+[Explicit cross-mount import](docs/CROSS_MOUNT_IMPORT.md) previews selected files, conditionally creates destinations,
+and verifies acceptance before separately confirmed source deletion;
 single-share and v1 remain available until explicitly converted or detached.
 
 Share selection, safe downloads and writable synchronization are implemented. Download initialization remains

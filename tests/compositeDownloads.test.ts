@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, webcrypto } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, renameSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, renameSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 const Module = require("node:module");
@@ -48,12 +48,13 @@ function fixture(t: any, writable = false) {
   let inline = false;
   let damagedBytes = false;
   let legacyHeader: string | undefined = "allowed";
+  let conditional = true;
   const respond = async (options: any) => {
     requests.push(options);
     await hook?.(options);
     const url = new URL(options.url);
     if (url.pathname === "/v1/server/info") return ok({ apiVersion: 1, minClientApiVersion: 1,
-      features: ["shareSyncV2", "syncFileReferences"], version: "fixture", name: "fixture" });
+      features: ["shareSyncV2", "syncFileReferences", ...(conditional ? ["nativeSyncConditionalCreate"] : [])], version: "fixture", name: "fixture" });
     if (url.pathname === "/v1/auth/session") return ok({ user: "andy", subject: "p_andy" });
     if (url.pathname === "/v1/auth/config") return ok({ type: "password", passwordConfigured: true });
     if (url.pathname === "/v2/shares") return ok(ids.map((id, i) =>
@@ -112,6 +113,11 @@ function fixture(t: any, writable = false) {
     if (writable && (url.pathname.endsWith("/sync") || url.pathname.endsWith("/resolve"))) {
       const body = JSON.parse(options.body);
       const changes = body.changes ?? body.files.map((file: any) => ({ ...file, op: file.delete ? "delete" : "upsert" }));
+      if (body.destinationCondition) {
+        assert.equal(body.destinationCondition, "absent"); assert.equal(changes.length, 1); assert.equal(changes[0].op, "upsert");
+        if (conflicts[index].some((file) => file.path === changes[0].path)) return { status: 409, json: {}, text: "reconcile" };
+        if (remotes[index][changes[0].path] !== undefined) return { status: 412, json: {}, text: "destination exists" };
+      }
       for (const change of changes) {
         if (change.op === "delete") delete remotes[index][change.path];
         else {
@@ -161,6 +167,7 @@ function fixture(t: any, writable = false) {
     afterHook: (value?: typeof afterHook) => { afterHook = value; },
     inline: () => { inline = true; }, corruptBytes: (value: boolean) => { damagedBytes = value; },
     legacyHeader: (value?: string) => { legacyHeader = value; },
+    conditional: (value: boolean) => { conditional = value; },
     saved: () => JSON.parse(readFileSync(settingsPath, "utf8"))
   };
 }
@@ -544,6 +551,415 @@ async function writableMounts(t: any, count = 2) {
   }
   return { f, mounts };
 }
+
+test("import copies only selected bytes/attachments, preserves links, and separately deletes sources", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/note.md", "[[private.md]] ![[image.bin]]"); f.write("Personal/private.md", "private");
+  const preview = await f.service().previewImport([
+    { source: "Personal/note.md", destination: "Harmony/import.md" },
+    { source: "Personal/image.bin", destination: "Harmony/image-copy.bin" }
+  ]);
+  assert.equal(preview.files.length, 2);
+  await f.service().approveImport(preview);
+  assert.equal(f.saved().composite.version, 2, "older writable clients must reject import-bearing state");
+  assert.equal(f.read("Harmony/import.md"), "[[private.md]] ![[image.bin]]");
+  assert.equal(f.remoteFiles(1)["private.md"], undefined);
+  assert.equal(f.read("Personal/note.md"), "[[private.md]] ![[image.bin]]");
+  const record = f.service().importRecords()[0];
+  assert.ok(record.files.every((file: any) => file.accepted && !file.deleteApproved && file.backupVerified));
+  assert.ok(f.service().hasLocalBarrier("Personal/note.md"));
+  for (const req of f.requests.filter((req) => req.url.endsWith("/sync"))) {
+    const body = JSON.parse(req.body);
+    if (body.changes.some((file: any) => ["import.md", "image-copy.bin"].includes(file.path))) assert.equal(body.destinationCondition, "absent");
+  }
+  await f.service().deleteImportSources(record.id);
+  assert.equal(f.read("Personal/note.md"), null); assert.equal(f.read("Personal/image.bin"), null);
+  assert.equal(f.remoteFiles(0)["image.bin"], undefined); assert.equal(f.remoteFiles(1)["image-copy.bin"], "binary base");
+  assert.ok(f.service().importRecords()[0].files.every((file: any) => file.deleted));
+  assert.equal(f.read(`${record.files[0].backupFolder}/Personal/note.md`), "[[private.md]] ![[image.bin]]");
+  assert.equal(mounts[0].download.writing, undefined);
+});
+
+test("import requires deployed conditional capability, rejects remote collisions and local overwrite without separate consent", async (t) => {
+  const { f } = await writableMounts(t);
+  f.conditional(false);
+  await assert.rejects(f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]), /nativeSyncConditionalCreate/);
+  f.conditional(true);
+  await assert.rejects(f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/same.md" }]), /collision/);
+  f.write("Harmony/new.md", "local collision");
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await assert.rejects(f.service().approveImport(preview), /separate/);
+  assert.equal(f.read("Harmony/new.md"), "local collision");
+  await f.service().approveImport(preview, true);
+  const record = f.service().importRecords()[0];
+  assert.equal(f.read(`${record.files[0].backupFolder}/Harmony/new.md`), "local collision");
+  assert.equal(f.read("Harmony/new.md"), "base 0");
+});
+
+test("competing destination creation returns 412, preserves both versions and never authorizes source deletion", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  f.hook(async (req) => {
+    if (req.url.includes(ids[1]) && req.url.endsWith("/sync") && JSON.parse(req.body).destinationCondition) {
+      f.remote(1, { ...f.remoteFiles(1), "new.md": "competitor" });
+    }
+  });
+  await assert.rejects(f.service().approveImport(preview), (error: any) => error.status === 412);
+  assert.equal(f.remoteFiles(1)["new.md"], "competitor"); assert.equal(f.read("Personal/same.md"), "base 0");
+  assert.equal(f.read("Harmony/new.md"), "base 0");
+  f.hook(); f.restart();
+  const record = f.service().importRecords()[0]; assert.ok(record.files[0].rejected);
+  await assert.rejects(f.service().resumeImport(record.id), /rejected/);
+  await assert.rejects(f.service().deleteImportSources(record.id), /Verify/);
+});
+
+test("lost conditional acceptance is recovered from exact contents without replaying uploads", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  f.afterHook(async (req) => {
+    if (req.url.endsWith("/sync") && JSON.parse(req.body).destinationCondition) throw new Error("lost response");
+  });
+  await assert.rejects(f.service().approveImport(preview), /lost response/);
+  const count = f.requests.filter((req) => req.url.endsWith("/uploads")).length;
+  f.afterHook(); f.restart();
+  await f.service().resumeImport(preview.id);
+  assert.ok(f.service().importRecords()[0].files[0].accepted);
+  assert.equal(f.requests.filter((req) => req.url.endsWith("/uploads")).length, count);
+  assert.equal(f.read("Personal/same.md"), "base 0");
+});
+
+test("detected folder move releases only selected destination file; source and siblings stay blocked", async (t) => {
+  const { f } = await writableMounts(t, 3);
+  f.remote(0, { ...f.remoteFiles(0), "folder/a.md": "A", "folder/b.md": "B" }); await f.service().sync();
+  await f.move("Personal/folder", "Harmony/folder");
+  const move = f.service().detectedImportMoves()[0];
+  assert.equal(move.mappings.length, 2);
+  const preview = await f.service().previewImport([move.mappings.find((mapping: any) => mapping.source.endsWith("a.md"))], move.id);
+  assert.equal(preview.files[0].sourceLocal, null);
+  await f.service().approveImport(preview);
+  assert.ok(!f.service().hasLocalBarrier("Harmony/folder/a.md"));
+  assert.ok(f.service().hasLocalBarrier("Harmony/folder/b.md")); assert.ok(f.service().hasLocalBarrier("Personal/folder/a.md"));
+  f.write("Third/unrelated.md", "independent"); await f.service().sync();
+  assert.equal(f.remoteFiles(2)["unrelated.md"], "independent"); assert.equal(f.remoteFiles(0)["folder/a.md"], "A");
+  assert.equal(f.remoteFiles(1)["folder/b.md"], undefined);
+  await f.service().deleteImportSources(preview.id);
+  assert.equal(f.remoteFiles(0)["folder/a.md"], undefined); assert.equal(f.remoteFiles(0)["folder/b.md"], "B");
+  assert.ok(f.service().hasLocalBarrier("Personal/folder/b.md"));
+});
+
+test("intervening bytes, move generations and permission changes stop import/deletion", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  let preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  f.write("Personal/same.md", "edit"); await assert.rejects(f.service().approveImport(preview), /changed/);
+  preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await f.service().approveImport(preview);
+  f.write("Personal/same.md", "newer edit");
+  await assert.rejects(f.service().deleteImportSources(preview.id), /differs|changed/);
+  assert.equal(f.read("Personal/same.md"), "newer edit");
+  mounts[1].moveGeneration++;
+  await assert.rejects(f.service().resumeImport(preview.id), /stale/);
+});
+
+test("local-only and read-only sources can copy; local-only/read-only destinations and protected paths cannot", async (t) => {
+  const { f } = await writableMounts(t);
+  f.write("Local/note.md", "local");
+  const preview = await f.service().previewImport([{ source: "Local/note.md", destination: "Harmony/local.md" }]);
+  await f.service().approveImport(preview); await f.service().deleteImportSources(preview.id);
+  assert.equal(f.read("Local/note.md"), null); assert.equal(f.remoteFiles(1)["local.md"], "local");
+  f.capabilities[0] = "read";
+  const readOnly = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/read-only-copy.md" }]);
+  await f.service().approveImport(readOnly);
+  await assert.rejects(f.service().deleteImportSources(readOnly.id), /Writable|read-only/);
+  assert.equal(f.read("Personal/same.md"), "base 0");
+  await assert.rejects(f.service().previewImport([{ source: "Personal/delete.md", destination: "Local/target.md" }]), /Local-only/);
+  f.capabilities[1] = "read";
+  await assert.rejects(f.service().previewImport([{ source: "Personal/delete.md", destination: "Harmony/readonly.md" }]), /Writable|read-only/);
+  for (const source of [".obsidian/config.json", "Personal/.inkvault/source", "Personal/.trash/note.md"]) {
+    await assert.rejects(f.service().previewImport([{ source, destination: "Harmony/protected.md" }]), /Protected/);
+  }
+});
+
+test("import save failure gates further writes and restart inspects actual bytes", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  let failed = false;
+  f.saveHook(async () => {
+    const file = f.settings().imports?.entries[0]?.files[0];
+    if (!failed && file?.copyIntent && !file.copied) { failed = true; throw new Error("disk save failed"); }
+  });
+  await assert.rejects(f.service().approveImport(preview), /save failed|uncertain/);
+  assert.equal(f.read("Personal/same.md"), "base 0");
+  await assert.rejects(f.service().resumeImport(preview.id), /uncertain/);
+  f.saveHook(); f.restart(); await f.service().resumeImport(preview.id);
+  assert.equal(f.read("Harmony/new.md"), "base 0");
+});
+
+test("plugin rename rejects cross-mount/root moves before disk changes and permits ordinary same-mount rename", async (t) => {
+  const { f } = await writableMounts(t);
+  for (const [from, to] of [["Personal/same.md", "Harmony/moved.md"], ["Personal", "Harmony/Personal"]]) {
+    await assert.rejects(f.service().renameCompositePath(from, to), /Cross-mount/);
+  }
+  assert.equal(f.read("Personal/same.md"), "base 0"); assert.equal(f.read("Harmony/moved.md"), null);
+  f.vault.rename = async (file: any, to: string) => f.move(file.path, to);
+  await f.service().renameCompositePath("Personal/same.md", "Personal/renamed.md");
+  assert.equal(f.settings().composite.moves.length, 0); await f.service().sync();
+  assert.equal(f.remoteFiles(0)["same.md"], undefined); assert.equal(f.remoteFiles(0)["renamed.md"], "base 0");
+});
+
+test("detected mount-root move recovers selected bytes without releasing whole-root barriers", async (t) => {
+  const { f } = await writableMounts(t);
+  await f.move("Personal", "Harmony/root");
+  const move = f.service().detectedImportMoves()[0];
+  const preview = await f.service().previewImport([move.mappings.find((entry: any) => entry.source === "Personal/same.md")], move.id);
+  await f.service().approveImport(preview);
+  assert.equal(f.remoteFiles(1)["root/same.md"], "base 0");
+  assert.ok(f.service().hasLocalBarrier("Personal/delete.md")); assert.ok(f.service().hasLocalBarrier("Harmony/root/delete.md"));
+  await f.service().deleteImportSources(preview.id);
+  assert.equal(f.remoteFiles(0)["same.md"], undefined); assert.equal(f.remoteFiles(0)["delete.md"], "delete me");
+});
+
+test("recapture requires new consent, retains old destination barriers and handles original binding generations", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  const first = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/old.md" }]);
+  f.afterHook(async (req) => {
+    if (req.url.endsWith("/sync") && JSON.parse(req.body).destinationCondition) throw new Error("lost");
+  });
+  await assert.rejects(f.service().approveImport(first), /lost/);
+  f.afterHook(); await f.service().resumeImport(first.id);
+  f.write("Personal/same.md", "new source"); mounts[0].moveGeneration++;
+  const next = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }], undefined, first.id);
+  assert.equal(f.remoteFiles(1)["new.md"], undefined);
+  await f.service().approveImport(next);
+  assert.equal(f.remoteFiles(1)["new.md"], "new source");
+  assert.equal(f.remoteFiles(1)["old.md"], "base 0");
+  await assert.rejects(f.service().resumeImport(first.id), /replaced/);
+  await assert.rejects(f.service().deleteImportSources(next.id), /differs/);
+  assert.equal(f.read("Personal/same.md"), "new source");
+});
+
+test("lost source-deletion response recovers without replay and newer local source prevents completion", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await f.service().approveImport(preview);
+  f.afterHook(async (req) => {
+    if (req.url.includes(ids[0]) && req.url.endsWith("/sync") && JSON.parse(req.body).changes.some((entry: any) => entry.op === "delete")) {
+      throw new Error("lost source deletion");
+    }
+  });
+  await assert.rejects(f.service().deleteImportSources(preview.id), /lost source/);
+  f.afterHook(); f.restart();
+  const deletes = () => f.requests.filter((req) => req.url.endsWith("/sync") && JSON.parse(req.body).changes.some((entry: any) => entry.op === "delete")).length;
+  const count = deletes(); await f.service().deleteImportSources(preview.id);
+  assert.equal(deletes(), count); assert.ok(f.service().importRecords()[0].files[0].deleted);
+});
+
+test("interrupted deletion followed by a move can hand retained evidence to explicit reconciliation without replay", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await f.service().approveImport(preview);
+  f.afterHook(async (req) => {
+    if (req.url.includes(ids[0]) && req.url.endsWith("/sync") && JSON.parse(req.body).changes.some((entry: any) => entry.op === "delete")) throw new Error("lost deletion");
+  });
+  await assert.rejects(f.service().deleteImportSources(preview.id), /lost/);
+  f.afterHook(); await f.move("Personal/delete.md", "Harmony/moved-other.md");
+  await f.service().preserveImportEndpoints(preview.id);
+  const record = f.service().importRecords()[0]; assert.ok(record.closed);
+  assert.equal(f.read(`${record.files[0].backupFolder}/Personal/same.md`), "base 0");
+  assert.ok(mounts[0].download.reconciliation.some((entry: any) => entry.path === "same.md"));
+  assert.equal(f.remoteFiles(1)["new.md"], "base 0"); assert.equal(f.remoteFiles(1)["moved-other.md"], undefined);
+  await assert.rejects(f.service().deleteImportSources(preview.id), /ended/);
+});
+
+test("edits and permission loss during staging invalidate consent before conditional commit", async (t) => {
+  for (const change of ["source", "destination", "move", "permission", "capability"]) {
+    await t.test(change, async (sub) => {
+      const { f } = await writableMounts(sub);
+      const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+      let changed = false;
+      f.afterHook(async (req) => {
+        if (!changed && req.url.includes(ids[1]) && req.url.endsWith("/chunk")) {
+          changed = true;
+          if (change === "source") f.write("Personal/same.md", "new source");
+          if (change === "destination") f.write("Harmony/new.md", "new destination");
+          if (change === "move") await f.move("Harmony/new.md", "Personal/moved.md");
+          if (change === "permission") f.capabilities[1] = "read";
+          if (change === "capability") f.conditional(false);
+        }
+      });
+      await assert.rejects(f.service().approveImport(preview));
+      assert.equal(f.remoteFiles(1)["new.md"], undefined);
+      assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+      assert.ok(f.read("Personal/same.md"));
+      assert.ok(!f.service().lifecycleState().imports.entries[0].files[0].deleteApproved);
+    });
+  }
+});
+
+test("network interruption at each upload boundary retains source and never replays consumed uploads", async (t) => {
+  for (const boundary of ["/uploads", "/chunk", "/complete"]) await t.test(boundary, async (sub) => {
+    const { f } = await writableMounts(sub);
+    const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+    f.afterHook(async (req) => { if (req.url.includes(ids[1]) && req.url.endsWith(boundary)) throw new Error("network interrupted"); });
+    await assert.rejects(f.service().approveImport(preview), /interrupted/);
+    assert.equal(f.remoteFiles(1)["new.md"], undefined); assert.equal(f.read("Personal/same.md"), "base 0");
+    const count = f.requests.filter((req) => req.url.endsWith("/uploads")).length;
+    f.afterHook(); f.restart(); await assert.rejects(f.service().resumeImport(preview.id), /Reconcile/);
+    assert.equal(f.requests.filter((req) => req.url.endsWith("/uploads")).length, count);
+    assert.equal(f.read("Personal/same.md"), "base 0");
+  });
+});
+
+test("save interruption at import/deletion intents is fail-closed and preserves verified recovery bytes", async (t) => {
+  for (const boundary of ["approval", "backup", "backupVerified", "copied", "submitted", "accepted", "localDeleteIntent", "localDeleted", "deleteSubmitted", "deleted"]) {
+    await t.test(boundary, async (sub) => {
+      const { f } = await writableMounts(sub);
+      const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+      const deletion = ["localDeleteIntent", "localDeleted", "deleteSubmitted", "deleted"].includes(boundary);
+      if (deletion) await f.service().approveImport(preview);
+      let failed = false;
+      f.saveHook(async () => {
+        const record = f.settings().imports?.entries[0], file = record?.files[0];
+        const hit = boundary === "approval" ? record?.approved : boundary === "backup" ? file?.backupFolder : file?.[boundary];
+        if (!failed && hit) { failed = true; throw new Error("injected save failure"); }
+      });
+      await assert.rejects(deletion ? f.service().deleteImportSources(preview.id) : f.service().approveImport(preview), /save failure/);
+      assert.ok(failed);
+      if (!deletion) assert.equal(f.read("Personal/same.md"), "base 0");
+      else assert.equal(f.read(`${f.settings().imports.entries[0].files[0].backupFolder}/Personal/same.md`), "base 0");
+      await assert.rejects(f.service().resumeImport(preview.id), /uncertain/);
+      f.saveHook(); f.restart();
+      try { await f.service().resumeImport(preview.id); } catch { /* Explicit reconciliation is a valid conservative outcome. */ }
+      assert.equal(f.remoteFiles(1)["new.md"] ?? f.read("Personal/same.md"), "base 0");
+    });
+  }
+});
+
+test("adapter corruption, path aliases and filesystem links stop import; mobile adapters need no Node filesystem", async (t) => {
+  const { f } = await writableMounts(t);
+  f.write("Personal/link-target.md", "linked");
+  symlinkSync(join(f.dir, "Personal/link-target.md"), join(f.dir, "Personal/link.md"));
+  await assert.rejects(f.service().previewImport([{ source: "Personal/link.md", destination: "Harmony/link.md" }]), /Symlink/);
+  f.write("Harmony/Case.md", "alias");
+  await assert.rejects(f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/case.md" }]), /aliases/);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/corrupt.md" }]);
+  const write = f.vault.adapter.writeBinary;
+  f.vault.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => write(path,
+    path === "Harmony/corrupt.md" ? new TextEncoder().encode("corrupt").buffer : bytes);
+  await assert.rejects(f.service().approveImport(preview), /verification/);
+  assert.equal(f.read("Personal/same.md"), "base 0"); assert.equal(f.remoteFiles(1)["corrupt.md"], undefined);
+  f.vault.adapter.writeBinary = write;
+  const desktop = mock.Platform.isDesktopApp;
+  try {
+    mock.Platform.isDesktopApp = false;
+    delete f.vault.adapter.getBasePath;
+    f.write("Local/mobile.md", "mobile adapter");
+    const mobile = await f.service().previewImport([{ source: "Local/mobile.md", destination: "Harmony/mobile.md" }]);
+    await f.service().approveImport(mobile);
+    assert.equal(f.read("Harmony/mobile.md"), "mobile adapter");
+  } finally { mock.Platform.isDesktopApp = desktop; }
+});
+
+test("ending an import preserves exact endpoints for standard reconciliation without approving source deletion", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await f.service().approveImport(preview);
+  await f.service().preserveImportEndpoints(preview.id);
+  assert.ok(f.service().importRecords()[0].closed);
+  assert.equal(f.read("Personal/same.md"), "base 0");
+  assert.ok(mounts[0].download.reconciliation.some((entry: any) => entry.path === "same.md"));
+  assert.ok(mounts[1].download.reconciliation.some((entry: any) => entry.path === "new.md"));
+  await assert.rejects(f.service().deleteImportSources(preview.id), /ended/);
+  await f.service().useRemoteReconciliation("same.md", mounts[0].mountId);
+  assert.ok(!mounts[0].download.reconciliation.some((entry: any) => entry.path === "same.md"));
+  assert.equal(f.read("Personal/same.md"), "base 0");
+});
+
+test("new move invalidates old import consent but explicit preservation still permits current endpoint reconciliation", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  let moved = false;
+  f.afterHook(async (req) => {
+    if (!moved && req.url.includes(ids[1]) && req.url.endsWith("/chunk")) {
+      moved = true; await f.move("Harmony/new.md", "Personal/moved.md");
+    }
+  });
+  await assert.rejects(f.service().approveImport(preview), /stale/);
+  f.afterHook(); await f.service().preserveImportEndpoints(preview.id);
+  assert.ok(f.service().importRecords()[0].closed);
+  assert.equal(f.read("Personal/moved.md"), "base 0"); assert.equal(f.read("Personal/same.md"), "base 0");
+  assert.ok(mounts[0].download.reconciliation.some((entry: any) => entry.path === "same.md"));
+  const move = f.service().detectedImportMoves()[0];
+  await f.service().reconcileCompositeMove(mounts[1].mountId, move.id, "new.md", "use-remote");
+  const next = await f.service().previewImport(move.mappings, move.id);
+  await f.service().approveImport(next);
+  assert.equal(f.remoteFiles(0)["moved.md"], "base 0"); assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+});
+
+test("destination edits/conflicts and binding changes invalidate separate deletion consent", async (t) => {
+  for (const change of ["local-destination", "remote-destination", "conflict", "identity", "revision", "binding"]) await t.test(change, async (sub) => {
+    const { f, mounts } = await writableMounts(sub);
+    const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+    await f.service().approveImport(preview);
+    if (change === "local-destination") f.write("Harmony/new.md", "new local destination");
+    if (change === "remote-destination") f.remote(1, { ...f.remoteFiles(1), "new.md": "new remote destination" });
+    if (change === "conflict") f.conflicts[1].push({ path: "new.md", reason: "conflict" });
+    if (change === "identity") f.settings().authenticatedIdentity.subject = "different";
+    if (change === "revision") f.settings().composite.revision++;
+    if (change === "binding") mounts[1].localPrefix = "Changed";
+    await assert.rejects(f.service().deleteImportSources(preview.id));
+    assert.equal(f.read("Personal/same.md"), "base 0"); assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  });
+});
+
+test("unknown/corrupt import journal schemas stop all dispatch without legacy fallback", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  await f.service().approveImport(preview);
+  const valid = JSON.parse(JSON.stringify(f.settings().imports));
+  for (const corrupt of [null, { version: 99, entries: [] }, { version: 1, entries: [{ ...valid.entries[0], files: [{}] }] }]) {
+    f.settings().imports = corrupt;
+    const count = f.requests.length; await assert.rejects(f.service().sync()); assert.equal(f.requests.length, count);
+  }
+  f.settings().imports = valid;
+  f.settings().composite.version = 1;
+  await assert.rejects(f.service().sync(), /Invalid composite/);
+  f.settings().composite.version = 2;
+});
+
+test("conditional 409 and divergent lost responses cannot verify acceptance or delete source", async (t) => {
+  for (const outcome of ["409", "diverged"]) await t.test(outcome, async (sub) => {
+    const { f } = await writableMounts(sub);
+    const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+    if (outcome === "409") f.hook(async (req) => {
+      if (req.url.endsWith("/sync") && JSON.parse(req.body).destinationCondition) f.conflicts[1].push({ path: "new.md", reason: "reconcile" });
+    });
+    else f.afterHook(async (req) => {
+      if (req.url.endsWith("/sync") && JSON.parse(req.body).destinationCondition) {
+        f.remote(1, { ...f.remoteFiles(1), "new.md": "later remote edit" }); throw new Error("lost response");
+      }
+    });
+    await assert.rejects(f.service().approveImport(preview));
+    f.hook(); f.afterHook(); f.restart();
+    await assert.rejects(f.service().resumeImport(preview.id));
+    await assert.rejects(f.service().deleteImportSources(preview.id), /Verify/);
+    assert.equal(f.read("Personal/same.md"), "base 0"); assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  });
+});
+
+test("restart after completed disk copy with a lost adapter response inspects bytes instead of overwriting", async (t) => {
+  const { f } = await writableMounts(t);
+  const preview = await f.service().previewImport([{ source: "Personal/same.md", destination: "Harmony/new.md" }]);
+  const write = f.vault.adapter.writeBinary;
+  let lost = false;
+  f.vault.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => {
+    await write(path, bytes);
+    if (!lost && path === "Harmony/new.md") { lost = true; throw new Error("lost adapter response"); }
+  };
+  await assert.rejects(f.service().approveImport(preview), /adapter/);
+  assert.equal(f.read("Harmony/new.md"), "base 0"); assert.equal(f.remoteFiles(1)["new.md"], undefined);
+  f.vault.adapter.writeBinary = write; f.restart(); await f.service().resumeImport(preview.id);
+  assert.ok(f.service().importRecords()[0].files[0].accepted); assert.equal(f.read("Personal/same.md"), "base 0");
+});
 
 test("writable mounts isolate text, deletion and binary capture and retain edits during transfer", async (t) => {
   const { f, mounts } = await writableMounts(t);

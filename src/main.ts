@@ -6,6 +6,7 @@ import { DevicePasswordsModal } from "./devicePasswordsModal";
 import { FILE_HISTORY_VIEW_TYPE, FileHistoryView, HistorySnapshotReference } from "./fileHistoryView";
 import { GitService, LoginStatus, type FileContext } from "./gitService";
 import { validateLifecycle } from "./localLifecycle";
+import { validateImports } from "./crossMountImport";
 import { InitialSyncModal } from "./initialSyncModal";
 import { OidcDeviceLoginModal } from "./oidcModal";
 import { ServerInfoResponse, SyncConflict } from "./protocol";
@@ -175,6 +176,7 @@ export default class ObsidiSyncPlugin extends Plugin {
     const loaded = ((await this.loadData()) ?? {}) as Partial<IosGitSyncSettings> & { authToken?: string; vaultId?: string };
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
     validateLifecycle(this.settings);
+    validateImports(this.settings);
     if (this.settings.composite !== undefined) validateComposite(this.settings);
     this.settings.branch = DEFAULT_SETTINGS.branch;
     if (!this.settings.oidcAccessToken && loaded.authToken) {

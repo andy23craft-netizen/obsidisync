@@ -1,6 +1,6 @@
 # FEAT-14: Explicit Cross-Mount Import
 
-**Status:** Design specified; implementation blocked on FEAT-15
+**Status:** Proposed client implementation; server prerequisite implemented
 **Owner:** Obsidian plugin
 **Parent:** [PLAN-02](PLAN-02-composite-local-vault-synchronization.md)
 
@@ -12,8 +12,9 @@ Detected local moves must use existing barriers rather than silently becoming de
 
 ## Dependencies
 
-- Hard, unimplemented: [FEAT-15](FEAT-15-native-sync-conditional-create.md) for atomic conditional destination creation
-  in native v2 sync. Collision safety is required; existing native merge/conflict behavior is not a substitute.
+- Hard, implemented: [native conditional destination creation](../../README.md#api) in v2 sync. Collision safety
+  remains required; existing native merge/conflict behavior is not a substitute. Require the bound server's
+  advertised capability at runtime; repository implementation does not establish deployment availability.
 - Hard, implemented: [FEAT-10/11](../COMPOSITE_MOUNT_DOWNLOADS.md) for mount setup, move records/generations,
   guarded writes, exact captured-evidence recovery and reconciliation release primitives.
 - FEAT-12/13 are not hard dependencies: use fresh active mounts and scoped sync acceptance, not history/credential UI.
@@ -29,7 +30,7 @@ Detected local moves must use existing barriers rather than silently becoming de
 - Use collision-safe copies with verified bytes. Existing destination collisions require separate confirmed backup/
   reconciliation; never silently overwrite. Fresh verified recovery copies protect local bytes where replacement is
   approved. An already moved file is evidence at its current location, not proof destination upload was approved.
-- Require fresh `nativeSyncConditionalCreate` capability evidence and use FEAT-15's `destinationCondition: "absent"`
+- Require fresh `nativeSyncConditionalCreate` capability evidence and use `destinationCondition: "absent"`
   for each destination creation. A missing capability stops import; never fall back to ordinary upsert/resolve or
   DAV. A `412` retains source/recovery evidence and requires collision reconciliation or a new absent destination.
   Import itself never replaces an existing remote destination; separate collision consent is not permission to
@@ -65,8 +66,11 @@ Add explicit import/recovery UI using FEAT-10 move records/resolver and FEAT-11 
 primitives. Persist import progress in versioned settings with attributable endpoint identity; reuse verified adapter
 capture/backup/application rather than inventing parallel sync logic. FEAT-12's vault conversion journal is a separate
 lifecycle: this ticket operates on active mounts and never activates a new composite configuration.
-Use FEAT-15 for per-file destination creation while retaining FEAT-11 journal/recovery ownership; no new server
-implementation belongs to this client ticket. Persist the conditional submission intent before network effects.
+Use the implemented native conditional API for per-file destination creation while retaining FEAT-11 journal/recovery
+ownership. Extend the TypeScript request contract and scoped submission helper to carry the condition; ordinary sync
+must retain its current behavior. Handle `412` as a collision and `409` as destination reconciliation required, without
+unconditional retry. No new server implementation belongs to this client ticket. Persist the conditional submission
+intent before network effects.
 
 ## Acceptance Criteria
 

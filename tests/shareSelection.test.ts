@@ -50,6 +50,7 @@ const { GitService, HttpStatusError } = require("../src/gitService");
 const { DEFAULT_SETTINGS, IosGitSyncSettingTab } = require("../src/settings");
 const { ShareSelectionModal } = require("../src/shareSelectionModal");
 const { CompositeMountsModal } = require("../src/compositeMountsModal");
+const { CrossMountImportModal } = require("../src/crossMountImportModal");
 const { ConversionModal } = require("../src/conversionModal");
 const { LocalReconciliationModal } = require("../src/localReconciliationModal");
 const { DevicePasswordsModal } = require("../src/devicePasswordsModal");
@@ -676,6 +677,38 @@ test("composite chooser separates mount selection from explicit per-mount downlo
   assert.equal(downloads, 1);
   assert.ok(buttons.some((button) => button.text === "Retry downloads"));
   assert.ok(buttons.some((button) => button.text === "Enable writes"));
+});
+
+test("import UI previews explicit mappings, names privacy implications and separately confirms source deletion", async () => {
+  buttons = []; textChanges = [];
+  let approved = 0, deleted = 0, consent = false;
+  const prompts: string[] = [];
+  const source = { localPath: "Personal/note.md", label: "Private (s_private)" };
+  const destination = { localPath: "Harmony/import.md", label: "Household (s_shared)" };
+  const entry = { path: source.localPath, sha256: "a".repeat(64), size: 42, mtime: 0 };
+  const record: any = { id: "import-preview", files: [{ source, destination, currentPath: source.localPath,
+    captured: entry, sourceLocal: entry, destinationLocal: null }] };
+  const records: any[] = [];
+  const service: any = {
+    detectedImportMoves: () => [], importRecords: () => records,
+    previewImport: async (mappings: any[]) => {
+      assert.deepEqual(mappings, [{ source: source.localPath, destination: destination.localPath }]); return record;
+    },
+    approveImport: async () => { approved++; record.files[0].accepted = true; records.push(record); },
+    deleteImportSources: async (id: string) => { assert.equal(id, record.id); deleted++; record.files[0].deleted = true; }
+  };
+  (globalThis as any).window = { confirm: (prompt: string) => { prompts.push(prompt); return consent; } };
+  const modal = new CrossMountImportModal({}, service); modal.onOpen();
+  assert.ok(!buttons.some((button) => button.text === "Separately confirm source deletion"));
+  textChanges.find((text) => text.name === "Explicit file mappings")!.change("Personal/note.md -> Harmony/import.md");
+  await buttons.find((button) => button.text === "Preview selected files")!.click();
+  await buttons.find((button) => button.text === "Approve copy/import only")!.click(); assert.equal(approved, 0);
+  consent = true; await buttons.find((button) => button.text === "Approve copy/import only")!.click();
+  assert.equal(approved, 1); assert.equal(deleted, 0);
+  assert.ok(prompts.some((prompt) => prompt.includes("members can read") && prompt.includes("no source deletion")));
+  consent = false; await buttons.find((button) => button.text === "Separately confirm source deletion")!.click(); assert.equal(deleted, 0);
+  consent = true; await buttons.find((button) => button.text === "Separately confirm source deletion")!.click(); assert.equal(deleted, 1);
+  assert.ok(prompts.some((prompt) => prompt.includes(source.label) && prompt.includes(source.localPath)));
 });
 
 test("composite write controls confirm a named mount and stale callbacks cannot approve it", async () => {

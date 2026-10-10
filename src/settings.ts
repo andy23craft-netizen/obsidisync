@@ -9,6 +9,7 @@ import type { CompositeState } from "./composite";
 import type { BindingArchive, ConversionJournal } from "./localLifecycle";
 
 export interface IosGitSyncSettings {
+  imports?: { version: 1; entries: import("./crossMountImport").ImportRecord[] };
   settingsRevision?: number;
   conversion?: ConversionJournal;
   conversionGate?: string;

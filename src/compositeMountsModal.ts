@@ -2,6 +2,7 @@ import { App, Modal, Setting } from "obsidian";
 import type { GitService } from "./gitService";
 import { LocalReconciliationModal } from "./localReconciliationModal";
 import { ConflictResolverModal } from "./conflictResolverModal";
+import { CrossMountImportModal } from "./crossMountImportModal";
 
 /** Selection and initial replacement consent are separate actions, per mount. */
 export class CompositeMountsModal extends Modal {
@@ -16,6 +17,9 @@ export class CompositeMountsModal extends Modal {
     const message = this.contentEl.createEl("p");
     try {
       const mounts = this.service.compositeMounts();
+      if (mounts.length) new Setting(this.contentEl).setName("Explicit cross-mount copy/import")
+        .setDesc("Preview selected notes and attachments or recover detected moves. Source deletion needs separate consent.")
+        .addButton((button) => button.setButtonText("Import and recovery").onClick(() => new CrossMountImportModal(this.app, this.service).open()));
       for (const mount of mounts) {
         const guard = this.service.compositeActionGuard(mount.mountId);
         const run = async (work: () => Promise<void>) => {

@@ -57,6 +57,7 @@ export interface RegisterResponse {
 }
 
 export interface SyncRequest {
+  destinationCondition?: "absent";
   baseHead: string | null;
   clientId: string;
   deviceName: string;

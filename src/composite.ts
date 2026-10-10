@@ -11,14 +11,14 @@ export interface CompositeMount extends ActiveShare {
   localPrefix: string;
   moveGeneration: number;
   initialized: boolean;
-  barriers: Array<{ moveId: string; path: string }>;
+  barriers: Array<{ moveId: string; path: string; releasedPaths?: string[] }>;
   status: "download-only" | "writable";
   lastAttemptAt?: string;
   lastError?: string;
 }
 
 export interface CompositeState {
-  version: 1;
+  version: 1 | 2;
   revision: number;
   mounts: CompositeMount[];
   moves: Array<{ id: string; from: string; to: string; mountIds: string[] }>;
@@ -92,14 +92,21 @@ export function assertMountAction(settings: IosGitSyncSettings, token: MountActi
 }
 
 export function mountPathBlocked(mount: CompositeMount, path: string): boolean {
-  return mount.barriers.some((barrier) => containsPath(barrier.path, path) || containsPath(path, barrier.path));
+  return mount.barriers.some((barrier) => moveBarrierBlocks(barrier, path));
+}
+
+/** A file decision never releases its siblings or a containing directory. */
+export function moveBarrierBlocks(barrier: CompositeMount["barriers"][number], path: string): boolean {
+  return !barrier.releasedPaths?.includes(path) &&
+    (containsPath(barrier.path, path) || containsPath(path, barrier.path));
 }
 
 /** Validate before dispatch, including persisted per-file ownership. Unknown schemas never become v1 defaults. */
 export function validateComposite(settings: IosGitSyncSettings): CompositeState {
   const state = settings.composite;
   const invalid = (): never => { throw new Error("Invalid composite state; synchronization stopped, no v1 fallback"); };
-  if (!state || state.version !== 1 || !Number.isSafeInteger(state.revision) || state.revision < 1 ||
+  if (!state || ![1, 2].includes(state.version) || !Number.isSafeInteger(state.revision) || state.revision < 1 ||
+      (state.version === 1 && settings.imports?.entries.some((entry) => entry.approved)) ||
       !Array.isArray(state.mounts) || (!state.mounts.length && !settings.bindingArchives?.entries.length) || !Array.isArray(state.moves) ||
       settings.activeShare || settings.pendingShareSelection) return invalid();
   if (state.mounts.some((mount) => !mount || typeof mount.localPrefix !== "string" || typeof mount.shareId !== "string") ||
@@ -190,6 +197,14 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
     for (const barrier of mount.barriers) {
       if (!barrier || typeof barrier.moveId !== "string") invalid();
       if (barrier.path !== "") assertSafeLocalPath(barrier.path);
+      if (barrier.releasedPaths !== undefined) {
+        if (state.version !== 2) invalid();
+        if (!Array.isArray(barrier.releasedPaths)) invalid();
+        for (const released of barrier.releasedPaths) {
+          path(released);
+          if (!containsPath(barrier.path, released)) invalid();
+        }
+      }
       if (!state.moves.some((move) => move.id === barrier.moveId && move.mountIds.includes(mount.mountId))) invalid();
     }
   }
