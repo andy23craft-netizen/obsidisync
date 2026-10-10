@@ -12,7 +12,7 @@ export interface CompositeMount extends ActiveShare {
   moveGeneration: number;
   initialized: boolean;
   barriers: Array<{ moveId: string; path: string }>;
-  status: "download-only";
+  status: "download-only" | "writable";
   lastAttemptAt?: string;
   lastError?: string;
 }
@@ -127,13 +127,18 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
   for (const mount of state.mounts) {
     if (!mount || typeof mount.mountId !== "string" || !mount.mountId || ids.has(mount.mountId) ||
         !Number.isSafeInteger(mount.moveGeneration) || mount.moveGeneration < 0 || typeof mount.initialized !== "boolean" ||
-        mount.status !== "download-only" || !["read", "read-write"].includes(mount.capability) ||
+        !["download-only", "writable"].includes(mount.status) || !["read", "read-write"].includes(mount.capability) ||
         typeof mount.label !== "string" || !mount.identity || typeof mount.identity.subject !== "string" ||
         !mount.identity.subject || typeof mount.identity.user !== "string" || !mount.identity.user ||
         typeof mount.serverUrl !== "string" || mount.serverUrl !== serverIdentity(mount.serverUrl) ||
         mount.identity.serverUrl !== mount.serverUrl || typeof mount.authentication !== "string" ||
         !Array.isArray(mount.barriers)) invalid();
     ids.add(mount.mountId);
+    const originalAction = (token: MountActionToken | undefined): void => {
+      if (!token || token.mountId !== mount.mountId || token.destination !== mountDestination(mount) ||
+          !Number.isSafeInteger(token.revision) || token.revision < 1 || token.revision > state.revision ||
+          !Number.isSafeInteger(token.moveGeneration) || token.moveGeneration < 0 || token.moveGeneration > mount.moveGeneration) invalid();
+    };
     const destination = JSON.stringify([mount.serverUrl, mount.identity, mount.authentication]);
     if (binding && binding !== destination) invalid();
     binding = destination;
@@ -142,7 +147,23 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
         !download.initial || typeof download.initial.complete !== "boolean" ||
         typeof download.initial.backupFolder !== "string" ||
         !Array.isArray(download.initial.appliedPaths) || !Array.isArray(download.reconciliation) ||
-        (download.serverConflicts !== undefined && !Array.isArray(download.serverConflicts)) || download.writing) invalid();
+        (download.serverConflicts !== undefined && !Array.isArray(download.serverConflicts))) invalid();
+    if (mount.status === "writable" && !mount.initialized) invalid();
+    if (download.writing) {
+      originalAction(download.writing.mountAction);
+      if (!["staging", "submitted", "accepted"].includes(download.writing.stage) ||
+          !Array.isArray(download.writing.entries) || !download.writing.entries.length) invalid();
+      const keys = new Set<string>();
+      for (const entry of download.writing.entries) {
+        path(entry?.path);
+        if (keys.has(pathKey(entry.path))) invalid();
+        keys.add(pathKey(entry.path));
+        if (entry.entry !== null) {
+          manifest([entry.entry]);
+          if (entry.entry.path !== entry.path) invalid();
+        }
+      }
+    }
     manifest(download.baseline);
     if (download.initial.backupManifest) manifest(download.initial.backupManifest);
     if (download.initial.backupFolder && !download.initial.backupFolder.startsWith(".obsidian-git-sync/backups/")) invalid();
@@ -156,6 +177,14 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
       if (record.remote.op === "upsert" && !/^[a-f0-9]{64}$/.test(record.remote.sha256)) invalid();
       if (record.baseline) manifest([record.baseline]);
       if (record.baseline && record.baseline.path !== record.path) invalid();
+      if (record.capturedWrite) {
+        originalAction(record.capturedWrite.mountAction);
+        if (!["staging", "submitted", "accepted"].includes(record.capturedWrite.stage)) invalid();
+        if (record.capturedWrite.entry !== null) {
+          manifest([record.capturedWrite.entry]);
+          if (record.capturedWrite.entry.path !== record.path) invalid();
+        }
+      }
     }
     for (const conflict of download.serverConflicts ?? []) path(conflict.path);
     for (const barrier of mount.barriers) {

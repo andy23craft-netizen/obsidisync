@@ -560,10 +560,11 @@ test("composite chooser separates mount selection from explicit per-mount downlo
   let downloads = 0;
   const service = {
     compositeMounts: () => mounts, discoverShares: async () => [share],
+    compositeActionGuard: () => () => {}, canWriteSelectedShare: () => false,
     addCompositeMount: async (shareId: string, localPrefix: string) => {
       assert.equal(shareId, share.shareId); assert.equal(localPrefix, "Personal");
       mounts = [{ ...share, localPrefix, mountId: "mount-1", initialized: false, barriers: [],
-        download: { reconciliation: [] } }];
+        status: "download-only", download: { reconciliation: [], initial: {} } }];
     },
     initializeCompositeMount: async (mountId: string) => {
       assert.equal(mountId, "mount-1"); downloads++; mounts[0].initialized = true;
@@ -580,7 +581,49 @@ test("composite chooser separates mount selection from explicit per-mount downlo
   await buttons.find((button) => button.text === "Back up and download")!.click();
   assert.equal(downloads, 1);
   assert.ok(buttons.some((button) => button.text === "Retry downloads"));
-  assert.ok(!buttons.some((button) => /upload|Enable writes/.test(button.text)));
+  assert.ok(buttons.some((button) => button.text === "Enable writes"));
+});
+
+test("composite write controls confirm a named mount and stale callbacks cannot approve it", async () => {
+  buttons = []; textChanges = [];
+  const mount: any = { ...share, mountId: "mount-A", localPrefix: "Personal", initialized: false,
+    status: "download-only", barriers: [], download: { reconciliation: [], initial: {} } };
+  let stale = false, uploaded = 0, enabled = 0;
+  const prompts: string[] = [];
+  let consent = false;
+  (globalThis as any).window = { confirm: (prompt: string) => { prompts.push(prompt); return consent; } };
+  const service: any = {
+    compositeMounts: () => [mount], discoverShares: async () => [], canWriteSelectedShare: () => false,
+    compositeActionGuard: () => () => { if (stale) throw new Error("stale modal"); },
+    initializeShareUpload: async (id: string) => { assert.equal(id, mount.mountId); uploaded++; },
+    enableShareWrites: async (id: string) => { assert.equal(id, mount.mountId); enabled++; }
+  };
+  const modal = new CompositeMountsModal({}, service); await modal.onOpen();
+  await buttons.find((button) => button.text === "Back up and replace share")!.click();
+  assert.equal(uploaded, 0); consent = true;
+  await buttons.find((button) => button.text === "Back up and replace share")!.click();
+  assert.equal(uploaded, 1); assert.match(prompts[0], /Personal/); assert.ok(prompts[0].includes(share.shareId));
+  assert.match(prompts[0], /deletion of remote-only files/);
+  mount.initialized = true; buttons = []; await modal.onOpen();
+  consent = false; await buttons.find((button) => button.text === "Enable writes")!.click(); assert.equal(enabled, 0);
+  consent = true; stale = true; await buttons.find((button) => button.text === "Enable writes")!.click(); assert.equal(enabled, 0);
+  stale = false; await buttons.find((button) => button.text === "Enable writes")!.click(); assert.equal(enabled, 1);
+});
+
+test("read-only composite mounts expose local reconciliation without upload or write-enable controls", async () => {
+  buttons = []; textChanges = [];
+  const service: any = {
+    compositeMounts: () => [{ ...share, capability: "read", mountId: "read-mount", localPrefix: "Harmony",
+      initialized: true, status: "download-only", barriers: [{ moveId: "move", path: "note.md" }],
+      download: { reconciliation: [], initial: {} } }],
+    compositeActionGuard: () => () => {}, compositeMoveDescription: () => "Personal/note.md -> Harmony/note.md",
+    discoverShares: async () => [], canWriteSelectedShare: () => false
+  };
+  await new CompositeMountsModal({}, service).onOpen();
+  assert.ok(buttons.some((button) => button.text === "Local reconciliation"));
+  assert.ok(buttons.some((button) => button.text === "Keep local (upload blocked)"));
+  assert.ok(buttons.some((button) => button.text === "Back up and use remote"));
+  assert.ok(!buttons.some((button) => /upload|Enable writes|replace share/i.test(button.text) && button.text !== "Keep local (upload blocked)"));
 });
 
 test("startup refuses corrupt composite settings before scheduling or falling back to v1", async () => {

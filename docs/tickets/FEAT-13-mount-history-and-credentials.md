@@ -11,8 +11,8 @@ route each action to its owning mount and distinguish identical relative filenam
 
 ## Dependencies
 
-- Hard: [FEAT-10](FEAT-10-scoped-mount-downloads.md) for resolver, ownership tokens and per-mount state;
-  [FEAT-11](FEAT-11-safe-writable-mount-sync.md) for mutable-stage guards and reconciliation UI integration.
+- Hard, implemented: [FEAT-10/11](../COMPOSITE_MOUNT_DOWNLOADS.md) for resolver, ownership tokens, per-mount state,
+  mutable-stage guards and reconciliation UI integration.
 - FEAT-12 conversion is not required: fresh mounts provide complete contexts. Coordinate shared settings/UI edits.
 - Preserve [FEAT-04 credential/history contracts](../CLIENT_SHARE_SELECTION.md) and existing v2 routes.
 

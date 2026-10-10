@@ -12,7 +12,7 @@ Detected local moves must use existing barriers rather than silently becoming de
 
 ## Dependencies
 
-- Hard: [FEAT-11](FEAT-11-safe-writable-mount-sync.md), transitively FEAT-10, for mount setup, move records/generations,
+- Hard, implemented: [FEAT-10/11](../COMPOSITE_MOUNT_DOWNLOADS.md) for mount setup, move records/generations,
   guarded writes, exact captured-evidence recovery and reconciliation release primitives.
 - FEAT-12/13 are not hard dependencies: use fresh active mounts and scoped sync acceptance, not history/credential UI.
 

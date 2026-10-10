@@ -23,7 +23,7 @@ const ids = ["s_" + "1".repeat(32), "s_" + "2".repeat(32), "s_" + "3".repeat(32)
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 const ok = (json: any) => ({ status: 200, json, text: "" });
 
-function fixture(t: any) {
+function fixture(t: any, writable = false) {
   const root = mkdtempSync(join(process.cwd(), ".tmp-tests", "mount-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = join(root, "vault"), settingsPath = join(root, "settings.json");
@@ -39,9 +39,13 @@ function fixture(t: any) {
   const denied = new Set<number>();
   const requests: any[] = [];
   let hook: ((options: any) => Promise<void>) | undefined;
+  let afterHook: ((options: any) => Promise<void>) | undefined;
+  const uploads = new Map<string, { index: number; path: string; sha256: string; bytes: Buffer }>();
+  let uploadSequence = 0;
+  const conflicts: any[][] = ids.map(() => []);
   let inline = false;
   let damagedBytes = false;
-  responder = async (options: any) => {
+  const respond = async (options: any) => {
     requests.push(options);
     await hook?.(options);
     const url = new URL(options.url);
@@ -56,6 +60,42 @@ function fixture(t: any) {
     if (denied.has(index)) return { status: 404, json: {}, text: "not found" };
     if (url.pathname.endsWith("/sync-state")) return ok({ shareId: ids[index], apiVersion: 2,
       capability: capabilities[index], serverHead: heads[index] });
+    if (writable && url.pathname.endsWith("/conflicts")) return ok(conflicts[index]);
+    if (writable && url.pathname.includes("/uploads")) {
+      const body = JSON.parse(options.body);
+      if (url.pathname.endsWith("/uploads")) {
+        const uploadId = `upload-${uploadSequence++}`;
+        uploads.set(uploadId, { index, path: body.path, sha256: body.sha256, bytes: Buffer.alloc(0) });
+        return ok({ uploadId, chunkSize: 3 });
+      }
+      const uploadId = url.pathname.split("/")[5];
+      const upload = uploads.get(uploadId)!;
+      assert.equal(upload.index, index);
+      if (url.pathname.endsWith("/chunk")) {
+        assert.equal(body.offset, upload.bytes.length);
+        upload.bytes = Buffer.concat([upload.bytes, Buffer.from(body.contentBase64, "base64")]);
+        return ok({ received: upload.bytes.length });
+      }
+      assert.equal(sha(upload.bytes), upload.sha256);
+      return ok({ uploadId, sha256: upload.sha256, size: upload.bytes.length });
+    }
+    if (writable && (url.pathname.endsWith("/sync") || url.pathname.endsWith("/resolve"))) {
+      const body = JSON.parse(options.body);
+      const changes = body.changes ?? body.files.map((file: any) => ({ ...file, op: file.delete ? "delete" : "upsert" }));
+      for (const change of changes) {
+        if (change.op === "delete") delete remotes[index][change.path];
+        else {
+          const upload = uploads.get(change.uploadId)!;
+          assert.equal(upload.index, index); assert.equal(upload.path, change.path);
+          remotes[index][change.path] = upload.bytes;
+          uploads.delete(change.uploadId);
+        }
+      }
+      if (changes.length) heads[index] += "-commit";
+      if (body.files) conflicts[index] = conflicts[index].filter((file) => !changes.some((change: any) => change.path === file.path));
+      return ok({ status: "ok", conflicts: [], serverHead: heads[index], files: Object.entries(remotes[index]).map(([path, bytes]) =>
+        ({ path, op: "upsert", sha256: sha(bytes), size: Buffer.byteLength(bytes) })) });
+    }
     if (url.pathname.endsWith("/sync")) {
       const body = JSON.parse(options.body);
       assert.deepEqual(body.changes, []); assert.deepEqual(body.clientManifest, []); assert.equal(body.baseHead, null);
@@ -71,13 +111,15 @@ function fixture(t: any) {
     }
     throw new Error(`Mutation/unexpected route ${options.method} ${url.pathname}`);
   };
+  responder = async (options: any) => { const response = await respond(options); await afterHook?.(options); return response; };
   const write = (path: string, bytes: string | Buffer) => {
     mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), bytes);
   };
   return {
     dir, vault, requests, settings: () => settings, service: () => service,
     remote: (index: number, files: Record<string, string | Buffer>) => { remotes[index] = files; heads[index] += "-next"; },
-    capabilities, denied, write,
+    capabilities, denied, conflicts, write,
+    remoteFiles: (index: number) => Object.fromEntries(Object.entries(remotes[index]).map(([path, bytes]) => [path, Buffer.from(bytes).toString("utf8")])),
     read: (path: string) => existsSync(join(dir, path)) ? readFileSync(join(dir, path), "utf8") : null,
     move: async (from: string, to: string) => { mkdirSync(dirname(join(dir, to)), { recursive: true });
       renameSync(join(dir, from), join(dir, to)); await service.observeCompositeRename(from, to); },
@@ -86,6 +128,7 @@ function fixture(t: any) {
     initialize: async (mount: any) => service.initializeCompositeMount(mount.mountId),
     restart: () => { settings = JSON.parse(readFileSync(settingsPath, "utf8")); service = new GitService(vault, settings, save); },
     hook: (value?: typeof hook) => { hook = value; }, saveHook: (value?: typeof saveHook) => { saveHook = value; },
+    afterHook: (value?: typeof afterHook) => { afterHook = value; },
     inline: () => { inline = true; }, corruptBytes: (value: boolean) => { damagedBytes = value; },
     saved: () => JSON.parse(readFileSync(settingsPath, "utf8"))
   };
@@ -293,4 +336,313 @@ test("identity/configuration changes and corrupt composite schemas cannot fall b
     await assert.rejects(f.service().sync(), /Invalid composite/); f.settings().composite = previous;
   }
   assert.ok(!f.requests.some((req) => req.url.includes("/v1/users/")));
+});
+
+async function writableMounts(t: any, count = 2) {
+  const f = fixture(t, true);
+  const mounts = [];
+  for (let i = 0; i < count; i++) {
+    f.remote(i, { "same.md": `base ${i}`, "delete.md": "delete me", "image.bin": "binary base" });
+    const mount = await f.add(i, ["Personal", "Harmony", "Third"][i]);
+    await f.initialize(mount); await f.service().enableShareWrites(mount.mountId); mounts.push(mount);
+  }
+  return { f, mounts };
+}
+
+test("writable mounts isolate text, deletion and binary capture and retain edits during transfer", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "personal edit"); f.write("Harmony/same.md", "shared edit");
+  f.write("Personal/image.bin", Buffer.from([0, 1, 255]));
+  rmSync(join(f.dir, "Harmony/delete.md")); f.write("local-only.md", "never uploaded");
+  let edited = false;
+  let stagingSame = false;
+  f.hook(async (options) => {
+    if (options.url.includes(ids[0]) && options.url.endsWith("/uploads")) stagingSame = JSON.parse(options.body).path === "same.md";
+    if (!edited && stagingSame && options.url.includes(`${ids[0]}/uploads/`) && options.url.endsWith("/chunk")) {
+      edited = true; f.write("Personal/same.md", "new edit during transfer");
+    }
+  });
+  await f.service().sync();
+  assert.equal(f.remoteFiles(0)["same.md"], "personal edit");
+  assert.equal(f.remoteFiles(1)["same.md"], "shared edit");
+  assert.equal(f.remoteFiles(1)["delete.md"], undefined);
+  assert.equal(f.remoteFiles(0)["image.bin"], Buffer.from([0, 1, 255]).toString("utf8"));
+  assert.equal(f.read("Personal/same.md"), "new edit during transfer");
+  assert.ok(mounts[0].download.reconciliation.some((file: any) => file.path === "same.md"));
+  assert.ok(mounts.every((mount: any) => mount.download.baseline.every((file: any) => !file.path.includes("Personal/") && !file.path.includes("Harmony/"))));
+  assert.ok(!Object.keys(f.remoteFiles(0)).includes("local-only.md"));
+});
+
+test("initial mount upload replaces only the named share including remote-only deletion", async (t) => {
+  const f = fixture(t, true);
+  f.remote(0, { "old.md": "remote only", "same.md": "remote" }); f.remote(1, { "keep.md": "sibling" });
+  const a = await f.add(0, "Personal"), b = await f.add(1, "Harmony");
+  f.write("Personal/same.md", "initial local"); f.write("Personal/pic.bin", "binary");
+  f.write("Harmony/untouched.md", "local sibling");
+  await f.service().initializeShareUpload(a.mountId);
+  assert.deepEqual(f.remoteFiles(0), { "same.md": "initial local", "pic.bin": "binary" });
+  assert.deepEqual(f.remoteFiles(1), { "keep.md": "sibling" }); assert.equal(b.initialized, false);
+  assert.equal(f.read("Harmony/untouched.md"), "local sibling");
+  assert.equal(a.status, "writable"); assert.equal(a.download.initial.backupManifest.length, 2);
+  await assert.rejects(f.service().initializeShareUpload(a.mountId), /cannot be repeated/);
+});
+
+for (const stage of ["/uploads", "/chunk", "/complete", "/sync"]) {
+  test(`move after dispatch at ${stage} retains original journal; current recovery keeps barriers and third mount works`, async (t) => {
+    const { f, mounts } = await writableMounts(t, 3);
+    f.write("Personal/same.md", "captured private bytes"); f.write("Third/same.md", "third edit");
+    let moved = false;
+    f.afterHook(async (options) => {
+      if (moved || !options.url.includes(ids[0]) || !options.url.endsWith(stage)) return;
+      if (stage === "/sync" && !JSON.parse(options.body).changes.length) return;
+      moved = true; await f.move("Personal/same.md", "Harmony/moved.md");
+    });
+    await assert.rejects(f.service().sync(), /stale/);
+    assert.ok(moved);
+    const journal = mounts[0].download.writing;
+    assert.equal(journal.entries[0].entry.sha256, sha("captured private bytes"));
+    assert.equal(journal.stage, stage === "/sync" ? "submitted" : "staging");
+    assert.equal(journal.mountAction.mountId, mounts[0].mountId);
+    assert.equal(journal.mountAction.moveGeneration, 0);
+    assert.equal(mounts[0].download.baseline.find((file: any) => file.path === "same.md").sha256, sha("base 0"));
+    assert.equal(f.remoteFiles(2)["same.md"], "third edit");
+    assert.equal(f.remoteFiles(1)["moved.md"], undefined);
+    f.afterHook(); f.restart();
+    await f.service().sync();
+    const recovered = f.settings().composite.mounts[0];
+    assert.ok(recovered.barriers.length); assert.ok(f.settings().composite.mounts[1].barriers.length);
+    assert.equal(recovered.download.writing, undefined);
+    if (stage === "/sync") assert.equal(recovered.download.baseline.find((file: any) => file.path === "same.md").sha256, sha("captured private bytes"));
+    else {
+      const original = recovered.download.reconciliation.find((file: any) => file.path === "same.md").capturedWrite;
+      assert.equal(original.stage, "staging"); assert.equal(original.mountAction.moveGeneration, 0);
+    }
+    assert.equal(f.remoteFiles(0)["same.md"], stage === "/sync" ? "captured private bytes" : "base 0");
+    assert.equal(f.remoteFiles(1)["moved.md"], undefined);
+  });
+}
+
+test("move during write-journal save stops upload initialization before dispatch", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "private staged");
+  let moved = false;
+  const before = f.requests.length;
+  f.saveHook(async () => {
+    if (!moved && mounts[0].download.writing?.stage === "staging") {
+      moved = true; await f.move("Personal/same.md", "Harmony/moved.md");
+    }
+  });
+  await assert.rejects(f.service().sync(), /stale/);
+  assert.ok(!f.requests.slice(before).some((request) => request.url.includes("/uploads")));
+  assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+});
+
+test("lost write response recovers exact captures without replaying upload IDs; divergence preserves evidence", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "lost accepted");
+  let lost = false;
+  f.afterHook(async (options) => {
+    if (!lost && options.url.includes(ids[0]) && options.url.endsWith("/sync") && JSON.parse(options.body).changes.length) {
+      lost = true; throw new Error("synthetic lost response");
+    }
+  });
+  await assert.rejects(f.service().sync(), /lost response/);
+  assert.equal(mounts[0].download.writing.stage, "submitted");
+  const count = f.requests.filter((request) => request.url.endsWith("/uploads")).length;
+  f.afterHook(); f.restart(); await f.service().sync();
+  assert.equal(f.requests.filter((request) => request.url.endsWith("/uploads")).length, count);
+  assert.equal(f.settings().composite.mounts[0].download.writing, undefined);
+  f.write("Personal/same.md", "uncertain capture"); lost = false;
+  f.afterHook(async (options) => {
+    if (!lost && options.url.includes(ids[0]) && options.url.endsWith("/sync") && JSON.parse(options.body).changes.length) {
+      lost = true; f.remote(0, { "same.md": "another writer" }); throw new Error("lost divergent");
+    }
+  });
+  await assert.rejects(f.service().sync(), /lost divergent/); f.afterHook(); f.restart();
+  await f.service().sync();
+  const record = f.settings().composite.mounts[0].download.reconciliation.find((file: any) => file.path === "same.md");
+  assert.equal(record.capturedWrite.entry.sha256, sha("uncertain capture"));
+  assert.equal(record.capturedWrite.stage, "submitted"); assert.equal(f.read("Personal/same.md"), "uncertain capture");
+});
+
+test("downgrade during chunks stops writes and restoration never uploads retained edits implicitly", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "retained private edit"); f.write("Harmony/same.md", "sibling write");
+  let changed = false;
+  f.afterHook(async (options) => {
+    if (!changed && options.url.includes(ids[0]) && options.url.endsWith("/chunk")) { changed = true; f.capabilities[0] = "read"; }
+  });
+  await assert.rejects(f.service().sync(), /read-only/);
+  assert.equal(f.remoteFiles(0)["same.md"], "base 0"); assert.equal(f.remoteFiles(1)["same.md"], "sibling write");
+  f.afterHook(); f.capabilities[0] = "read-write"; f.restart(); await f.service().sync();
+  assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  const mount = f.settings().composite.mounts[0];
+  await f.service().keepLocalReconciliation("same.md", mount.mountId); await f.service().sync();
+  assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  await f.service().uploadLocalReconciliation("same.md", mount.mountId);
+  assert.equal(f.remoteFiles(0)["same.md"], "retained private edit");
+  assert.equal(mount.download.reconciliation.length, 0);
+});
+
+test("explicit move endpoint reconciliation releases only that endpoint and Keep local retains upload consent barrier", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  await f.move("Personal/same.md", "Harmony/moved.md");
+  const move = f.settings().composite.moves[0];
+  await f.service().reconcileCompositeMove(mounts[1].mountId, move.id, "moved.md", "keep-local");
+  assert.equal(mounts[1].barriers.length, 0); assert.equal(mounts[0].barriers.length, 1);
+  await f.service().sync(); assert.equal(f.remoteFiles(1)["moved.md"], undefined);
+  assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  await f.service().uploadLocalReconciliation("moved.md", mounts[1].mountId);
+  assert.equal(f.remoteFiles(1)["moved.md"], "base 0"); assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+  await f.service().reconcileCompositeMove(mounts[0].mountId, move.id, "same.md", "use-remote");
+  assert.equal(f.read("Personal/same.md"), "base 0"); assert.equal(f.settings().composite.moves.length, 0);
+});
+
+test("per-mount server resolution captures binary bytes and does not alter sibling baselines", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.conflicts[0] = [{ path: "image.bin", reason: "binary conflict" }];
+  f.write("Personal/image.bin", "local binary choice");
+  const sibling = JSON.stringify(mounts[1].download);
+  await f.service().resolveConflicts([{ path: "image.bin", kind: "current" }], mounts[0].mountId);
+  assert.equal(f.remoteFiles(0)["image.bin"], "local binary choice");
+  assert.equal(JSON.stringify(mounts[1].download), sibling);
+  assert.deepEqual(await f.service().pendingConflicts(mounts[0].mountId), []);
+});
+
+for (const stage of ["/uploads", "/chunk", "/complete", "/sync", "/resolve"]) {
+  test(`original mount authority is rechecked after async token preparation before ${stage} dispatch`, async (t) => {
+    const { f, mounts } = await writableMounts(t);
+    f.write("Personal/same.md", "private new bytes");
+    if (stage === "/resolve") f.conflicts[0] = [{ path: "same.md", reason: "pending" }];
+    const service = f.service();
+    const original = service.refreshExpiringOidcAccessToken.bind(service);
+    let trigger = false, moved = false;
+    // requestWithAuth awaits this preparation after capture, immediately before the actual send.
+    service.refreshExpiringOidcAccessToken = async () => {
+      await original();
+      if (trigger && !moved) { moved = true; await f.move("Personal/same.md", "Harmony/moved.md"); }
+    };
+    const transport = service.requestWithAuth.bind(service);
+    service.requestWithAuth = async (method: string, path: string, ...args: any[]) => {
+      if (path.includes(ids[0]) && path.endsWith(stage)) {
+        const body = args[0];
+        if (stage !== "/sync" || body?.changes?.length) trigger = true;
+      }
+      return transport(method, path, ...args);
+    };
+    const before = f.requests.length;
+    const work = stage === "/resolve" ? service.resolveConflicts([{ path: "same.md", kind: "current" }], mounts[0].mountId)
+      : service.sync();
+    await assert.rejects(work, /stale/);
+    assert.ok(moved);
+    assert.ok(!f.requests.slice(before).some((request) => request.url.includes(ids[0]) && request.url.endsWith(stage) &&
+      (stage !== "/sync" || JSON.parse(request.body).changes.length)));
+    assert.equal(f.remoteFiles(0)["same.md"], "base 0"); assert.equal(f.remoteFiles(1)["moved.md"], undefined);
+  });
+}
+
+test("HTTP 403 after writable negotiation persists barriers and retains staging evidence", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "denied edit"); f.write("Harmony/same.md", "allowed sibling");
+  const original = responder;
+  responder = async (options) => options.url.includes(ids[0]) && options.url.endsWith("/chunk")
+    ? { status: 403, json: {}, text: "synthetic capability denial" } : original(options);
+  await assert.rejects(f.service().sync(), /denial/);
+  assert.equal(mounts[0].capability, "read"); assert.equal(mounts[0].download.writing.stage, "staging");
+  assert.ok(mounts[0].download.reconciliation.some((file: any) => file.path === "same.md"));
+  assert.equal(f.remoteFiles(1)["same.md"], "allowed sibling");
+  responder = original; f.restart(); await f.service().sync(); assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+});
+
+test("failed initial-upload backup and activation never authorize background replacement", async (t) => {
+  const f = fixture(t, true);
+  f.remote(0, { "remote.md": "retain remote" });
+  const mount = await f.add(0, "Personal"); f.write("Personal/local.md", "retain local");
+  const original = f.vault.adapter.writeBinary.bind(f.vault.adapter);
+  f.vault.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => {
+    if (path.includes("/backups/")) throw new Error("synthetic backup failure");
+    return original(path, bytes);
+  };
+  await assert.rejects(f.service().initializeShareUpload(mount.mountId), /backup failure/);
+  assert.equal(mount.initialized, false); assert.equal(mount.status, "download-only");
+  await f.service().sync(); assert.deepEqual(f.remoteFiles(0), { "remote.md": "retain remote" });
+  f.vault.adapter.writeBinary = original;
+  f.saveHook(async () => { if (mount.initialized) throw new Error("synthetic activation save failure"); });
+  await assert.rejects(f.service().initializeShareUpload(mount.mountId), /activation save/);
+  assert.equal(mount.initialized, false); assert.equal(mount.status, "download-only");
+  f.saveHook(); await f.service().sync(); assert.deepEqual(f.remoteFiles(0), { "remote.md": "retain remote" });
+  assert.ok(mount.download.initial.backupManifest); assert.ok(mount.download.writing);
+  f.restart(); await f.service().sync(); assert.deepEqual(f.remoteFiles(0), { "remote.md": "retain remote" });
+});
+
+test("failed write-enable save stays download-only and stale modal guards cannot approve a later generation", async (t) => {
+  const f = fixture(t, true);
+  f.remote(0, { "same.md": "base" });
+  const mount = await f.add(0, "Personal"); await f.initialize(mount);
+  f.saveHook(async () => { if (mount.status === "writable") throw new Error("synthetic enable save failure"); });
+  await assert.rejects(f.service().enableShareWrites(mount.mountId), /enable save/);
+  assert.equal(mount.status, "download-only"); f.saveHook();
+  const oldModal = f.service().compositeActionGuard(mount.mountId);
+  await f.move("Personal/same.md", "local.md");
+  assert.throws(oldModal, /stale/);
+  f.restart(); assert.equal(f.settings().composite.mounts[0].status, "download-only");
+});
+
+test("a failed endpoint release restores its barrier, while explicit upload authorizes only that source deletion", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  await f.move("Personal/same.md", "Harmony/moved.md");
+  const move = f.settings().composite.moves[0];
+  f.saveHook(async () => { if (!mounts[0].barriers.length) throw new Error("synthetic release failure"); });
+  await assert.rejects(f.service().reconcileCompositeMove(mounts[0].mountId, move.id, "same.md", "keep-local"), /release failure/);
+  assert.equal(mounts[0].barriers.length, 1); assert.equal(mounts[1].barriers.length, 1);
+  f.saveHook(); await f.service().reconcileCompositeMove(mounts[0].mountId, move.id, "same.md", "upload-local");
+  assert.equal(f.remoteFiles(0)["same.md"], undefined); assert.equal(f.remoteFiles(1)["moved.md"], undefined);
+  assert.equal(mounts[1].barriers.length, 1); assert.equal(f.read("Harmony/moved.md"), "base 0");
+  assert.equal(mounts[0].download.reconciliation.length, 0);
+});
+
+test("malformed persisted write captures fail closed without transport or v1 fallback", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  const count = f.requests.length;
+  mounts[0].download.writing = { stage: "submitted", entries: [{ path: "same.md", entry: { path: "other.md", sha256: sha("x"), size: 1, mtime: 0 } }] };
+  assert.throws(() => validateComposite(f.settings()), /Invalid composite/);
+  await assert.rejects(f.service().sync(), /Invalid composite/);
+  assert.equal(f.requests.length, count); assert.ok(mounts[0].download.writing);
+});
+
+for (const change of ["server", "account", "revision"]) {
+  test(`${change} change during staging cannot reuse old writable captures or fall back to v1`, async (t) => {
+    const { f, mounts } = await writableMounts(t);
+    f.write("Personal/same.md", "old context capture");
+    let changed = false;
+    f.afterHook(async (options) => {
+      if (changed || !options.url.includes(ids[0]) || !options.url.endsWith("/chunk")) return;
+      changed = true;
+      if (change === "server") f.settings().serverUrl = "http://localhost:9999";
+      if (change === "account") f.settings().authenticatedIdentity.subject = "different-account";
+      if (change === "revision") f.settings().composite.revision++;
+    });
+    await assert.rejects(f.service().sync(), /stale|changed/);
+    assert.equal(mounts[0].download.writing.stage, "staging");
+    assert.equal(f.remoteFiles(0)["same.md"], "base 0");
+    assert.ok(!f.requests.some((request) => request.url.includes("/v1/users/")));
+  });
+}
+
+test("move during accepted-journal persistence cannot advance captured baselines", async (t) => {
+  const { f, mounts } = await writableMounts(t);
+  f.write("Personal/same.md", "accepted original capture");
+  let moved = false;
+  f.saveHook(async () => {
+    if (!moved && mounts[0].download.writing?.stage === "accepted") {
+      moved = true; await f.move("Personal/same.md", "Harmony/moved.md");
+    }
+  });
+  await assert.rejects(f.service().sync(), /stale/);
+  assert.equal(mounts[0].download.writing.stage, "accepted");
+  assert.equal(mounts[0].download.baseline.find((file: any) => file.path === "same.md").sha256, sha("base 0"));
+  assert.equal(f.remoteFiles(0)["same.md"], "accepted original capture");
+  f.saveHook(); f.restart(); await f.service().sync();
+  assert.equal(f.settings().composite.mounts[0].download.baseline.find((file: any) => file.path === "same.md").sha256, sha("accepted original capture"));
+  assert.ok(f.settings().composite.mounts[0].barriers.length); assert.ok(f.settings().composite.mounts[1].barriers.length);
 });

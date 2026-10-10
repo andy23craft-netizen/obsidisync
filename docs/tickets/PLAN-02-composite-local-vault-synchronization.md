@@ -1,12 +1,15 @@
 # PLAN-02: Composite Local Vault Synchronization
 
-**Status:** Approved design; decomposed into proposed implementation tickets
+**Status:** Approved design; FEAT-10/11 implemented; FEAT-12/13/14 remain
 **Owner:** Obsidian plugin
 **Parent:** [FEAT-01](FEAT-01-multi-user-shares-and-composite-vault-sync.md)
 **Dependencies:** Implemented FEAT-02/03/04; preserve the
 [FEAT-04 contracts and acceptance audit](../CLIENT_SHARE_SELECTION.md) and
 [server storage/migration contracts](../SHARE_STORAGE_AND_MIGRATION.md).
-**Refreshed:** 2026-10-10 against repository code; composite synchronization remains proposed.
+**Implementation progress:** 2026-10-10: fresh composite setup, downloads and writable synchronization are implemented.
+See the [current behavior and recovery guide](../COMPOSITE_MOUNT_DOWNLOADS.md). Conversion/detachment,
+composite history/credentials and explicit import remain proposed. Desktop/mobile acceptance and production
+verification remain operator work. Completed FEAT-10/11 ticket files have been removed; their coverage is retained below.
 
 ## Implementation Tickets and Coverage
 
@@ -16,17 +19,17 @@ there is no separate testing or miscellaneous ticket. Completed FEAT-02/03/04 re
 
 | Ticket | Owned behavior and plan coverage | Hard dependencies |
 | --- | --- | --- |
-| [FEAT-10](FEAT-10-scoped-mount-downloads.md) | Mount state/routing, fresh empty-vault setup, safe downloads, exclusions, scheduling/status, generation/barrier lifecycle and rename detection | Implemented FEAT-04 |
-| [FEAT-11](FEAT-11-safe-writable-mount-sync.md) | Writable initialization/sync, per-mount conflicts/reconciliation, write-stage invalidation, submitted-outcome recovery and explicit reconciliation barrier release | FEAT-10 |
+| [FEAT-10 (implemented)](../COMPOSITE_MOUNT_DOWNLOADS.md) | Mount state/routing, fresh empty-vault setup, safe downloads, exclusions, scheduling/status, generation/barrier lifecycle and rename detection | Implemented FEAT-04 |
+| [FEAT-11 (implemented)](../COMPOSITE_MOUNT_DOWNLOADS.md) | Writable initialization/sync, per-mount conflicts/reconciliation, write-stage invalidation, submitted-outcome recovery and explicit reconciliation barrier release | FEAT-10 |
 | [FEAT-12](FEAT-12-journaled-conversion-and-detachment.md) | Existing-vault conversion, durable activation/reversal, inaccessible-binding archive/detach, re-add and configuration lifecycle | FEAT-10, FEAT-11 |
 | [FEAT-13](FEAT-13-mount-history-and-credentials.md) | History/snapshots, device/version metadata, separate share/legacy credential workflows and stale modal protection | FEAT-10, FEAT-11 |
 | [FEAT-14](FEAT-14-explicit-cross-mount-import.md) | Verified explicit copy/import, attachment selection, persisted progress, destination acceptance and separately confirmed source deletion | FEAT-11 |
 
-Recommended order is FEAT-10, FEAT-11, then FEAT-12/13/14. The latter tickets have no hard dependency on one another;
+Remaining implementation is FEAT-12/13/14. These tickets have no hard dependency on one another;
 shared-file coordination is an ordering preference, not an additional contract dependency. FEAT-10 provides fresh
 empty-vault mount setup so downstream work does not depend on the conversion UI merely to exercise composite sync.
 Until FEAT-13, legacy single-share history/credential controls must fail closed in composite mode; until FEAT-14,
-detected moves remain blocked with reconciliation guidance and no advertised unfinished import action.
+detected moves require explicit endpoint reconciliation, with no advertised unfinished import action.
 
 Cross-cutting ownership: FEAT-10 establishes reusable mount resolution, action tokens, saved barriers and startup
 gates; FEAT-11 consumes them for every mutation and recovery stage; FEAT-12/13/14 consume the same contracts rather
@@ -36,10 +39,10 @@ real-server suites below and desktop/mobile fixtures; production migration remai
 
 ## Problem
 
-One-share-per-local-vault is secure but makes people switch vaults between private and Harmony work. The plugin
-currently supports one selected v2 share with guarded downloads and explicitly enabled writable synchronization.
-It still scans one whole local vault, so it cannot route files to independently authorized shares. Unconverted
-configurations retain intentional v1 behavior. FEAT-02/03/04 have no remaining implementation work; human
+At design time, one-share-per-local-vault required switching vaults between private and Harmony work. FEAT-10/11 now
+support independently authorized writable mounts in a fresh composite vault. Existing installations still need
+explicit conversion, and composite history/credentials and import remain unfinished. Unconverted configurations
+retain intentional v1 behavior. FEAT-02/03/04/10/11 have no remaining implementation work; human
 desktop/iPhone acceptance and production verification remain separate from repository implementation evidence.
 
 `activeShare.download` already owns per-file baselines, observed head, local reconciliation, application intent,

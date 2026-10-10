@@ -52,14 +52,17 @@ export class ConflictResolverModal extends Modal {
   private syncRunning = false;
   private busy = false;
   private actionButtons: HTMLButtonElement[] = [];
+  private readonly contextGuard: () => void;
 
   constructor(
     app: App,
     private readonly gitService: GitService,
     initialConflicts: SyncConflict[] = [],
-    private readonly onClosed?: ConflictResolverClosedHandler
+    private readonly onClosed?: ConflictResolverClosedHandler,
+    private readonly mountId?: string
   ) {
     super(app);
+    this.contextGuard = mountId ? gitService.compositeActionGuard(mountId) : () => {};
     for (const conflict of initialConflicts) {
       this.reported.set(conflict.path, conflict.reason);
     }
@@ -89,7 +92,8 @@ export class ConflictResolverModal extends Modal {
 
   private async loadPendingFromServer(): Promise<void> {
     try {
-      for (const conflict of await this.gitService.pendingConflicts()) {
+      this.contextGuard();
+      for (const conflict of await this.gitService.pendingConflicts(this.mountId)) {
         if (!this.reported.has(conflict.path)) this.reported.set(conflict.path, conflict.reason);
       }
     } catch (error) {
@@ -99,10 +103,11 @@ export class ConflictResolverModal extends Modal {
   }
 
   private async loadConflicts(): Promise<void> {
+    this.contextGuard();
     const byPath = new Map<string, ConflictFile>();
 
     for (const [path, reason] of this.reported) {
-      const file = this.app.vault.getAbstractFileByPath(path);
+      const file = this.app.vault.getAbstractFileByPath(this.localPath(path));
       const exists = file instanceof TFile;
       let parsed: ParsedConflictDocument | null = null;
       if (exists) {
@@ -116,15 +121,18 @@ export class ConflictResolverModal extends Modal {
       byPath.set(path, { path, reason: friendlyReason(reason), reportedByServer: true, exists, parsed, choice: null });
     }
 
-    const files = this.app.vault.getFiles();
+    const prefix = this.mountId ? this.gitService.compositeMounts().find((mount) => mount.mountId === this.mountId)?.localPrefix : undefined;
+    const files = this.app.vault.getFiles().filter((file) => !this.mountId ||
+      (prefix && file.path.startsWith(`${prefix}/`) && this.gitService.tracksLocalPath(file.path)));
     await Promise.all(
       files.map(async (file) => {
-        if (byPath.has(file.path)) return;
+        const path = prefix ? file.path.slice(prefix.length + 1) : file.path;
+        if (byPath.has(path)) return;
         try {
           const content = await this.app.vault.cachedRead(file);
           if (!hasConflictMarkers(content)) return;
-          byPath.set(file.path, {
-            path: file.path,
+          byPath.set(path, {
+            path,
             reason: SCANNED_REASON,
             reportedByServer: false,
             exists: true,
@@ -165,7 +173,7 @@ export class ConflictResolverModal extends Modal {
     contentEl.createEl("h2", { text: "Resolve sync conflicts" });
     this.renderSyncStatus(contentEl);
 
-    if (!this.gitService.canWriteSelectedShare()) {
+    if (!this.gitService.canWriteSelectedShare(this.mountId)) {
       contentEl.createEl("p", { text: "Server conflict actions require current read-write access. Local edits and conflicts are retained." });
       return;
     }
@@ -524,7 +532,8 @@ export class ConflictResolverModal extends Modal {
       for (const conflict of selected) {
         resolutions.push(await this.toResolution(conflict));
       }
-      const remaining = await this.gitService.resolveConflicts(resolutions);
+      this.contextGuard();
+      const remaining = await this.gitService.resolveConflicts(resolutions, this.mountId);
       for (const path of paths) {
         this.reported.delete(path);
         this.choices.delete(path);
@@ -567,6 +576,7 @@ export class ConflictResolverModal extends Modal {
       case "delete":
         return { path: conflict.path, kind: "delete" };
       case "restore": {
+        if (this.mountId) return { path: conflict.path, kind: "binary", contentBase64: await this.gitService.compositeConflictRemote(this.mountId, conflict.path) };
         const history = await this.gitService.history(conflict.path);
         const latest = history[0];
         if (!latest) throw new Error(`The server has no committed version of ${conflict.path}. Delete it on the server instead.`);
@@ -580,8 +590,13 @@ export class ConflictResolverModal extends Modal {
     }
   }
 
+  private localPath(path: string): string {
+    this.contextGuard();
+    return this.mountId ? this.gitService.compositeLocalPath(this.mountId, path) : path;
+  }
+
   private async openInEditor(path: string): Promise<void> {
-    const file = this.app.vault.getAbstractFileByPath(path);
+    const file = this.app.vault.getAbstractFileByPath(this.localPath(path));
     if (!(file instanceof TFile)) {
       new Notice(`Could not find ${path}`);
       return;

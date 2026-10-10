@@ -1,8 +1,8 @@
-# Composite mount downloads
+# Composite mount synchronization
 
-The plugin implements FEAT-10's fresh composite setup and scoped downloads. Writable composite synchronization,
-existing-vault conversion/detachment, composite history/credential management and explicit import remain separate
-FEAT-11 through FEAT-14 work. Existing v1 and single selected-share workflows retain their previous behavior.
+The plugin implements FEAT-10's fresh composite setup and scoped downloads and FEAT-11's explicitly writable mounts.
+Existing-vault conversion/detachment, composite history/credential management and explicit import remain separate
+FEAT-12 through FEAT-14 work. Existing v1 and single selected-share workflows retain their previous behavior.
 This describes repository implementation and synthetic automated evidence, not desktop/mobile human acceptance
 or production rollout. See [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md).
 
@@ -18,9 +18,14 @@ conversion, which this stage does not provide. Do not clear settings or move fil
 3. For each mount, choose Back up and download and confirm that folder's reconciliation. Selection alone and
    background synchronization do not initialize files. Local files added after selection are included in that
    mount's verified backup before replacement. Edits/deletions after backup are preserved for reconciliation.
-4. Once initialized, startup, timer, manual and close synchronization perform download-only reads per mount.
+4. Once initialized, startup, timer, manual and close synchronization perform download-only reads per mount until
+   Enable writes is explicitly confirmed for that mount. Retained edits still require separate reconciliation.
    Manage mounts shows capability, initialization, last attempt/completion, errors, local records and move barriers.
    Retry downloads resumes incomplete initialization or retries an initialized mount independently.
+5. Alternatively, an uninitialized read-write mount offers Back up and replace share. Confirm the named share ID
+   and folder: this replaces that share with the verified local folder, including remote-only deletions, against
+   a real remote base. It enables writes only for that mount. Concurrent changes produce recoverable conflicts.
+   An interrupted initial upload cannot repeat replacement: resume recovery/downloads and explicitly reconcile.
 
 Prefixes cannot overlap, alias by case/Unicode normalization, or mount the same share twice. Remote/local file and
 folder aliases fail closed rather than overwriting another spelling. Files outside the prefixes remain local-only.
@@ -42,10 +47,24 @@ application intent and checks again before the adapter operation. Interrupted ap
 local reconciliation. An observed remote head is not proof of synchronized local contents.
 
 Edited, deleted, unreadable or conflicting local files stay blocked while safe files/mounts continue. Downgrade,
-restart, re-login and restored write membership do not clear barriers or approve uploads. Composite mode has no
-write controls at this stage, including history metadata and credential actions. Authorization denial never selects
-legacy v1 as a fallback. Do not hand-edit state to bypass reconciliation; keep local/recovery evidence for later
-explicit reconciliation or operator-assisted recovery.
+restart, re-login and restored write membership do not clear barriers or approve uploads. Authorization denial never
+selects legacy v1 as a fallback. Do not hand-edit state to bypass reconciliation. History metadata and credential
+management remain unavailable in composite mode.
+
+Writable scans, staged chunks, sync/resolve submissions, baselines and server conflicts use only share-relative
+paths within their mount. Exact captured hashes/deletions are saved before staging. Completion never acknowledges
+a fresh filesystem scan. Edits during transfer become preservation records; failed/ambiguous staging does not
+replay upload IDs. Composite captures also retain their original mount/binding/revision/generation; corrupt or
+retargeted evidence fails closed. Before every dispatch, including after token refresh and capability negotiation, the operation
+checks its original mount/binding/configuration revision/move generation, capability and affected path barriers.
+The same checks protect response acknowledgement and local application.
+
+Local reconciliation offers Keep local (upload blocked), Back up and use remote, and, with explicitly writable
+membership, Back up and upload local choice. Remote choice refreshes the current target and verifies a fresh local
+backup before replacement/deletion. Upload choice separately captures current bytes or deletion against a fresh
+remote base; concurrent changes can still conflict. Server conflicts have a separate per-mount resolver. Text marker
+views are checksum verified inline contents, never blobs inferred from the returned Git head. Binary choices retain
+their original bytes; the missing-file restore choice fetches checksum-verified current committed bytes.
 
 ## Detected moves
 
@@ -53,7 +72,18 @@ The plugin observes Obsidian rename events after local mutation. A detected cros
 local-only space, folder move or mount-root rename advances affected mount generations and records persistent
 barriers for both endpoints. In-flight actions with old generations cannot apply or acknowledge downloaded bytes.
 Affected paths stay blocked; unrelated mounts can continue. A missing mount folder never approves mass deletion.
-Move barriers remain after restart and successful reads; this stage has no import or barrier-release workflow.
+Move barriers remain after restart and successful reads. A request dispatched before a move may already have
+committed. Stale callbacks cannot acknowledge it; original staged/submitted/accepted captures remain recoverable.
+Fresh authorized snapshots and server conflict reads establish only an exact captured version's outcome. Divergence
+retains captured hash/deletion and phase evidence in local reconciliation. Recovery never clears move barriers.
+
+Manage mounts shows both move endpoints and offers a separately confirmed decision for one endpoint only. Keep local
+saves local upload barriers before releasing that endpoint's move barrier; it grants no upload/deletion consent.
+Back up and use remote restores the selected endpoint after a fresh target read and verified backup. Back up and
+upload endpoint explicitly approves current contents, including local deletions, for that endpoint only. Conflicts,
+new edits, another covering move barrier or uncertain outcomes retain the move barrier. Overlapping move barriers
+can first use Keep local to retain preservation records. The other endpoint remains blocked until its own decision.
+This is reconciliation of an already detected move, not the FEAT-14 copy/import workflow.
 
 If saving a move barrier fails, affected mounts stop in memory and show a persistence error. Retry synchronization
 after fixing storage to save retained evidence before more work. Preserve settings/recovery copies and the moved
@@ -71,8 +101,22 @@ Automated fixtures exercise independent mounts, protected/alias paths, verified 
 interrupted application, identity/configuration changes, capability loss/restoration, persisted move barriers and
 sibling retries. The real-server composite scenario uses two synthetic principals with separate private shares
 and a shared share; it checks inaccessible discovery/content/blob/history responses and unchanged share storage
-fingerprints after downloads. Existing legacy/writable/history/credential and server authorization regressions remain.
+fingerprints after downloads. Writable fixtures cover original-token checks at every dispatch stage, staged/committed
+moves, lost responses, restart, permission restoration, initial activation failures and explicit endpoint release.
+The real-server writable scenario covers three mounts, text/binary conflicts, edit/delete conflicts, partial staging,
+committed-but-stale responses, membership changes, concurrent initial replacement and inaccessible reads/mutations.
+Existing legacy/writable/history/credential and server authorization regressions remain.
+
+Ubuntu/WSL automated results on 2026-10-10: `npm run test:plugin` passed 194 tests; `npm run build:plugin` passed;
+`npm run test:server` passed 145 tests with one existing ignored sample-PDF test; `npm run test:e2e` passed all seven
+scenarios. The first Rust run hit an existing conflict test's filesystem error; that test passed in isolation and
+the full Rust rerun passed. Tests use disposable synthetic data, not household documents or deployed services.
+
+No server migration is required for this client feature. Install the updated plugin through the normal operator
+workflow. A previous download-only composite build rejects writable/journal state; do not reset that state to
+force a downgrade. Preserve settings and recovery copies and reconcile uncertain contents before changing clients.
 
 Human desktop/iPhone acceptance remains required: use disposable notes/attachments to inspect setup/status,
-offline edits, permission loss, interruptions and detected moves. No production migration, deployment, household
+initial upload/enable writes, per-mount conflict/reconciliation, offline edits, permission loss, interruptions and
+detected moves. No production migration, deployment, household
 data access or sibling repository changes are performed by this stage.

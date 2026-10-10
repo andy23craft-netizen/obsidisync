@@ -3,6 +3,7 @@ import type { PendingShareSelection } from "./shareSelection";
 import { shouldIgnoreVaultPath } from "./ignore";
 import { assertSafeVaultPath } from "./security";
 import type { ReconciliationVault } from "./vaultState";
+import type { MountActionToken } from "./composite";
 
 export interface LocalReconciliation {
   path: string;
@@ -14,6 +15,7 @@ export interface LocalReconciliation {
   uploadBlocked: true;
   localChoice?: "keep-local";
   backupFolder?: string;
+  capturedWrite?: { stage: "staging" | "submitted" | "accepted"; entry: ManifestEntry | null; mountAction?: MountActionToken };
 }
 
 export interface ShareDownloadState {
@@ -25,7 +27,8 @@ export interface ShareDownloadState {
   /** Saved BEFORE touching a file. An ambiguous interrupted write fails closed on restart. */
   applying?: LocalReconciliation;
   /** Exact captured contents, saved before staging. Never reconstructed by scanning at completion. */
-  writing?: { stage: "staging" | "submitted" | "accepted"; entries: Array<{ path: string; entry: ManifestEntry | null }> };
+  writing?: { stage: "staging" | "submitted" | "accepted"; entries: Array<{ path: string; entry: ManifestEntry | null }>;
+    mountAction?: MountActionToken };
   serverConflicts?: SyncConflict[];
   initial: { backupFolder: string; backupManifest?: ManifestEntry[]; appliedPaths: string[]; complete: boolean };
 }
@@ -55,6 +58,7 @@ export class ShareReconciler {
     const previous = this.state.reconciliation.find((entry) => entry.path === record.path);
     this.state.reconciliation = this.state.reconciliation.filter((entry) => entry.path !== record.path);
     this.state.reconciliation.push({ ...record, localChoice: previous?.localChoice,
+      capturedWrite: record.capturedWrite ?? previous?.capturedWrite,
       backupFolder: record.backupFolder ?? previous?.backupFolder });
   }
 

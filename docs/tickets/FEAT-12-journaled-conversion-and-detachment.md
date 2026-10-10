@@ -12,8 +12,8 @@ must permit archiving/detachment without forcing unresolved original work into a
 
 ## Dependencies
 
-- Hard: [FEAT-10](FEAT-10-scoped-mount-downloads.md) for mount configuration, startup gates and scoped downloads;
-  [FEAT-11](FEAT-11-safe-writable-mount-sync.md) for recovery and per-mount reconciliation/write enablement.
+- Hard, implemented: [FEAT-10/11](../COMPOSITE_MOUNT_DOWNLOADS.md) for mount configuration, startup gates,
+  scoped downloads, recovery and per-mount reconciliation/write enablement.
 - Preserve existing v1 and selected-share evidence, [FEAT-04 contracts](../CLIENT_SHARE_SELECTION.md) and independent
   service/device grants. Conversion performs no server migration, credential retargeting or publication.
 

@@ -126,7 +126,7 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js"];
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js", "scenario-composite-writes.js"];
   for (const scenario of scenarios) {
     let server = await startServer();
     const stop = async () => {

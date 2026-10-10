@@ -14,8 +14,8 @@ test("conflict resolver scans the vault using the shared conflict-marker detecto
 
 test("conflict resolver asks the server for conflicts it still expects this device to resolve", () => {
   assert.match(source, /await this\.loadPendingFromServer\(\);/);
-  assert.match(source, /await this\.gitService\.pendingConflicts\(\)/);
-  assert.match(gitSource, /async pendingConflicts\(\): Promise<SyncConflict\[\]>/);
+  assert.match(source, /await this\.gitService\.pendingConflicts\(this\.mountId\)/);
+  assert.match(gitSource, /async pendingConflicts\(mountId\?: string\): Promise<SyncConflict\[\]>/);
   assert.match(gitSource, /if \(error instanceof HttpStatusError && error\.status === 404\) return \[\];/);
 });
 
@@ -27,7 +27,7 @@ test("conflict resolver collects one choice per file and pushes them with a sing
   assert.match(source, /toggle\("Delete on server", \{ kind: "delete" \}\);/);
   assert.match(source, /toggle\("Restore server version", \{ kind: "restore" \}\);/);
   assert.match(source, /`Resolve \$\{selected\} file\$\{selected === 1 \? "" : "s"\}`/);
-  assert.match(source, /const remaining = await this\.gitService\.resolveConflicts\(resolutions\);/);
+  assert.match(source, /const remaining = await this\.gitService\.resolveConflicts\(resolutions, this\.mountId\);/);
 });
 
 test("merge editor stores the merged text as the file's choice instead of pushing immediately", () => {
