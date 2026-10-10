@@ -1,7 +1,8 @@
 # Share storage, independent grants, and offline publication
 
 This describes the server interfaces introduced by FEAT-03. Local fixture validation is distinct from deployment.
-Complete FEAT-03, FEAT-04, then FEAT-05 before one separately authorized coordinated production migration.
+Complete FEAT-03, FEAT-04, then [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md) (FEAT-10 through
+FEAT-14) before one separately authorized coordinated production migration.
 
 ## Authentication and storage boundary
 

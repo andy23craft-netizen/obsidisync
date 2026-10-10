@@ -17,6 +17,15 @@ export interface CollectChangesOptions {
 
 export type ServerUpsert = Extract<ServerFileChange, { op: "upsert" }>;
 
+/** Minimal disk boundary shared by whole-vault and mounted reconciliation. */
+export interface ReconciliationVault {
+  paths(): string[];
+  checkedEntryFor(path: string): Promise<ManifestEntry | null>;
+  serverBytes(file: ServerUpsert, download: (file: ServerUpsert) => Promise<ArrayBuffer>): Promise<ArrayBuffer>;
+  applyGuarded(file: ServerFileChange, expected: ManifestEntry | null, bytes: ArrayBuffer | undefined,
+    assertDestination: () => void): Promise<boolean>;
+}
+
 export interface ApplyServerFilesOptions {
   /** Fetches the bytes of a file the server sent without inline content. */
   download?: (file: ServerUpsert) => Promise<ArrayBuffer>;

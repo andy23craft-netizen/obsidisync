@@ -342,6 +342,11 @@ The plugin checks `/v1/server/info` before authenticated server operations and r
 
 ### Adding another device to a vault
 
+Fresh empty local vaults can use independent `Personal/` and `Harmony/` share mounts with safe download-only
+synchronization. See [Composite mount downloads](docs/COMPOSITE_MOUNT_DOWNLOADS.md) for setup, backups, exclusions,
+move barriers and recovery limits. Composite uploads, existing-vault conversion, history/credential management
+and explicit import remain later work; existing single-share and v1 workflows below remain available.
+
 Share selection, safe downloads and writable synchronization are implemented. Download initialization remains
 download-only until Enable writes is explicitly chosen; initial upload is a separate confirmed replacement decision.
 See [Client share selection](docs/CLIENT_SHARE_SELECTION.md) for verified backups, guarded per-file application,

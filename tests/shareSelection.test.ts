@@ -42,6 +42,7 @@ Module._load = function(name: string, ...args: any[]) {
 const { GitService, HttpStatusError } = require("../src/gitService");
 const { DEFAULT_SETTINGS, IosGitSyncSettingTab } = require("../src/settings");
 const { ShareSelectionModal } = require("../src/shareSelectionModal");
+const { CompositeMountsModal } = require("../src/compositeMountsModal");
 const { LocalReconciliationModal } = require("../src/localReconciliationModal");
 const { DevicePasswordsModal } = require("../src/devicePasswordsModal");
 const ObsidiSyncPlugin = require("../src/main").default;
@@ -551,4 +552,40 @@ test("a failed plugin save rejects its caller without poisoning subsequent durab
   plugin.saveData = async (snapshot: any) => { written = snapshot; };
   plugin.settings.marker = "recovered"; await plugin.saveSettings();
   assert.deepEqual(written, { marker: "recovered" });
+});
+
+test("composite chooser separates mount selection from explicit per-mount download consent", async () => {
+  buttons = []; textChanges = [];
+  let mounts: any[] = [];
+  let downloads = 0;
+  const service = {
+    compositeMounts: () => mounts, discoverShares: async () => [share],
+    addCompositeMount: async (shareId: string, localPrefix: string) => {
+      assert.equal(shareId, share.shareId); assert.equal(localPrefix, "Personal");
+      mounts = [{ ...share, localPrefix, mountId: "mount-1", initialized: false, barriers: [],
+        download: { reconciliation: [] } }];
+    },
+    initializeCompositeMount: async (mountId: string) => {
+      assert.equal(mountId, "mount-1"); downloads++; mounts[0].initialized = true;
+    }
+  };
+  const modal = new CompositeMountsModal({}, service);
+  await modal.onOpen();
+  await buttons.find((button) => button.text === "Add mount")!.click();
+  assert.equal(downloads, 0);
+  (globalThis as any).window = { confirm: () => false };
+  await buttons.find((button) => button.text === "Back up and download")!.click();
+  assert.equal(downloads, 0);
+  (globalThis as any).window.confirm = () => true;
+  await buttons.find((button) => button.text === "Back up and download")!.click();
+  assert.equal(downloads, 1);
+  assert.ok(buttons.some((button) => button.text === "Retry downloads"));
+  assert.ok(!buttons.some((button) => /upload|Enable writes/.test(button.text)));
+});
+
+test("startup refuses corrupt composite settings before scheduling or falling back to v1", async () => {
+  const plugin: any = Object.create(ObsidiSyncPlugin.prototype);
+  plugin.loadData = async () => ({ composite: { version: 99 } });
+  await assert.rejects(plugin.loadSettings(), /Invalid composite/);
+  assert.equal(plugin.settings.composite.version, 99, "corrupt evidence is not reset");
 });

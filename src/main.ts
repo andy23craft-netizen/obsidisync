@@ -12,6 +12,8 @@ import { createClientId, generateComputerName, slugFromName } from "./runtime";
 import { DEFAULT_SETTINGS, IosGitSyncSettings, IosGitSyncSettingTab } from "./settings";
 import { sha256Hex } from "./vaultState";
 import { ShareSelectionModal } from "./shareSelectionModal";
+import { CompositeMountsModal } from "./compositeMountsModal";
+import { validateComposite } from "./composite";
 import { LocalReconciliationModal } from "./localReconciliationModal";
 
 const LOGIN_RENEWAL_CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -157,6 +159,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const loaded = ((await this.loadData()) ?? {}) as Partial<IosGitSyncSettings> & { authToken?: string; vaultId?: string };
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    if (this.settings.composite !== undefined) validateComposite(this.settings);
     this.settings.branch = DEFAULT_SETTINGS.branch;
     if (!this.settings.oidcAccessToken && loaded.authToken) {
       this.settings.oidcAccessToken = loaded.authToken;
@@ -173,8 +176,11 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   openShareSelectionModal(): void {
+    if (this.gitService.hasComposite()) { this.openCompositeMountsModal(); return; }
     new ShareSelectionModal(this.app, this.gitService, this.settings).open();
   }
+
+  openCompositeMountsModal(): void { new CompositeMountsModal(this.app, this.gitService).open(); }
 
   openLoginModal(): void {
     new AuthLoginModal(this.app, this.gitService, async () => {
@@ -183,6 +189,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   openDevicePasswordsModal(): void {
+    if (this.gitService.hasComposite()) { new Notice("Credential management is not yet available in composite mode."); return; }
     new DevicePasswordsModal(this.app, this.gitService, this.settings.serverUrl).open();
   }
 
@@ -297,6 +304,9 @@ export default class ObsidiSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => this.updateMobileSyncIndicatorForPath(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => this.updateMobileSyncIndicatorForPath(file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      void this.gitService.observeCompositeRename(oldPath, file.path).catch((error) => {
+        new Notice(error instanceof Error ? error.message : "Move recovery could not be saved", 10000);
+      });
       this.updateMobileSyncIndicatorForPath(file.path);
       this.updateMobileSyncIndicatorForPath(oldPath);
     }));
@@ -419,7 +429,8 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async fileHasLocalChanges(path: string): Promise<boolean> {
-    if (this.gitService.localReconciliations().some((entry) => entry.path === path)) return true;
+    if (!this.gitService.tracksLocalPath(path)) return false;
+    if (this.gitService.hasLocalBarrier(path)) return true;
     const syncedEntry = this.gitService.synchronizedManifest().find((entry) => entry.path === path);
     const exists = await this.app.vault.adapter.exists(path, true);
     if (!exists) return Boolean(syncedEntry);
@@ -598,6 +609,7 @@ export default class ObsidiSyncPlugin extends Plugin {
    * forcing the dialog back open; the clickable conflict notice and the command still work.
    */
   private openConflictResolver(conflicts: SyncConflict[] = [], options: { explicit: boolean } = { explicit: true }): void {
+    if (this.gitService.hasComposite()) { this.openCompositeMountsModal(); return; }
     if (this.settings.pendingShareSelection?.download || (this.settings.activeShare &&
         (conflicts.length === 0 || !this.gitService.canWriteSelectedShare()))) {
       new LocalReconciliationModal(this.app, this.gitService).open();
@@ -668,6 +680,7 @@ export default class ObsidiSyncPlugin extends Plugin {
   }
 
   private async openFileHistoryView(): Promise<void> {
+    if (this.gitService.hasComposite()) { new Notice("History is not yet available in composite mode."); return; }
     const activeFilePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? null;
     let leaf = this.app.workspace.getLeavesOfType(FILE_HISTORY_VIEW_TYPE)[0];
     if (!leaf) {

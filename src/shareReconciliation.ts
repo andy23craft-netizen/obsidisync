@@ -2,7 +2,7 @@ import type { ManifestEntry, ServerFileChange, SyncConflict } from "./protocol";
 import type { PendingShareSelection } from "./shareSelection";
 import { shouldIgnoreVaultPath } from "./ignore";
 import { assertSafeVaultPath } from "./security";
-import { VaultState } from "./vaultState";
+import type { ReconciliationVault } from "./vaultState";
 
 export interface LocalReconciliation {
   path: string;
@@ -46,8 +46,10 @@ export function sameFile(a: ManifestEntry | null, b: ManifestEntry | null): bool
 
 /** Full read snapshots keep blocked targets reachable even after the observed head advances. */
 export class ShareReconciler {
-  constructor(private readonly vault: VaultState, private readonly state: ShareDownloadState,
-    private readonly save: () => Promise<void>, private readonly assertDestination: () => void) {}
+  constructor(private readonly vault: ReconciliationVault, private readonly state: ShareDownloadState,
+    private readonly save: () => Promise<void>, private readonly assertDestination: () => void,
+    private readonly supportedPath: (path: string) => boolean = sharePathSupported,
+    private readonly canApply: (path: string) => boolean = () => true) {}
 
   private block(record: LocalReconciliation): void {
     const previous = this.state.reconciliation.find((entry) => entry.path === record.path);
@@ -58,11 +60,12 @@ export class ShareReconciler {
 
   /** Save downgrade barriers even if the subsequent network read fails. No scan result becomes a baseline. */
   async preserveLocalChanges(): Promise<void> {
-    const paths = new Set([...this.vault.paths().filter(sharePathSupported), ...this.state.baseline.map((entry) => entry.path)]);
+    const paths = new Set([...this.vault.paths().filter(this.supportedPath), ...this.state.baseline.map((entry) => entry.path)]);
     for (const path of paths) {
       if (this.state.serverConflicts?.some((entry) => entry.path === path)) continue;
       if (this.state.reconciliation.some((entry) => entry.path === path)) continue;
       this.assertDestination();
+      if (!this.canApply(path)) continue;
       const baseline = this.state.baseline.find((entry) => entry.path === path) ?? null;
       let reason = "Local edit retained; future upload requires explicit reconciliation";
       try { if (sameFile(await this.vault.checkedEntryFor(path), baseline)) continue; }
@@ -83,7 +86,7 @@ export class ShareReconciler {
       if (file.op !== "delete" && (file.op !== "upsert" || !/^[a-f0-9]{64}$/.test(file.sha256))) {
         throw new Error(`Invalid remote change: ${file.path}`);
       }
-      if (sharePathSupported(file.path)) {
+      if (this.supportedPath(file.path)) {
         if (targets.has(file.path)) throw new Error(`Duplicate remote path: ${file.path}`);
         targets.set(file.path, file);
       }
@@ -97,11 +100,12 @@ export class ShareReconciler {
     const known = new Set([...this.state.baseline.map((entry) => entry.path),
       ...this.state.reconciliation.map((entry) => entry.path),
       ...(initial ? this.state.initial.backupManifest ?? [] : []).map((entry) => entry.path),
-      ...this.vault.paths().filter(sharePathSupported)]);
-    for (const path of known) if (!targets.has(path) && sharePathSupported(path)) targets.set(path, { path, op: "delete" });
+      ...this.vault.paths().filter(this.supportedPath)]);
+    for (const path of known) if (!targets.has(path) && this.supportedPath(path)) targets.set(path, { path, op: "delete" });
 
     for (const remote of targets.values()) {
       this.assertDestination();
+      if (!this.canApply(remote.path)) continue;
       // Server conflicts are resolved explicitly, not as local-only preservation decisions.
       if (this.state.serverConflicts?.some((entry) => entry.path === remote.path)) continue;
       const baseline = this.state.baseline.find((entry) => entry.path === remote.path) ?? null;
@@ -130,7 +134,11 @@ export class ShareReconciler {
       this.state.applying = record;
       await this.save();
       this.assertDestination();
-      const applied = await this.vault.applyGuarded(remote, expected, buffer, this.assertDestination);
+      const applied = await this.vault.applyGuarded(remote, expected, buffer, () => {
+        this.assertDestination();
+        if (!this.canApply(remote.path)) throw new Error("Mount path is blocked by a detected move");
+      });
+      this.assertDestination();
       if (!applied) this.block({ ...record, reason: "Local file changed during download/application" });
       else {
         this.state.baseline = this.state.baseline.filter((entry) => entry.path !== remote.path);

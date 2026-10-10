@@ -5,8 +5,10 @@ import { ManifestEntry } from "./protocol";
 import type { ClientIdentity, LegacyManagementContext, LegacySyncBinding, PendingShareSelection } from "./shareSelection";
 import { syncDestinationBlocker } from "./shareSelection";
 import type { ActiveShare } from "./shareReconciliation";
+import type { CompositeState } from "./composite";
 
 export interface IosGitSyncSettings {
+  composite?: CompositeState;
   authenticatedIdentity?: ClientIdentity;
   legacyManagementContext?: LegacyManagementContext;
   legacySyncBinding?: LegacySyncBinding;
@@ -153,6 +155,10 @@ export class IosGitSyncSettingTab extends PluginSettingTab {
       .setName("Server share selection")
       .setDesc("Choose a share, then explicitly back up and download. V2 uploads remain disabled.")
       .addButton((button) => button.setButtonText("Choose share").onClick(() => this.plugin.openShareSelectionModal()));
+
+    new Setting(containerEl).setName("Composite mounts")
+      .setDesc("Independent share folders with safe downloads. Fresh setup needs a new empty vault; existing vaults require explicit conversion. Uploads, history and credential management are not yet available in composite mode.")
+      .addButton((button) => button.setButtonText("Manage mounts").onClick(() => this.plugin.openCompositeMountsModal()));
 
     if (this.plugin.settings.pendingShareSelection) {
       new Setting(containerEl).setName("Pending share")

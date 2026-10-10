@@ -45,6 +45,10 @@ import { ServerUpsert, sha256Hex, VaultState } from "./vaultState";
 import { captureLegacyContext, serverIdentity, syncDestinationBlocker } from "./shareSelection";
 import { ActiveShare, LocalReconciliation, ShareReconciler, sharePathSupported, sameFile } from "./shareReconciliation";
 import type { PendingShareSelection, LegacyManagementContext } from "./shareSelection";
+import { assertFreshCompositeVault, assertMountAction, assertMountPrefixes, captureMountAction,
+  compositePathSupported, mountPathBlocked, pathKey, recordCompositeMove, resolveMount, validateComposite } from "./composite";
+import type { CompositeMount, MountActionToken } from "./composite";
+import { MountedVaultState } from "./mountedVaultState";
 
 type SaveSettings = () => Promise<void>;
 type ConflictNoticeHandler = (conflicts: SyncConflict[]) => void;
@@ -123,6 +127,7 @@ export interface LoginStatus {
 }
 
 export class GitService {
+  private compositeUnsavedMoves = new Map<string, number>();
   private running = false;
   private syncQueued = false;
   private syncStateListeners = new Set<SyncStateListener>();
@@ -143,6 +148,176 @@ export class GitService {
 
   destinationBlocker(): string | null {
     return syncDestinationBlocker(this.settings);
+  }
+
+  hasComposite(): boolean { return this.settings.composite !== undefined; }
+
+  compositeMounts(): CompositeMount[] { return this.hasComposite() ? validateComposite(this.settings).mounts : []; }
+
+  tracksLocalPath(path: string): boolean {
+    return !this.hasComposite() || Boolean(resolveMount(validateComposite(this.settings), path));
+  }
+
+  hasLocalBarrier(path: string): boolean {
+    if (!this.hasComposite()) return this.localReconciliations().some((entry) => entry.path === path);
+    const resolved = resolveMount(validateComposite(this.settings), path);
+    return Boolean(resolved && (mountPathBlocked(resolved.mount, resolved.path) ||
+      resolved.mount.download.reconciliation.some((entry) => entry.path === resolved.path)));
+  }
+
+  private mountGuard(token: MountActionToken): () => void {
+    return () => {
+      if (this.compositeUnsavedMoves.has(token.mountId)) throw new Error("Move barrier persistence failed; retry synchronization to save recovery evidence");
+      assertMountAction(this.settings, token);
+    };
+  }
+
+  private vaultForShare(selected: PendingShareSelection | ActiveShare): VaultState | MountedVaultState {
+    if (this.hasComposite()) {
+      const mount = this.compositeMounts().find((entry) => entry === selected);
+      if (!mount) throw new Error("Mount binding is unavailable");
+      return new MountedVaultState(this.vault, mount.localPrefix);
+    }
+    return new VaultState(this.vault);
+  }
+
+  async addCompositeMount(shareId: string, localPrefix: string): Promise<void> {
+    await this.exclusive(async () => {
+      if (!this.hasComposite()) {
+        assertFreshCompositeVault(this.settings, this.vault);
+        const root = await this.vault.adapter.list("");
+        if (root.files.length || root.folders.some((folder) => folder !== ".obsidian")) {
+          throw new Error("Composite setup requires a new empty vault; explicit conversion is required");
+        }
+      }
+      const prior = this.settings.composite;
+      const priorRevision = prior?.revision;
+      const mounts = this.compositeMounts();
+      assertMountPrefixes([...mounts, { shareId, localPrefix }]);
+      const shares = await this.discoverShares();
+      const share = shares.find((entry) => entry.shareId === shareId);
+      if (!share) throw new Error("Share is unavailable or inaccessible");
+      const identity = { ...this.settings.authenticatedIdentity! };
+      const accessToken = this.settings.oidcAccessToken;
+      const config = await this.authConfig();
+      const authentication = config.type === "oidc" ? `oidc:${config.issuer}` : config.type;
+      const response = await this.getJson<ShareSyncState>(`/v2/shares/${encodeURIComponent(shareId)}/sync-state`);
+      if (prior !== this.settings.composite || priorRevision !== this.settings.composite?.revision ||
+          accessToken !== this.settings.oidcAccessToken || identity.serverUrl !== serverIdentity(this.settings.serverUrl) ||
+          JSON.stringify(identity) !== JSON.stringify(this.settings.authenticatedIdentity) || this.settings.userSlug !== identity.user) {
+        throw new Error("Mount selection context changed; try again");
+      }
+      if (!prior) assertFreshCompositeVault(this.settings, this.vault);
+      if (mounts.some((mount) => mount.serverUrl !== identity.serverUrl ||
+          JSON.stringify(mount.identity) !== JSON.stringify(identity) || mount.authentication !== authentication)) {
+        throw new Error("All mounts must use the original server and verified identity");
+      }
+      if (response.shareId !== shareId || response.apiVersion !== 2 || !["read", "read-write"].includes(response.capability)) {
+        throw new Error("Invalid mount negotiation");
+      }
+      const mount: CompositeMount = { ...share, capability: response.capability, serverUrl: identity.serverUrl, identity,
+        authentication, mountId: createClientId(), localPrefix, moveGeneration: 0, initialized: false,
+        status: "download-only", barriers: [], download: { observedHead: null, baseline: [], reconciliation: [],
+          initial: { backupFolder: "", appliedPaths: [], complete: false } } };
+      this.settings.composite = { version: 1, revision: (priorRevision ?? 0) + 1,
+        mounts: [...mounts, mount], moves: prior?.moves ?? [] };
+      validateComposite(this.settings);
+      await this.saveSettings();
+    });
+  }
+
+  /** Post-mutation notification: invalidate synchronously, persist both endpoints before permitting more work. */
+  async observeCompositeRename(from: string, to: string): Promise<void> {
+    if (!this.hasComposite()) return;
+    const state = validateComposite(this.settings);
+    if (!recordCompositeMove(state, from, to, createClientId())) return;
+    const generations = state.mounts.filter((mount) => state.moves[state.moves.length - 1].mountIds.includes(mount.mountId))
+      .map((mount) => [mount.mountId, mount.moveGeneration] as const);
+    for (const [id, generation] of generations) this.compositeUnsavedMoves.set(id, generation);
+    try {
+      await this.saveSettings();
+      for (const [id, generation] of generations) {
+        if (this.compositeUnsavedMoves.get(id) === generation) this.compositeUnsavedMoves.delete(id);
+      }
+    }
+    catch { throw new Error("Move barrier could not be saved; affected synchronization stopped"); }
+  }
+
+  async initializeCompositeMount(mountId: string): Promise<void> {
+    await this.exclusive(async () => {
+      const mount = this.compositeMounts().find((entry) => entry.mountId === mountId);
+      if (!mount) throw new Error("Mount not found");
+      await this.attemptCompositeDownload(mount, !mount.initialized);
+    });
+  }
+
+  private async attemptCompositeDownload(mount: CompositeMount, initial: boolean): Promise<void> {
+    try { await this.downloadCompositeMount(mount, initial); }
+    catch (error) {
+      mount.lastError = error instanceof Error ? error.message : String(error);
+      await this.saveSettings();
+      throw error;
+    }
+  }
+
+  private async downloadCompositeMount(mount: CompositeMount, initial: boolean): Promise<void> {
+    const token = captureMountAction(validateComposite(this.settings), mount);
+    const guard = this.mountGuard(token);
+    const vault = this.vaultForShare(mount);
+    guard();
+    mount.lastAttemptAt = new Date().toISOString();
+    mount.lastError = undefined;
+    await this.saveSettings(); guard();
+    await this.negotiateShare(mount, guard);
+    guard();
+    if (initial && !mount.download.initial.backupManifest) {
+      mount.download.initial.backupFolder = `${this.recoveryFolder()}-${mount.mountId}`;
+      await this.saveSettings(); guard();
+      const backup = await vault.verifiedBackup(mount.download.initial.backupFolder, vault.paths());
+      guard(); mount.download.initial.backupManifest = backup;
+      await this.saveSettings(); guard();
+    }
+    const reconciler = new ShareReconciler(vault, mount.download, async () => { guard(); await this.saveSettings(); guard(); },
+      guard, compositePathSupported, (path) => !mountPathBlocked(mount, path));
+    if (!initial) await reconciler.preserveLocalChanges();
+    const response = await this.shareSnapshot(mount);
+    guard();
+    const paths = new Set<string>();
+    for (const file of response.files) {
+      if (!compositePathSupported(file.path)) continue;
+      if (paths.has(pathKey(file.path))) throw new Error("Remote paths alias each other");
+      paths.add(pathKey(file.path));
+    }
+    await reconciler.applySnapshot(response.files, response.serverHead,
+      async (file) => { guard(); const bytes = await this.downloadShareFile(mount, file, response.serverHead); guard(); return bytes; }, initial);
+    guard();
+    mount.initialized = true;
+    mount.download.lastDownloadedAt = new Date().toISOString();
+    await this.saveSettings(); guard();
+  }
+
+  private async performCompositeDownloads(): Promise<SyncConflict[]> {
+    const mounts = this.compositeMounts();
+    if (this.compositeUnsavedMoves.size) {
+      const pending = new Map(this.compositeUnsavedMoves);
+      await this.saveSettings();
+      for (const [id, generation] of pending) {
+        if (this.compositeUnsavedMoves.get(id) === generation) this.compositeUnsavedMoves.delete(id);
+      }
+    }
+    const errors: string[] = [];
+    for (const mount of mounts) {
+      if (!mount.initialized) continue; // Background work cannot supply initial replacement consent.
+      try { await this.attemptCompositeDownload(mount, false); }
+      catch (error) {
+        errors.push(`${mount.label}: ${mount.lastError ?? String(error)}`);
+      }
+    }
+    if (errors.length) throw new Error(errors.join("; "));
+    new Notice(mounts.some((mount) => mount.initialized)
+      ? "Composite downloads complete; review per-mount barriers in Composite mounts. Uploads remain disabled."
+      : "Open Composite mounts to explicitly initialize each download. Uploads remain disabled.");
+    return [];
   }
 
   private rememberAuthenticatedUser(session: AuthSessionResponse | PasswordLoginResponse): void {
@@ -177,6 +352,7 @@ export class GitService {
   }
 
   async stageShareSelection(shareId: string): Promise<void> {
+    if (this.hasComposite()) throw new Error("Use Composite mounts; legacy selection is disabled");
     if (this.running) throw new Error("Wait for synchronization to finish before selecting a share");
     if (this.settings.activeShare || this.settings.pendingShareSelection?.download) {
       throw new Error("Existing share reconciliation state must be retained. Use a separate local vault for another share.");
@@ -217,22 +393,29 @@ export class GitService {
   }
 
   synchronizedManifest(): ManifestEntry[] {
+    if (this.hasComposite()) return this.compositeMounts().flatMap((mount) => mount.download.baseline.map((entry) =>
+      ({ ...entry, path: `${mount.localPrefix}/${entry.path}` })));
     return this.settings.activeShare?.download.baseline ?? this.settings.localManifest;
   }
 
-  hasSelectedShare(): boolean { return Boolean(this.settings.activeShare); }
+  hasSelectedShare(): boolean { return this.hasComposite() || Boolean(this.settings.activeShare); }
 
   canWriteSelectedShare(): boolean {
+    if (this.hasComposite()) return false;
     if (this.settings.pendingShareSelection) return false;
     const selected = this.settings.activeShare;
     return !selected || (selected.status === "writable" && selected.capability === "read-write");
   }
 
   lastSynchronizedAt(): string | null {
+    if (this.hasComposite()) return null; // Per-mount times must not imply a vault-wide acknowledgement.
     return this.settings.activeShare?.download.lastDownloadedAt ?? (this.settings.activeShare ? null : this.settings.lastSyncedAt);
   }
 
   shareDownloadStatus(): string | null {
+    if (this.hasComposite()) return this.compositeMounts().map((mount) =>
+      `${mount.localPrefix}: ${mount.capability}, ${mount.initialized ? "download-only" : "initial reconciliation required"}; ` +
+      `${mount.download.reconciliation.length + mount.barriers.length} barrier(s)${mount.lastError ? "; retry required" : ""}`).join("; ");
     const selected = this.settings.activeShare;
     return selected ? `${selected.capability}, ${selected.status}; ${selected.download.reconciliation.length} local barrier(s)` : null;
   }
@@ -293,7 +476,8 @@ export class GitService {
   }
 
   private assertShareContext(selected: PendingShareSelection | ActiveShare): void {
-    const current = this.settings.activeShare ?? this.settings.pendingShareSelection;
+    const current = this.hasComposite() ? this.compositeMounts().find((mount) => mount === selected)
+      : this.settings.activeShare ?? this.settings.pendingShareSelection;
     const identity = this.settings.authenticatedIdentity;
     if (current !== selected || serverIdentity(this.settings.serverUrl) !== selected.serverUrl ||
         identity?.serverUrl !== selected.serverUrl || identity?.subject !== selected.identity.subject ||
@@ -310,6 +494,7 @@ export class GitService {
   }
 
   private async readVaultPath(): Promise<string> {
+    if (this.hasComposite()) throw new Error("History and metadata reads are not yet available in composite mode");
     if (this.settings.activeShare) {
       const selected = this.settings.activeShare;
       await this.negotiateShare(selected);
@@ -319,27 +504,36 @@ export class GitService {
     return this.vaultPath();
   }
 
-  private async negotiateShare(selected: PendingShareSelection | ActiveShare): Promise<void> {
+  private async negotiateShare(selected: PendingShareSelection | ActiveShare,
+    guard: () => void = () => this.assertShareContext(selected)): Promise<void> {
+    guard();
     this.assertShareContext(selected);
     const info = await this.checkServerCompatibility();
+    guard();
     if (!info.features?.includes("shareSyncV2")) throw new Error("Selected server no longer advertises shareSyncV2; no v1 fallback");
     const session = await this.getJson<AuthSessionResponse>("/v1/auth/session");
+    guard();
     this.assertShareContext(selected);
     if (session.subject !== selected.identity.subject || session.user !== selected.identity.user) {
       throw new Error("Authenticated account differs from selected share state");
     }
     const config = await this.authConfig();
+    guard();
     const authentication = config.type === "oidc" ? `oidc:${config.issuer}` : config.type;
     if (authentication !== selected.authentication) throw new Error("Authentication configuration changed; selected recovery state is retained");
     const state = await this.getJson<ShareSyncState>(`${this.sharePath(selected)}/sync-state`);
+    guard();
     this.assertShareContext(selected);
     if (state.shareId !== selected.shareId || state.apiVersion !== 2 ||
         !["read", "read-write"].includes(state.capability)) throw new Error("Invalid share negotiation");
     const downgraded = selected.capability === "read-write" && state.capability === "read";
     selected.capability = state.capability;
     await this.saveSettings();
-    if (downgraded && selected.download) await new ShareReconciler(new VaultState(this.vault), selected.download,
-      this.saveSettings, () => this.assertShareContext(selected)).preserveLocalChanges();
+    guard();
+    if (downgraded && selected.download) await new ShareReconciler(this.vaultForShare(selected), selected.download,
+      async () => { guard(); await this.saveSettings(); guard(); }, guard,
+      this.hasComposite() ? compositePathSupported : sharePathSupported,
+      (path) => !this.hasComposite() || !mountPathBlocked(selected as CompositeMount, path)).preserveLocalChanges();
   }
 
   private async requireShareWrite(selected: PendingShareSelection | ActiveShare): Promise<void> {
@@ -702,6 +896,16 @@ export class GitService {
   }
 
   async localChangeSummary(): Promise<{ changed: number; upserts: number; deletes: number }> {
+    if (this.hasComposite()) {
+      let upserts = 0, deletes = 0;
+      for (const mount of this.compositeMounts()) {
+        const manifest = await this.vaultForShare(mount).computeManifest();
+        const diff = diffManifests(manifest, mount.download.baseline);
+        upserts += diff.upsertPaths.length + mount.barriers.length;
+        deletes += diff.deletePaths.length;
+      }
+      return { changed: upserts + deletes, upserts, deletes };
+    }
     const manifest = await new VaultState(this.vault).computeManifest();
     const diff = diffManifests(manifest, this.synchronizedManifest());
     return {
@@ -846,6 +1050,7 @@ export class GitService {
   }
 
   private async performSync(): Promise<SyncConflict[]> {
+    if (this.hasComposite()) return this.performCompositeDownloads();
     if (this.settings.activeShare) return this.performShareSync();
     const blockReason = this.syncBlocker?.();
     if (blockReason) {
@@ -1197,6 +1402,7 @@ export class GitService {
   }
 
   legacyCredentialContext(): LegacyManagementContext {
+    if (this.hasComposite()) throw new Error("Credential management is not yet available in composite mode");
     captureLegacyContext(this.settings);
     const context = this.settings.legacyManagementContext;
     if (!context || context.serverUrl !== serverIdentity(this.settings.serverUrl)) {
@@ -1602,7 +1808,11 @@ export class GitService {
 
   private async requestWithAuth(method: "GET" | "POST" | "DELETE", path: string, body?: unknown,
       legacyCredential?: LegacyManagementContext): Promise<RequestUrlResponse> {
-    const selected = path.startsWith("/v2/shares/") ? this.settings.activeShare ?? this.settings.pendingShareSelection : null;
+    const selected = path.startsWith("/v2/shares/") ? (this.hasComposite()
+      ? this.compositeMounts().find((mount) => path.startsWith(`/v2/shares/${encodeURIComponent(mount.shareId)}/`))
+      : this.settings.activeShare ?? this.settings.pendingShareSelection) : null;
+    const mountToken = selected && this.hasComposite()
+      ? captureMountAction(validateComposite(this.settings), selected as CompositeMount) : null;
     const legacyAccount = legacyCredential ? JSON.stringify([this.settings.userSlug, this.settings.authenticatedIdentity]) : null;
     const assertDestination = () => {
       if (path.startsWith("/v1/users/")) {
@@ -1623,6 +1833,7 @@ export class GitService {
         }
       }
       if (selected) this.assertShareContext(selected);
+      if (mountToken) this.mountGuard(mountToken)();
     };
     assertDestination();
     const serverUrl = this.settings.serverUrl.replace(/\/+$/, "");
@@ -1710,9 +1921,9 @@ export class GitService {
     this.settings.syncStatus = "running";
     this.settings.lastSyncAttemptAt = new Date().toISOString();
     this.settings.lastSyncError = null;
-    await this.saveSettings();
-    this.emitSyncState();
     try {
+      await this.saveSettings();
+      this.emitSyncState();
       const result = await operation();
       this.settings.syncStatus = this.syncQueued ? "queued" : "idle";
       await this.saveSettings();

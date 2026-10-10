@@ -167,7 +167,7 @@ recoverable legacy Saber encryption configuration.
 | --- | --- | --- |
 | Server privacy boundary | Published independent shares, typed membership, v2 API | Production migration requires separate operator action |
 | Obsidian routing | [One selected v2 share or intentional mapped v1 namespace](../CLIENT_SHARE_SELECTION.md) | Human desktop/mobile acceptance |
-| Local vault composition | One remote sync state per local vault | [FEAT-05 composite mounts](../FEAT-05-composite-local-vault-synchronization.md) |
+| Local vault composition | Fresh scoped download-only mounts; existing v1/single-share workflows retained | [PLAN-02 composite mounts](../tickets/PLAN-02-composite-local-vault-synchronization.md), [implemented downloads](../COMPOSITE_MOUNT_DOWNLOADS.md) |
 | Device integration | Independent share DAV grants plus retained legacy DAV/Saber | Share-native Saber configuration remains deferred |
 
 The eventual composite vault must keep separate heads, manifests and recovery decisions for each share. That is

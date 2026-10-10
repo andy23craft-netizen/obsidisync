@@ -1,4 +1,13 @@
 export function assertSafeVaultPath(path: string): string {
+  return assertSafePath(path, false);
+}
+
+/** Local rename evidence may name excluded .git paths; this never authorizes them for synchronization. */
+export function assertSafeLocalPath(path: string): string {
+  return assertSafePath(path, true);
+}
+
+function assertSafePath(path: string, allowGit: boolean): string {
   const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
   if (!normalized || normalized.includes("\0") || path.includes("\\") || path.startsWith("/") || normalized !== path) {
     throw new Error(`Unsafe vault path: ${path}`);
@@ -6,7 +15,7 @@ export function assertSafeVaultPath(path: string): string {
 
   const parts = normalized.split("/");
   for (const part of parts) {
-    if (!part || part === "." || part === ".." || part === ".git") {
+    if (!part || part === "." || part === ".." || (!allowGit && part === ".git")) {
       throw new Error(`Unsafe vault path: ${path}`);
     }
   }

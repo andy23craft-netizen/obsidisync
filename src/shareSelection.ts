@@ -35,7 +35,7 @@ export function serverIdentity(url: string): string {
 }
 
 export function captureLegacyContext(settings: IosGitSyncSettings): void {
-  if (settings.activeShare || settings.pendingShareSelection) return;
+  if (settings.composite !== undefined || settings.activeShare || settings.pendingShareSelection) return;
   if (!settings.serverUrl || !settings.userSlug || !settings.vaultSlug) return;
   const context = {
     serverUrl: serverIdentity(settings.serverUrl), userSlug: settings.userSlug, vaultSlug: settings.vaultSlug
@@ -49,6 +49,7 @@ export function captureLegacyContext(settings: IosGitSyncSettings): void {
 }
 
 export function syncDestinationBlocker(settings: IosGitSyncSettings): string | null {
+  if (settings.composite !== undefined) return "Composite mount mode is active; legacy file operations are disabled.";
   if (settings.activeShare) return "Share download mode is active. V2 write synchronization is not enabled; v1 state is retained.";
   if (settings.pendingShareSelection) {
     return "Share selection requires reconciliation. V2 file synchronization is not enabled until you explicitly back up and download in Choose share. Cancel an unstarted selection to retain v1 operation.";

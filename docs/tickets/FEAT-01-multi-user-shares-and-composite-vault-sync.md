@@ -2,7 +2,7 @@
 
 **Status:** Client implementation remains
 **Owner:** Obsidian plugin
-**Remaining subtask:** [FEAT-05](FEAT-05-composite-local-vault-synchronization.md).
+**Remaining plan:** [PLAN-02](PLAN-02-composite-local-vault-synchronization.md), decomposed into FEAT-10 through FEAT-14.
 
 ## Problem and Current Behavior
 
@@ -29,7 +29,7 @@ folder filtering and client UI are not privacy controls.
 
 ## Remaining Implementation
 
-### FEAT-05: Composite local vault
+### PLAN-02: Composite local vault
 
 Introduce safe non-overlapping prefixes with independently persisted share state. Scope scans, uploads, downloads,
 deletes, histories and recovery to the owning mount. A failed Harmony operation must not corrupt Personal state.
@@ -68,7 +68,7 @@ Attachments follow their mount. Use Obsidian adapters on supported desktop/mobil
 
 ## Integration and Production Boundaries
 
-Implement FEAT-04, then FEAT-05, followed by one separately authorized coordinated production migration after
+Implement FEAT-04, then PLAN-02's FEAT-10 through FEAT-14, followed by one separately authorized production migration after
 validation. No production access, deployment, live migration or Marvin/Harmony repository changes are authorized
 by these tickets.
 
@@ -85,7 +85,7 @@ and compromised endpoints remain separate trust boundaries; share membership is 
 
 ## Testing and Acceptance
 
-Follow the FEAT-04 acceptance audit and FEAT-05 criteria. Preserve the completed server and client regression suites,
+Follow the FEAT-04 acceptance audit and PLAN-02 criteria. Preserve the completed server and client regression suites,
 including every supported protocol, workers, mapped v1, independent credentials and publication recovery.
 Use disposable data and synthetic credentials.
 

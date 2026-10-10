@@ -37,6 +37,14 @@ class Vault {
     const abs = (p) => path.join(root, normalizePath(p));
     const toArrayBuffer = (buf) => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     this.adapter = {
+      list: async (p) => {
+        const files = [], folders = [];
+        for (const entry of fs.readdirSync(abs(p), { withFileTypes: true })) {
+          const rel = normalizePath(`${p}/${entry.name}`);
+          (entry.isDirectory() ? folders : files).push(rel);
+        }
+        return { files, folders };
+      },
       readBinary: async (p) => toArrayBuffer(fs.readFileSync(abs(p))),
       writeBinary: async (p, data) => {
         fs.mkdirSync(path.dirname(abs(p)), { recursive: true });

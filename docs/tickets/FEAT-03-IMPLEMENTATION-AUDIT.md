@@ -53,4 +53,5 @@ OIDC re-login communication, explicit authentication configuration and the coord
 
 The audited implementation has no unresolved product decisions. Legacy share-native Saber provisioning remains
 explicitly deferred; completed legacy Saber compatibility is retained. Implementation order remains
-FEAT-03 -> FEAT-04 -> FEAT-05, followed by one separately authorized production migration after validation.
+FEAT-03 -> FEAT-04 -> PLAN-02 (FEAT-10 through FEAT-14), followed by one separately authorized production migration
+after validation. See [the composite plan](PLAN-02-composite-local-vault-synchronization.md).

@@ -4,6 +4,8 @@ The plugin implements destination-bound selection (FEAT-04A), safe downloads (FE
 (FEAT-04C) with separate legacy/share credential management (FEAT-04D). Download initialization starts download-only,
 even with read-write membership. Enable writes explicitly enables synchronization for reconciled files.
 Unconverted configurations retain v1 behavior.
+Fresh empty vaults also support [scoped composite downloads](COMPOSITE_MOUNT_DOWNLOADS.md) (FEAT-10).
+The single-share instructions below remain applicable to existing installations; they do not convert a vault.
 This is implemented repository behavior, not a household deployment or desktop/mobile acceptance result.
 
 ## Selecting and initializing
@@ -211,5 +213,6 @@ attachments and the two credential sections. Supported CORS behavior is router-t
 and third-party DAV clients have not been exercised here. Keep the documented external-writer filesystem race,
 conservative ambiguous-write reconciliation and non-resumable partial upload staging in mind.
 
-FEAT-04 is ready for final human acceptance review. FEAT-05 remains a separate authorized implementation step;
+FEAT-04 is ready for final human acceptance review. [PLAN-02](tickets/PLAN-02-composite-local-vault-synchronization.md)
+defines the full composite initiative. FEAT-10 fresh mount downloads are implemented; FEAT-11 to FEAT-14 remain;
 household deployment and coordinated production migration remain later, separately authorized operations.
