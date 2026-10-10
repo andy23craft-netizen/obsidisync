@@ -630,7 +630,7 @@ fn metadata_mtime_millis(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-async fn stat_unlocked(
+pub(super) async fn stat_unlocked(
     repo: &Path,
     manifest: &BinaryManifest,
     path: &str,

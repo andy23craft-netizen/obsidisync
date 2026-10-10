@@ -79,6 +79,11 @@ pub struct RegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "DestinationCondition::is_unconditional"
+    )]
+    pub destination_condition: DestinationCondition,
     pub base_head: Option<String>,
     pub client_id: String,
     pub device_name: String,
@@ -86,6 +91,54 @@ pub struct SyncRequest {
     pub client_manifest: Vec<ManifestEntry>,
     #[serde(default)]
     pub file_content: FileContentMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DestinationCondition {
+    #[default]
+    Unconditional,
+    Absent,
+}
+
+impl DestinationCondition {
+    pub fn is_unconditional(&self) -> bool {
+        *self == Self::Unconditional
+    }
+}
+
+// A missing field defaults above; explicit null or any other value must never disable the condition.
+impl<'de> Deserialize<'de> for DestinationCondition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "absent" => Ok(Self::Absent),
+            _ => Err(serde::de::Error::custom("invalid destination condition")),
+        }
+    }
+}
+
+impl SyncRequest {
+    pub fn reject_destination_condition(&self) -> anyhow::Result<()> {
+        if !self.destination_condition.is_unconditional() {
+            anyhow::bail!("invalid destination condition for this operation");
+        }
+        Ok(())
+    }
+
+    pub fn conditional_destination(&self) -> anyhow::Result<Option<&str>> {
+        if self.destination_condition.is_unconditional() {
+            return Ok(None);
+        }
+        match self.changes.as_slice() {
+            [ClientChange::Upsert {
+                path,
+                content_base64,
+                upload_id,
+                ..
+            }] if content_base64.is_some() != upload_id.is_some() => Ok(Some(path)),
+            _ => anyhow::bail!("invalid conditional create: exactly one upsert required"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

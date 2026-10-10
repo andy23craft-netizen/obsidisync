@@ -244,6 +244,7 @@ impl VaultService {
         request: SyncRequest,
         sources: bool,
     ) -> Result<SyncResponse> {
+        request.reject_destination_condition()?;
         if !request.changes.is_empty() {
             bail!("forbidden: read synchronization cannot write");
         }
@@ -472,6 +473,13 @@ impl VaultService {
         include_sources: bool,
         verified_base_existence: bool,
     ) -> Result<SyncResponse> {
+        if !verified_base_existence {
+            request.reject_destination_condition()?;
+        }
+        let conditional_path = request
+            .conditional_destination()?
+            .map(validate_vault_path)
+            .transpose()?;
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         self.with_lock(&user, &vault, || async {
@@ -497,6 +505,10 @@ impl VaultService {
             }
             let binary_root = self.binary_dir(&user, &vault)?;
             let upload_root = self.upload_dir(&user, &vault)?;
+            if let Some(path) = &conditional_path {
+                self.check_conditional_destination(&user, &vault, &repo, &binary_root, path)
+                    .await?;
+            }
             let device_paths = read_devices(&self.devices_path(&user, &vault)?)
                 .await?
                 .devices
@@ -536,8 +548,38 @@ impl VaultService {
             )
             .await?;
 
-            let conflicts = self
-                .apply_client_changes(
+            let conflicts = if let Some(path) = &conditional_path {
+                self.check_conditional_destination(&user, &vault, &repo, &binary_root, path)
+                    .await?;
+                let ClientChange::Upsert {
+                    content_base64,
+                    upload_id,
+                    mtime,
+                    ..
+                } = &request.changes[0]
+                else {
+                    unreachable!()
+                };
+                let content = self
+                    .content_from_inline_or_upload(
+                        &upload_root,
+                        path,
+                        content_base64.as_ref(),
+                        upload_id.as_ref(),
+                    )
+                    .await?;
+                if is_text_or_code_path(path) {
+                    write_repo_file(&repo, path, &content).await?;
+                } else {
+                    let mut manifest = read_manifest(&repo).await?;
+                    let entry =
+                        store_binary(&binary_root, path, &content, mtime.unwrap_or(0)).await?;
+                    manifest.files.insert(path.clone(), entry);
+                    write_manifest(&repo, &manifest).await?;
+                }
+                vec![]
+            } else {
+                self.apply_client_changes(
                     ClientChangeContext {
                         user: &user,
                         vault: &vault,
@@ -550,7 +592,8 @@ impl VaultService {
                     },
                     &request.changes,
                 )
-                .await?;
+                .await?
+            };
             if !conflicts.is_empty() {
                 return self
                     .conflict_response(
@@ -665,6 +708,43 @@ impl VaultService {
             })
         })
         .await
+    }
+
+    /// Called under the share lock before preparation and again immediately before upload consumption.
+    async fn check_conditional_destination(
+        &self,
+        user: &str,
+        vault: &str,
+        repo: &Path,
+        binary_root: &Path,
+        path: &str,
+    ) -> Result<()> {
+        let manifest = read_manifest(repo).await?;
+        self.guard_inkvault_paths(repo, binary_root, &[path.to_string()])
+            .await?;
+        // Validate even manifest-only resources and dangling links before checking presence.
+        repo_path(repo, path)?;
+        if dav::stat_unlocked(repo, &manifest, path).await?.is_some() {
+            bail!("destination precondition failed");
+        }
+        let mut parent = Path::new(path).parent();
+        while let Some(folder) = parent.filter(|p| !p.as_os_str().is_empty()) {
+            if dav::stat_unlocked(repo, &manifest, path_to_str(folder)?)
+                .await?
+                .is_some_and(|entry| !entry.is_dir)
+            {
+                bail!("invalid destination parent");
+            }
+            parent = folder.parent();
+        }
+        if self
+            .read_pending_conflicts(user, vault)
+            .await?
+            .contains_key(path)
+        {
+            bail!("destination reconciliation required");
+        }
+        Ok(())
     }
 
     async fn upsert_device(

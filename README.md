@@ -688,6 +688,29 @@ under `auth` contain identity or credential material. Saber encryption passwords
 
 ## API
 
+Native v2 sync supports optional atomic destination creation when `/v1/server/info` advertises
+`nativeSyncConditionalCreate`. Send `destinationCondition: "absent"` on
+`POST /v2/shares/{shareId}/sync` with exactly one ordinary text/binary upsert and the usual sync fields.
+The condition is checked under the same share lock as native and DAV writes, before consuming the completed upload
+and applying bytes. Null `baseHead` is supported; current logical presence, not the base, decides absence.
+Existing files (even identical or zero-byte), binary resources and collections return `412` with
+`{"error":"destination precondition failed"}`. An absent target with a pending conflict returns `409` with
+`{"error":"destination reconciliation required"}`. Neither response applies the import payload or consumes its
+completed upload. Authorization and existing path/managed-content guards apply before presence is disclosed.
+
+Omitting the condition preserves normal sync. Invalid/explicit-null conditions, multiple changes, deletion and
+unsupported shared-request operations fail with `400`. This option is not supported on v1, read sync or paired
+InkVault resolution. Older servers can ignore unknown fields: require the advertised capability and never fall
+back to ordinary upsert when conditional creation is needed. WebDAV conditional creation is a separate contract.
+
+Success retains the normal `200` sync response and resulting head after the existing Git/remote/device completion
+path. Inspect contents and conflicts before treating captured bytes as accepted. Lost responses or disk/Git/remote
+failures after application can be ambiguous; retain recovery evidence and query snapshots/blobs/conflicts instead
+of replaying consumed upload IDs. Conditional retries still return `412` for existing bytes, including partial
+writes. This is exclusion among cooperating local writers, not a cross-share transaction or crash-atomic commit.
+Upstream integration is rechecked before creation; prior recovery/integration effects are not rolled back. External
+Git writers and privileged filesystem edits remain separate trust boundaries, and later writers can change a file.
+
 - `GET /v1/auth/config`
 - `GET /v1/auth/session`
 - `POST /v1/auth/session/refresh`

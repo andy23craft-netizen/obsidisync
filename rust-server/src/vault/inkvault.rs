@@ -81,6 +81,7 @@ impl VaultService {
         request: SyncRequest,
         resolving: bool,
     ) -> Result<SyncResponse> {
+        request.reject_destination_condition()?;
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         self.with_lock(&user, &vault, || {

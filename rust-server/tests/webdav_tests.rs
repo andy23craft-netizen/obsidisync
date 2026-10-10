@@ -266,6 +266,7 @@ async fn sync_files(app: &axum::Router, base_head: Option<&str>) -> (Value, Vec<
                 .body(Body::from(
                     serde_json::to_string(&SyncRequest {
                         base_head: base_head.map(ToString::to_string),
+                        destination_condition: Default::default(),
                         client_id: "phone".to_string(),
                         device_name: "iPhone".to_string(),
                         changes: vec![],
@@ -1211,6 +1212,7 @@ async fn sync_reference_mode_returns_metadata_and_blob_endpoint_serves_bytes() {
                 .body(Body::from(
                     serde_json::to_string(&SyncRequest {
                         base_head: None,
+                        destination_condition: Default::default(),
                         client_id: "tablet".to_string(),
                         device_name: "Android".to_string(),
                         changes: vec![],

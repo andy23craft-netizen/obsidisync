@@ -1,8 +1,8 @@
-# FEAT-03 implementation audit
+# Server implementation audit
 
 This records source inspection and disposable automated regression evidence for the reviewed FEAT-03 contracts.
 It is not human acceptance, deployment, production migration, or verification with actual Obsidian/Saber clients.
-The feature ticket remains available for comparison and later ticket refresh. FEAT-04 has not begun.
+This audit preserves the server implementation evidence; current client work is tracked under `docs/tickets/`.
 
 ## Contract and surface audit
 
@@ -54,4 +54,4 @@ OIDC re-login communication, explicit authentication configuration and the coord
 The audited implementation has no unresolved product decisions. Legacy share-native Saber provisioning remains
 explicitly deferred; completed legacy Saber compatibility is retained. Implementation order remains
 FEAT-03 -> FEAT-04 -> PLAN-02 (FEAT-10 through FEAT-14), followed by one separately authorized production migration
-after validation. See [the composite plan](PLAN-02-composite-local-vault-synchronization.md).
+after validation. See [the composite plan](tickets/PLAN-02-composite-local-vault-synchronization.md).

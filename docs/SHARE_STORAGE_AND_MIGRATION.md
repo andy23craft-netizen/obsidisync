@@ -193,4 +193,4 @@ Use disposable directories/volumes and synthetic authentication for all migratio
 `npm run test:e2e`, build the actual Dockerfile, and `python3 tests/packaged_commands.py --image IMAGE` against a locally
 loaded image. Packaged fixtures use unique volumes and `--network none`, then remove only their own fixtures.
 Automated checks do not replace human verification or authorize a production migration/deployment.
-See the [implementation audit](FEAT-03-IMPLEMENTATION-AUDIT.md) for the inspected surfaces and fixture evidence.
+See the [implementation audit](SERVER_IMPLEMENTATION_AUDIT.md) for the inspected surfaces and fixture evidence.

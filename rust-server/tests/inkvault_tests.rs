@@ -63,6 +63,7 @@ fn changes(rev: i64) -> Vec<ClientChange> {
 }
 fn request(head: Option<String>, changes: Vec<ClientChange>) -> SyncRequest {
     SyncRequest {
+        destination_condition: Default::default(),
         base_head: head,
         client_id: "inkvault-test".into(),
         device_name: "InkVault test".into(),

@@ -1,6 +1,6 @@
 # FEAT-14: Explicit Cross-Mount Import
 
-**Status:** Proposed implementation
+**Status:** Design specified; implementation blocked on FEAT-15
 **Owner:** Obsidian plugin
 **Parent:** [PLAN-02](PLAN-02-composite-local-vault-synchronization.md)
 
@@ -12,6 +12,8 @@ Detected local moves must use existing barriers rather than silently becoming de
 
 ## Dependencies
 
+- Hard, unimplemented: [FEAT-15](FEAT-15-native-sync-conditional-create.md) for atomic conditional destination creation
+  in native v2 sync. Collision safety is required; existing native merge/conflict behavior is not a substitute.
 - Hard, implemented: [FEAT-10/11](../COMPOSITE_MOUNT_DOWNLOADS.md) for mount setup, move records/generations,
   guarded writes, exact captured-evidence recovery and reconciliation release primitives.
 - FEAT-12/13 are not hard dependencies: use fresh active mounts and scoped sync acceptance, not history/credential UI.
@@ -27,6 +29,12 @@ Detected local moves must use existing barriers rather than silently becoming de
 - Use collision-safe copies with verified bytes. Existing destination collisions require separate confirmed backup/
   reconciliation; never silently overwrite. Fresh verified recovery copies protect local bytes where replacement is
   approved. An already moved file is evidence at its current location, not proof destination upload was approved.
+- Require fresh `nativeSyncConditionalCreate` capability evidence and use FEAT-15's `destinationCondition: "absent"`
+  for each destination creation. A missing capability stops import; never fall back to ordinary upsert/resolve or
+  DAV. A `412` retains source/recovery evidence and requires collision reconciliation or a new absent destination.
+  Import itself never replaces an existing remote destination; separate collision consent is not permission to
+  bypass the condition. Reconcile collisions separately, then recapture/reconfirm the import plan. Lost-response
+  recovery may verify an already submitted captured version using the existing authoritative evidence rules.
 - Persist stable import ID, endpoint mount IDs/bindings/revisions/generations, original/current path mappings,
   captured hashes/deletions, backup/collision evidence, explicit decisions and per-file copy/verification/destination
   acceptance/source-delete intents and outcomes. Keep this local-only and use serialized snapshots plus adapter
@@ -57,11 +65,15 @@ Add explicit import/recovery UI using FEAT-10 move records/resolver and FEAT-11 
 primitives. Persist import progress in versioned settings with attributable endpoint identity; reuse verified adapter
 capture/backup/application rather than inventing parallel sync logic. FEAT-12's vault conversion journal is a separate
 lifecycle: this ticket operates on active mounts and never activates a new composite configuration.
+Use FEAT-15 for per-file destination creation while retaining FEAT-11 journal/recovery ownership; no new server
+implementation belongs to this client ticket. Persist the conditional submission intent before network effects.
 
 ## Acceptance Criteria
 
 - Approved import verifies copied text/attachments and destination acceptance before offering source deletion.
 - Destination collision, checksum failure, partial staging, conflict or lost response cannot silently delete source.
+- A competing destination create returns `412` without replacing/merging its bytes; missing server capability cannot
+  result in an ordinary write. Existing remote destinations require separate reconciliation, never import overwrite.
 - Restart recovers journal/files/server evidence conservatively; submitted requests never imply rollback or replay.
 - Fresh consent releases only appropriate destination barriers; source deletion needs separate current approval.
 - Detected moves retain recoverable bytes and original remote deletion barriers, even when local source is absent.

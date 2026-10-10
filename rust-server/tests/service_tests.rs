@@ -1832,6 +1832,164 @@ async fn detects_binary_conflicts_without_overwriting_client_file() {
     );
 }
 
+fn conditional_sync(path: &str, bytes: &[u8], base: Option<String>) -> SyncRequest {
+    SyncRequest {
+        destination_condition: obsidian_git_sync_server::protocol::DestinationCondition::Absent,
+        changes: vec![upsert(path, bytes)],
+        ..empty_sync(base)
+    }
+}
+
+#[tokio::test]
+async fn conditional_create_uses_current_absence_not_historical_merge_base() {
+    let root = tempfile::tempdir().unwrap();
+    let service = VaultService::legacy_for_fixture(root.path().join("data"));
+    service
+        .register("share", VAULT, local_register_request())
+        .await
+        .unwrap();
+    for path in ["Recreated.md", "Recreated.bin"] {
+        let first = service
+            .sync_v2(VAULT, conditional_sync(path, b"old", None), false)
+            .await
+            .unwrap();
+        let deleted = service
+            .sync_v2(
+                VAULT,
+                SyncRequest {
+                    changes: vec![ClientChange::Delete { path: path.into() }],
+                    ..empty_sync(first.server_head.clone())
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status, SyncStatus::Ok);
+        let created = service
+            .sync_v2(
+                VAULT,
+                conditional_sync(path, b"new", first.server_head),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status, SyncStatus::Ok);
+        assert_eq!(
+            service
+                .file_bytes_at_version(
+                    "share",
+                    VAULT,
+                    path,
+                    created.server_head.as_deref().unwrap()
+                )
+                .await
+                .unwrap()
+                .1,
+            b"new"
+        );
+    }
+    let request = conditional_sync("Unsupported.md", b"never", None);
+    assert!(service.sync("share", VAULT, request.clone()).await.is_err());
+    assert!(service
+        .read_sync("share", VAULT, request.clone(), false)
+        .await
+        .is_err());
+    assert!(service
+        .sync_inkvault("share", VAULT, request.clone())
+        .await
+        .is_err());
+    assert!(service
+        .resolve_inkvault("share", VAULT, request)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn conditional_create_rechecks_after_remote_integration() {
+    let fixture = GitFixture::new().await;
+    fixture.seed_file("Seed.md", b"seed").await;
+    let service = VaultService::new_for_tests(fixture.root.path().join("data"));
+    service
+        .register("share", VAULT, register_request(&fixture.remote))
+        .await
+        .unwrap();
+    fixture
+        .commit_remote_file(
+            "remote-writer",
+            "Collision.md",
+            b"remote winner",
+            "remote create",
+        )
+        .await;
+    let error = service
+        .sync_v2(
+            VAULT,
+            conditional_sync("Collision.md", b"loser", None),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "destination precondition failed");
+    let repo = fixture
+        .root
+        .path()
+        .join("data/users/share/vaults/notes/repo");
+    assert_eq!(
+        fs::read(repo.join("Collision.md")).await.unwrap(),
+        b"remote winner"
+    );
+    assert!(!repo.join("pending-conflicts.json").exists());
+}
+
+#[tokio::test]
+async fn conditional_create_commit_failure_is_ambiguous_and_retry_never_overwrites() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let service = VaultService::legacy_for_fixture(data.clone());
+    service
+        .register("share", VAULT, local_register_request())
+        .await
+        .unwrap();
+    let repo = data.join("users/share/vaults/notes/repo");
+    // Fail the payload commit, after its bytes have been applied, without enabling Git hooks.
+    git(Some(&repo), &["config", "commit.gpgsign", "true"], &[0])
+        .await
+        .unwrap();
+    git(
+        Some(&repo),
+        &["config", "gpg.program", "/nonexistent-synthetic-signer"],
+        &[0],
+    )
+    .await
+    .unwrap();
+    assert!(service
+        .sync_v2(
+            VAULT,
+            conditional_sync("Partial.md", b"retained", None),
+            false
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        fs::read(repo.join("Partial.md")).await.unwrap(),
+        b"retained"
+    );
+    let restarted = VaultService::legacy_for_fixture(data);
+    let error = restarted
+        .sync_v2(
+            VAULT,
+            conditional_sync("Partial.md", b"replacement", None),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "destination precondition failed");
+    assert_eq!(
+        fs::read(repo.join("Partial.md")).await.unwrap(),
+        b"retained"
+    );
+}
+
 struct GitFixture {
     root: TempDir,
     remote: PathBuf,
@@ -1946,6 +2104,7 @@ fn local_register_request() -> RegisterRequest {
 
 fn empty_sync(base_head: Option<String>) -> SyncRequest {
     SyncRequest {
+        destination_condition: Default::default(),
         base_head,
         client_id: "device".to_string(),
         device_name: "iPhone".to_string(),

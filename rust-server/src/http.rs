@@ -32,6 +32,7 @@ const SERVER_FEATURES: &[&str] = &[
     "saberNextcloud",
     "shareSyncV2",
     "readOnlyShareSync",
+    "nativeSyncConditionalCreate",
 ];
 /// PDFs exported from note-taking tablets are routinely larger than the JSON sync payload limit.
 pub const DEFAULT_WEBDAV_MAX_BODY_BYTES: usize = 200 * 1024 * 1024;
@@ -180,7 +181,11 @@ impl IntoResponse for ApiError {
 }
 
 fn status_for_error(message: &str) -> StatusCode {
-    if message.contains("local login unavailable")
+    if message == "destination precondition failed" {
+        StatusCode::PRECONDITION_FAILED
+    } else if message == "destination reconciliation required" {
+        StatusCode::CONFLICT
+    } else if message.contains("local login unavailable")
         || message.contains("auth store")
         || message.contains("account store")
     {
@@ -337,6 +342,12 @@ fn apply_cors(router: Router, allowed_origins: Vec<String>) -> Router {
 }
 
 fn public_error_message(status: StatusCode, message: &str) -> String {
+    if matches!(
+        message,
+        "destination precondition failed" | "destination reconciliation required"
+    ) {
+        return message.to_string();
+    }
     match status {
         StatusCode::SERVICE_UNAVAILABLE if message.contains("local login unavailable") => {
             "Ask the server operator to create or enable a local account".to_string()

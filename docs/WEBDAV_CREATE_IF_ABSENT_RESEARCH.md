@@ -2,7 +2,7 @@
 
 **Inspected:** 2026-10-09. **Scope:** source research and one proposed ticket; no implementation or deployment.
 **Primary architectural reference:** [Architecture](architecture/README.md), completed before this investigation.
-**Implementation ticket:** [FEAT-06](FEAT-06-webdav-atomic-create-if-absent.md).
+**Implementation ticket:** [FEAT-06](tickets/FEAT-06-webdav-atomic-create-if-absent.md).
 
 ## Finding and smallest extension
 

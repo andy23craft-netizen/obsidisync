@@ -1458,6 +1458,7 @@ async fn sync_upserts(app: &axum::Router, files: &[(&str, &[u8])]) {
         &[("content-type", "application/json")],
         serde_json::to_vec(&SyncRequest {
             base_head: None,
+            destination_condition: Default::default(),
             client_id: "laptop".to_string(),
             device_name: "Laptop".to_string(),
             changes,
