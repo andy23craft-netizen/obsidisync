@@ -2,7 +2,9 @@
 
 **Inspected:** 2026-10-09. **Scope:** source research and one proposed ticket; no implementation or deployment.
 **Primary architectural reference:** [Architecture](../architecture/README.md), completed before this investigation.
-**Implementation ticket:** [FEAT-06](../tickets/FEAT-06-webdav-atomic-create-if-absent.md).
+**Historical investigation:** FEAT-06 has been implemented and its ticket retired. The source descriptions and
+readiness verdict below record the pre-implementation investigation, not current behavior or deployment evidence.
+See the [implemented contract](WEBDAV_CONDITIONAL_CREATE.md) for current semantics and recovery.
 
 ## Finding and smallest extension
 
@@ -162,7 +164,8 @@ Existing evidence inspected:
   `share_protocol_tests.rs::every_share_route_denies_nonmembers_and_readonly_requests_preserve_storage`: published
   storage, independent grants, read-only and native authorization foundations. These do not prove the new condition.
 
-New acceptance cases, exact expected results and fixture locations are in [FEAT-06](../tickets/FEAT-06-webdav-atomic-create-if-absent.md).
+The original FEAT-06 acceptance cases are now represented by automated fixtures; see the
+[implemented contract](WEBDAV_CONDITIONAL_CREATE.md) for their scope.
 Use published synthetic shares and a shared router/service. Add deterministic barriers around body completion/write
 entry where needed, rather than relying only on simultaneous task launch. Include a native-sync/DAV race and
 destination MOVE/COPY race to verify the shared boundary; no new conditions are needed on those APIs.

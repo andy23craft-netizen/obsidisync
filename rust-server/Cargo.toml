@@ -37,5 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
+http-body-util = { version = "0.1", features = ["channel"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

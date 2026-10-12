@@ -22,6 +22,43 @@ const ENC_PASSWORD: &str = "correct horse";
 const IV: [u8; 16] = [9; 16];
 
 #[tokio::test]
+async fn legacy_nextcloud_mounts_enforce_conditional_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let app = app(&state);
+    register(&app, &state).await;
+    let secret = saber_password(&state, ENC_PASSWORD).await;
+    let auth = basic("alice", &secret);
+    for uri in [
+        "/remote.php/webdav/Saber/manifest.md",
+        "/remote.php/dav/files/alice/Saber/files.md",
+    ] {
+        for expected in [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("authorization", &auth)
+                        .header("if-none-match", "*")
+                        .header("x-oc-mtime", "1700000000")
+                        .body(Body::from("manifest identity"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::CREATED {
+                assert!(response.headers().contains_key("x-obsidisync-revision"));
+                assert!(response.headers().contains_key(header::ETAG));
+                assert_eq!(response.headers()["x-oc-mtime"], "accepted");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn published_legacy_saber_preserves_rendering_export_scope_and_revocation() {
     use obsidian_git_sync_server::accounts::{AccountStore, Capability, Membership, Principal};
     use obsidian_git_sync_server::publication::{Mapping, Publication};

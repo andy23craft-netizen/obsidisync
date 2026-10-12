@@ -16,7 +16,7 @@ use crate::http::AppState;
 use crate::time_format::{
     http_date_from_unix, rfc3339_from_unix, unix_now_millis, unix_seconds_from_millis,
 };
-use crate::vault::dav::{DavDevice, DavEntry};
+use crate::vault::dav::{DavDevice, DavEntry, DavWriteCondition};
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
@@ -903,6 +903,20 @@ fn if_match_tag(headers: &HeaderMap) -> Result<Option<String>, DavError> {
         .ok_or_else(|| DavError::new(StatusCode::PRECONDITION_FAILED, "precondition failed"))
 }
 
+/// Restricted PUT profile: exactly one wildcard field, never a tag list or fallback.
+fn if_none_match_absent(headers: &HeaderMap) -> Result<bool, DavError> {
+    let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() || value.to_str().ok().map(str::trim) != Some("*") {
+        return Err(DavError::bad_request(
+            "unsupported If-None-Match; use one wildcard field",
+        ));
+    }
+    Ok(true)
+}
+
 async fn put(
     state: &AppState,
     grant: &DeviceGrant,
@@ -928,8 +942,10 @@ async fn put(
     if declared_length.is_some_and(|length| length > limit) {
         return Err(DavError::payload_too_large(limit));
     }
+    let absent = if_none_match_absent(headers)?;
     let if_match = if_match_tag(headers)?;
-    if let Some(if_match) = if_match.as_deref() {
+    // Absence mode uses the final locked check for all method/precondition ordering.
+    if let Some(if_match) = if_match.as_deref().filter(|_| !absent) {
         if !state
             .vaults
             .dav_etag_matches(&grant.user, &grant.vault, path, if_match)
@@ -951,42 +967,48 @@ async fn put(
         return Err(error);
     }
     let client_mtime = client_mtime_millis(headers);
-    let created = match if_match.as_deref() {
-        Some(if_match) => {
-            state
-                .vaults
-                .dav_write_from_file_if_match(
-                    &grant.user,
-                    &grant.vault,
-                    path,
-                    &staged,
-                    client_mtime,
-                    if_match,
-                    &device_for(grant),
-                )
-                .await?
+    let condition = if absent {
+        DavWriteCondition::Absent {
+            if_match,
+            granted_folder: grant.folder.clone(),
         }
-        None => {
-            state
-                .vaults
-                .dav_write_from_file(
-                    &grant.user,
-                    &grant.vault,
-                    path,
-                    &staged,
-                    client_mtime,
-                    &device_for(grant),
-                )
-                .await?
+    } else {
+        match if_match {
+            Some(tag) => DavWriteCondition::Match(tag),
+            None => DavWriteCondition::Unconditional,
         }
     };
+    let result = state
+        .vaults
+        .dav_write_from_file_conditionally(
+            &grant.user,
+            &grant.vault,
+            path,
+            &staged,
+            client_mtime,
+            condition,
+            &device_for(grant),
+        )
+        .await?;
     notify_saber(state, grant, vec![path.to_string()]);
-    let status = if created {
+    let status = if result.created {
         StatusCode::CREATED
     } else {
         StatusCode::NO_CONTENT
     };
     let mut response = status.into_response();
+    if let Some(receipt) = result.receipt {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-obsidisync-revision"),
+            HeaderValue::from_str(&receipt.revision).map_err(DavError::internal)?,
+        );
+        if let Some(etag) = receipt.etag {
+            response.headers_mut().insert(
+                header::ETAG,
+                HeaderValue::from_str(&format!("\"{etag}\"")).map_err(DavError::internal)?,
+            );
+        }
+    }
     if client_mtime.is_some() {
         // Nextcloud's acknowledgement; clients that sent the header expect it back.
         response.headers_mut().insert(

@@ -106,6 +106,169 @@ fn conditional_create(path: &str, bytes: &[u8]) -> Value {
 }
 
 #[tokio::test]
+async fn dav_conditional_create_active_grants_and_all_share_mounts() {
+    use base64::Engine;
+    use obsidian_git_sync_server::share_credentials::Store;
+    let (root, app, state, share, _, _) = conditional_fixture().await;
+    let accounts = AccountStore::load(root.path()).unwrap();
+    let writer = accounts.shares[0].members[0].principal.clone();
+    let reader = accounts.shares[0].members[1].principal.clone();
+    let mut credentials = Store::load(root.path()).unwrap();
+    let (id, secret) = credentials
+        .create(
+            &accounts,
+            &share,
+            writer,
+            "Household",
+            Capability::ReadWrite,
+            "Writer",
+        )
+        .unwrap();
+    let (read_id, read_secret) = credentials
+        .create(
+            &accounts,
+            &share,
+            reader,
+            "Household",
+            Capability::Read,
+            "Reader",
+        )
+        .unwrap();
+    credentials.save(root.path()).unwrap();
+    let basic = |secret: &str| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{share}:{secret}"))
+        )
+    };
+    let auth = basic(&secret);
+    let read_auth = basic(&read_secret);
+    let put = |uri: String, auth: String| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("authorization", auth)
+                .header("if-none-match", "*")
+                .body(Body::from("identity"))
+                .unwrap(),
+        )
+    };
+    let uri = format!("/dav/{share}/Household/project.md");
+    assert_eq!(
+        put(uri.clone(), auth.clone()).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for id in [&id, &read_id] {
+        obsidian_git_sync_server::admin::execute(
+            root.path(),
+            &["credential", "share", "activate", id].map(String::from),
+        )
+        .await
+        .unwrap();
+    }
+    for path in ["project.md", "absent.md"] {
+        assert_eq!(
+            put(format!("/dav/{share}/Household/{path}"), read_auth.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for uri in [
+        uri.clone(),
+        format!("/remote.php/webdav/Household/nextcloud.md"),
+        format!("/remote.php/dav/files/{share}/Household/files.md"),
+    ] {
+        let response = put(uri.clone(), auth.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(response.headers().contains_key("x-obsidisync-revision"));
+        assert_eq!(
+            put(uri, auth.clone()).await.unwrap().status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+    }
+    for uri in [
+        format!("/dav/{share}/Private/hidden.md"),
+        "/dav/nonexistent/Household/project.md".into(),
+        format!("/remote.php/dav/files/wrong/Household/project.md"),
+    ] {
+        assert_eq!(
+            put(uri, auth.clone()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    #[cfg(unix)]
+    {
+        let repo = root.path().join("shares").join(&share).join("repo");
+        std::os::unix::fs::symlink(root.path().join("absent"), repo.join("Household/link.md"))
+            .unwrap();
+        let response = put(format!("/dav/{share}/Household/link.md"), auth.clone())
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_ne!(response.status(), StatusCode::PRECONDITION_FAILED);
+        fs::remove_file(repo.join("Household/link.md")).unwrap();
+    }
+    // Active independent grants do not silently enable Saber rendering.
+    let native_endpoint = format!("/v2/shares/{share}/sync");
+    let native_auth = format!(
+        "Bearer {}",
+        state
+            .auth
+            .login_password("alice", PASSWORD)
+            .await
+            .unwrap()
+            .access_token
+    );
+    let (dav, native) = tokio::join!(
+        put(
+            format!("/dav/{share}/Household/native-race.md"),
+            auth.clone()
+        ),
+        request(
+            &app,
+            "POST",
+            &native_endpoint,
+            &native_auth,
+            conditional_create("Household/native-race.md", b"native")
+        ),
+    );
+    let dav = dav.unwrap().status();
+    assert!(
+        (dav == StatusCode::CREATED && native.0 == StatusCode::PRECONDITION_FAILED)
+            || (dav == StatusCode::PRECONDITION_FAILED && native.0 == StatusCode::OK),
+        "DAV {dav}; native {} {}",
+        native.0,
+        native.1
+    );
+    for path in ["project.md", "absent.md"] {
+        assert_eq!(
+            put(format!("/dav/{share}/Household/{path}"), read_auth.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let grant = obsidian_git_sync_server::grants::authenticate(&state, Some(&share), &secret)
+        .await
+        .unwrap();
+    assert!(grant.saber.is_none());
+    obsidian_git_sync_server::admin::execute(
+        root.path(),
+        &["credential", "share", "revoke", &id].map(String::from),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        put(uri, auth).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn native_conditional_create_collisions_restart_and_compatibility() {
     let (root, app, state, share, alice, bob) = conditional_fixture().await;
     let endpoint = format!("/v2/shares/{share}/sync");

@@ -13,6 +13,28 @@ use crate::time_format::unix_now_millis;
 use std::collections::BTreeMap;
 use std::time::UNIX_EPOCH;
 
+/// Conditions are evaluated inside the same lock as the destination mutation.
+#[derive(Debug, Default)]
+pub enum DavWriteCondition {
+    #[default]
+    Unconditional,
+    Match(String),
+    Absent {
+        if_match: Option<String>,
+        granted_folder: String,
+    },
+}
+
+pub struct DavWriteResult {
+    pub created: bool,
+    pub receipt: Option<DavWriteReceipt>,
+}
+
+pub struct DavWriteReceipt {
+    pub revision: String,
+    pub etag: Option<String>,
+}
+
 /// A file or directory as seen through WebDAV. `path` is vault-relative; the vault root is `""`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavEntry {
@@ -201,10 +223,11 @@ impl VaultService {
             path,
             WriteSource::Bytes(content),
             None,
-            None,
+            DavWriteCondition::Unconditional,
             device,
         )
         .await
+        .map(|result| result.created)
     }
 
     /// Writes a whole file from a staged upload. The staged file is always cleaned up.
@@ -221,19 +244,17 @@ impl VaultService {
         mtime_millis: Option<i64>,
         device: &DavDevice,
     ) -> Result<bool> {
-        let result = self
-            .dav_write_source(
-                user,
-                vault,
-                path,
-                WriteSource::File(staged.to_path_buf()),
-                mtime_millis,
-                None,
-                device,
-            )
-            .await;
-        let _ = fs::remove_file(staged).await;
-        result
+        self.dav_write_from_file_conditionally(
+            user,
+            vault,
+            path,
+            staged,
+            mtime_millis,
+            DavWriteCondition::Unconditional,
+            device,
+        )
+        .await
+        .map(|result| result.created)
     }
 
     /// Conditional variant of `dav_write_from_file`. The comparison and write share the vault
@@ -249,6 +270,30 @@ impl VaultService {
         if_match: &str,
         device: &DavDevice,
     ) -> Result<bool> {
+        self.dav_write_from_file_conditionally(
+            user,
+            vault,
+            path,
+            staged,
+            mtime_millis,
+            DavWriteCondition::Match(if_match.to_string()),
+            device,
+        )
+        .await
+        .map(|result| result.created)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dav_write_from_file_conditionally(
+        &self,
+        user: &str,
+        vault: &str,
+        path: &str,
+        staged: &Path,
+        mtime_millis: Option<i64>,
+        condition: DavWriteCondition,
+        device: &DavDevice,
+    ) -> Result<DavWriteResult> {
         let result = self
             .dav_write_source(
                 user,
@@ -256,7 +301,7 @@ impl VaultService {
                 path,
                 WriteSource::File(staged.to_path_buf()),
                 mtime_millis,
-                Some(if_match),
+                condition,
                 device,
             )
             .await;
@@ -272,9 +317,9 @@ impl VaultService {
         path: &str,
         source: WriteSource,
         mtime_millis: Option<i64>,
-        if_match: Option<&str>,
+        condition: DavWriteCondition,
         device: &DavDevice,
-    ) -> Result<bool> {
+    ) -> Result<DavWriteResult> {
         let user = validate_slug(user, "user")?;
         let vault = validate_slug(vault, "vault")?;
         let path = validate_dav_path(path)?;
@@ -292,6 +337,30 @@ impl VaultService {
             )
             .await?;
             let mut manifest = read_manifest(&repo).await?;
+            let if_match = match &condition {
+                DavWriteCondition::Unconditional => None,
+                DavWriteCondition::Match(tag) => Some(tag.as_str()),
+                DavWriteCondition::Absent { if_match, .. } => if_match.as_deref(),
+            };
+            if let DavWriteCondition::Absent { granted_folder, .. } = &condition {
+                // Scope context is explicit: only the credential's root may be virtual.
+                let folder = validate_dav_path(granted_folder)?;
+                if folder.is_empty() || !path.starts_with(&format!("{folder}/")) {
+                    bail!("forbidden: destination outside granted folder");
+                }
+                // Check from the root outward, avoiding ENOTDIR from stat on a child of a file.
+                let parent = Path::new(&path).parent().unwrap();
+                let mut prefix = String::new();
+                for component in parent.components() {
+                    prefix = join_path(&prefix, component.as_os_str().to_str().unwrap());
+                    let entry = stat_unlocked(&repo, &manifest, &prefix).await?;
+                    if entry.as_ref().is_some_and(|entry| !entry.is_dir)
+                        || (prefix.len() > folder.len() && entry.is_none())
+                    {
+                        bail!("conflict: destination parent is not a collection");
+                    }
+                }
+            }
             let existing = stat_unlocked(&repo, &manifest, &path).await?;
             if existing.as_ref().is_some_and(|entry| entry.is_dir) {
                 bail!("conflict: {path} is a directory");
@@ -301,6 +370,17 @@ impl VaultService {
             }) {
                 bail!("precondition failed");
             }
+            let input_hash = if matches!(condition, DavWriteCondition::Absent { .. }) {
+                if existing.is_some() {
+                    bail!("precondition failed");
+                }
+                Some(match &source {
+                    WriteSource::File(staged) => sha256_file(staged).await?,
+                    WriteSource::Bytes(bytes) => format!("{:x}", Sha256::digest(bytes)),
+                })
+            } else {
+                None
+            };
             let mtime_millis = if if_match.is_some() {
                 Some(
                     existing
@@ -330,7 +410,32 @@ impl VaultService {
             };
             self.finish_dav_commit(&user, &vault, &state, &repo, device, &touched)
                 .await?;
-            Ok(existing.is_none())
+            let receipt = if let Some(input_hash) = input_hash {
+                let revision = self.head_from_repo(&repo).await?.ok_or_else(|| {
+                    anyhow!("creation outcome uncertain: resulting Git head unavailable")
+                })?;
+                let final_manifest = read_manifest(&repo).await?;
+                let entry = stat_unlocked(&repo, &final_manifest, &path)
+                    .await?
+                    .filter(|entry| !entry.is_dir)
+                    .ok_or_else(|| {
+                        anyhow!("creation outcome uncertain: resulting file unavailable")
+                    })?;
+                let final_hash = match final_manifest.files.get(&path) {
+                    Some(binary) => sha256_file(&binary_root.join(&binary.object_path)).await?,
+                    None => sha256_file(&repo_path(&repo, &path)?).await?,
+                };
+                Some(DavWriteReceipt {
+                    revision,
+                    etag: (final_hash == input_hash).then_some(entry.etag),
+                })
+            } else {
+                None
+            };
+            Ok(DavWriteResult {
+                created: existing.is_none(),
+                receipt,
+            })
         })
         .await
     }

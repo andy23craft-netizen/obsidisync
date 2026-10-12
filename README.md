@@ -427,6 +427,12 @@ Files uploaded over WebDAV are committed to the vault repository under the devic
 
 The endpoint implements WebDAV class 1 (`OPTIONS`, `PROPFIND` with depth 0 or 1, `GET`, `HEAD`, `PUT`, `DELETE`, `MKCOL`, `MOVE`, `COPY`) plus advisory `LOCK`/`UNLOCK` so class 2 clients such as macOS Finder or Windows Explorer work too. Downloads support single byte ranges (`Range: bytes=...`) for PDF viewers that read files in place. Uploads are streamed to disk, so large PDFs do not have to fit into server memory, and are limited by `OBSIDIAN_GIT_SYNC_WEBDAV_MAX_BODY_BYTES` (default 200 MB). If the server sits behind a reverse proxy, raise its request body limit for `/dav/` as well (for nginx, `client_max_body_size`; its default of 1 MB rejects most PDF uploads with `413`). Unconditional re-uploads of unchanged bytes remain no-ops. A `PUT` with `If-Match` requires the exact current strong ETag; even when its bytes are unchanged, a successful conditional write advances the resource ETag so the original tag becomes stale.
 
+WebDAV and Nextcloud PUT also support atomic create-if-absent with exactly one `If-None-Match: *` field.
+Existing files return `412` without replacement; missing parents return `409` in this mode. Successful creation
+returns `X-ObsidiSync-Revision` and an ETag when the completed bytes match the request. Preserve the condition on
+retry and reconcile uncertain outcomes by read-back. See the
+[conditional creation contract and recovery notes](docs/technical-reference/WEBDAV_CONDITIONAL_CREATE.md).
+
 ### InkVault editable handwriting
 
 Native InkVault clients can publish editable source packages and server-rendered

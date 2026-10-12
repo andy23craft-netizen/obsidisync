@@ -150,6 +150,635 @@ fn app(root: &std::path::Path) -> axum::Router {
     router(state(root), 1024 * 1024, Vec::new())
 }
 
+#[tokio::test]
+async fn conditional_create_contract_receipts_and_restart() {
+    use obsidian_git_sync_server::git::git;
+    let root = tempfile::tempdir().unwrap();
+    let shared = state(root.path());
+    let vaults = shared.vaults.clone();
+    let app = router(shared, 1024 * 1024, Vec::new());
+    register(&app, root.path()).await;
+    let created = create_password(&app, "Conditional writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    let repo = vaults.storage_root("alice", "notes").unwrap().join("repo");
+    let uri = "/dav/notes/Tablet/project.md";
+    let condition = [("if-none-match", " * ")];
+    let response = dav(
+        &app,
+        "PUT",
+        uri,
+        Some(&auth),
+        &condition,
+        b"identity\n".to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let revision = response.headers()["x-obsidisync-revision"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        revision,
+        String::from_utf8(
+            git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+                .await
+                .unwrap()
+                .stdout
+        )
+        .unwrap()
+        .trim()
+    );
+    assert_eq!(
+        response.headers()[header::ETAG],
+        dav_etag(&app, &auth, uri).await
+    );
+    assert!(to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+    // A lost response is reconciled by read-back; retry must not replace identical bytes.
+    for body in [b"identity\n".to_vec(), b"foreign\n".to_vec()] {
+        let retry = dav(&app, "PUT", uri, Some(&auth), &condition, body).await;
+        assert_eq!(retry.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(!retry.headers().contains_key("x-obsidisync-revision"));
+    }
+    assert_eq!(
+        revision,
+        String::from_utf8(
+            git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+                .await
+                .unwrap()
+                .stdout
+        )
+        .unwrap()
+        .trim()
+    );
+    for method in ["HEAD", "PROPFIND"] {
+        let response = dav(
+            &app,
+            method,
+            uri,
+            Some(&auth),
+            &[("depth", "0")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if method == "HEAD" {
+                StatusCode::OK
+            } else {
+                StatusCode::MULTI_STATUS
+            }
+        );
+    }
+    let listing = dav(
+        &app,
+        "PROPFIND",
+        "/dav/notes/Tablet",
+        Some(&auth),
+        &[("depth", "1")],
+        Vec::new(),
+    )
+    .await;
+    assert!(text(listing).await.contains("project.md"));
+    let restarted = router(
+        AppState::new(
+            VaultService::new(root.path().join("data")),
+            AuthVerifier::StaticTokenForDev {
+                token: "secret".into(),
+                user: "alice".into(),
+            },
+            PublicAuthConfig::Token,
+        ),
+        1024 * 1024,
+        Vec::new(),
+    );
+    assert_eq!(
+        text(dav(&restarted, "GET", uri, Some(&auth), &[], Vec::new()).await).await,
+        "identity\n"
+    );
+    let reconstructed = root.path().join("reconstructed");
+    git(
+        None,
+        &[
+            "clone",
+            repo.to_str().unwrap(),
+            reconstructed.to_str().unwrap(),
+        ],
+        &[0],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(reconstructed.join("Tablet/project.md")).unwrap(),
+        b"identity\n"
+    );
+
+    // Refusal preserves uncommitted bytes and pending conflicts as well as committed files.
+    let pending = vaults
+        .storage_root("alice", "notes")
+        .unwrap()
+        .join("pending-conflicts.json");
+    for (name, bytes) in [("empty.md", Vec::new()), ("binary.bin", vec![0, 1, 2])] {
+        assert_eq!(
+            dav(
+                &app,
+                "PUT",
+                &format!("/dav/notes/Tablet/{name}"),
+                Some(&auth),
+                &condition,
+                bytes
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+    std::fs::write(repo.join("Tablet/partial.md"), b"partial").unwrap();
+    std::fs::write(&pending, br#"{"Tablet/partial.md":"other-device"}"#).unwrap();
+    let head = git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+        .await
+        .unwrap()
+        .stdout;
+    let before = std::fs::read(&pending).unwrap();
+    for name in ["partial.md", "empty.md", "binary.bin"] {
+        assert_eq!(
+            dav(
+                &app,
+                "PUT",
+                &format!("/dav/notes/Tablet/{name}"),
+                Some(&auth),
+                &condition,
+                b"replacement".to_vec()
+            )
+            .await
+            .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+    }
+    assert_eq!(
+        head,
+        git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+            .await
+            .unwrap()
+            .stdout
+    );
+    assert_eq!(std::fs::read(&pending).unwrap(), before);
+    assert_eq!(
+        std::fs::read(repo.join("Tablet/partial.md")).unwrap(),
+        b"partial"
+    );
+    assert_eq!(
+        dav(&app, "DELETE", uri, Some(&auth), &[], Vec::new())
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &condition,
+            b"new identity".to_vec()
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn conditional_create_header_parent_and_scope_refusals() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = state(root.path());
+    let vaults = shared.vaults.clone();
+    let app = router(shared, 1024 * 1024, Vec::new());
+    register(&app, root.path()).await;
+    let created = create_password(&app, "Writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    let uri = "/dav/notes/Tablet/absent.md";
+    for value in ["", "\"tag\"", "W/\"tag\"", "*, *", "*, \"tag\"", "**"] {
+        assert_eq!(
+            dav(
+                &app,
+                "PUT",
+                uri,
+                Some(&auth),
+                &[("if-none-match", value)],
+                b"invalid".to_vec()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &[("if-none-match", "*"), ("if-none-match", "*")],
+            b"duplicate".to_vec()
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let dual = [("if-none-match", "*"), ("if-match", "\"tag\"")];
+    assert_eq!(
+        dav(&app, "PUT", uri, Some(&auth), &dual, Vec::new())
+            .await
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        dav(&app, "GET", uri, Some(&auth), &[], Vec::new())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let condition = [("if-none-match", "*")];
+    assert_eq!(
+        dav(&app, "PUT", uri, Some(&auth), &condition, Vec::new())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let tag = dav_etag(&app, &auth, uri).await;
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &[("if-none-match", "*"), ("if-match", &tag)],
+            Vec::new()
+        )
+        .await
+        .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    for path in [
+        "Tablet/missing/child.md",
+        "Tablet/absent.md/child.md",
+        "Tablet/absent.md/nested/child.md",
+    ] {
+        assert_eq!(
+            dav(
+                &app,
+                "PUT",
+                &format!("/dav/notes/{path}"),
+                Some(&auth),
+                &condition,
+                Vec::new()
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    let repo = vaults.storage_root("alice", "notes").unwrap().join("repo");
+    assert!(!repo.join("Tablet/missing").exists());
+    let (left, right) = tokio::join!(
+        dav(
+            &app,
+            "MKCOL",
+            "/dav/notes/Tablet/dir",
+            Some(&auth),
+            &[],
+            Vec::new()
+        ),
+        dav(
+            &app,
+            "MKCOL",
+            "/dav/notes/Tablet/dir",
+            Some(&auth),
+            &[],
+            Vec::new()
+        ),
+    );
+    let mut statuses = [left.status().as_u16(), right.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [201, 405]);
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            "/dav/notes/Tablet/dir",
+            Some(&auth),
+            &condition,
+            Vec::new()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            "/dav/notes/Tablet",
+            Some(&auth),
+            &condition,
+            Vec::new()
+        )
+        .await
+        .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    for path in [
+        "Private/absent.md",
+        "Tablet/../escape.md",
+        "Tablet/a%2Fb.md",
+        "Tablet/.git/config",
+        "Tablet/.obsidian-git-sync/file",
+    ] {
+        let response = dav(
+            &app,
+            "PUT",
+            &format!("/dav/notes/{path}"),
+            Some(&auth),
+            &condition,
+            Vec::new(),
+        )
+        .await;
+        assert!(!response.status().is_success());
+        assert_ne!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+    #[cfg(unix)]
+    {
+        let outside = root.path().join("outside.md");
+        std::fs::write(&outside, b"private").unwrap();
+        for (name, destination) in [
+            ("link.md", outside.clone()),
+            ("dangling.md", root.path().join("missing")),
+            ("ancestor", root.path().to_path_buf()),
+        ] {
+            std::os::unix::fs::symlink(destination, repo.join("Tablet").join(name)).unwrap();
+            let suffix = if name == "ancestor" {
+                "ancestor/outside.md"
+            } else {
+                name
+            };
+            let response = dav(
+                &app,
+                "PUT",
+                &format!("/dav/notes/Tablet/{suffix}"),
+                Some(&auth),
+                &condition,
+                Vec::new(),
+            )
+            .await;
+            assert!(!response.status().is_success());
+            assert_ne!(response.status(), StatusCode::PRECONDITION_FAILED);
+        }
+        assert_eq!(std::fs::read(outside).unwrap(), b"private");
+    }
+}
+
+#[tokio::test]
+async fn conditional_creates_wait_for_both_streams_and_have_one_winner() {
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let app = app(root.path());
+    register(&app, root.path()).await;
+    let created = create_password(&app, "Writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let request = |bytes: &'static [u8]| {
+        let barrier = barrier.clone();
+        let (mut sender, body) = http_body_util::channel::Channel::<axum::body::Bytes>::new(1);
+        tokio::spawn(async move {
+            sender
+                .send_data(axum::body::Bytes::from_static(bytes))
+                .await
+                .unwrap();
+            // Sending the second frame waits until the handler has started reading its stage.
+            sender.send_data(axum::body::Bytes::new()).await.unwrap();
+            barrier.wait().await;
+        });
+        Request::builder()
+            .method("PUT")
+            .uri("/dav/notes/Tablet/race.md")
+            .header("authorization", &auth)
+            .header("if-none-match", "*")
+            .body(Body::new(body))
+            .unwrap()
+    };
+    let (left, right) = tokio::join!(
+        app.clone().oneshot(request(b"left")),
+        app.clone().oneshot(request(b"right"))
+    );
+    let (left, right) = (left.unwrap(), right.unwrap());
+    let mut statuses = [left.status().as_u16(), right.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [201, 412]);
+    let winner = if left.status() == StatusCode::CREATED {
+        "left"
+    } else {
+        "right"
+    };
+    assert_eq!(
+        text(
+            dav(
+                &app,
+                "GET",
+                "/dav/notes/Tablet/race.md",
+                Some(&auth),
+                &[],
+                Vec::new()
+            )
+            .await
+        )
+        .await,
+        winner
+    );
+}
+
+#[tokio::test]
+async fn conditional_create_serializes_with_put_native_and_move_copy() {
+    use axum::body::Bytes;
+    let root = tempfile::tempdir().unwrap();
+    let app = app(root.path());
+    register(&app, root.path()).await;
+    let created = create_password(&app, "Writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    let condition = [("if-none-match", "*")];
+    for operation in ["PUT", "SYNC", "MOVE", "COPY"] {
+        let uri = format!("/dav/notes/Tablet/{operation}.md");
+        // Keep creation staged but unfinished until a cooperating writer installs the target.
+        let (mut sender, body) = http_body_util::channel::Channel::<Bytes>::new(1);
+        let request = Request::builder()
+            .method("PUT")
+            .uri(&uri)
+            .header("authorization", &auth)
+            .header("if-none-match", "*")
+            .body(Body::new(body))
+            .unwrap();
+        let pending = tokio::spawn(app.clone().oneshot(request));
+        sender
+            .send_data(Bytes::from_static(b"loser"))
+            .await
+            .unwrap();
+        sender.send_data(Bytes::new()).await.unwrap();
+        if operation == "SYNC" {
+            let response = app.clone().oneshot(Request::builder().method("POST")
+                .uri("/v1/users/alice/vaults/notes/sync").header("authorization", BEARER)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"clientId":"native-writer","deviceName":"Native",
+                    "baseHead":null,"clientManifest":[],"changes":[{"op":"upsert","path":"Tablet/SYNC.md",
+                    "contentBase64":STANDARD.encode(b"winner")}]}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        } else if operation == "PUT" {
+            assert_eq!(
+                dav(&app, "PUT", &uri, Some(&auth), &[], b"winner".to_vec())
+                    .await
+                    .status(),
+                StatusCode::CREATED
+            );
+        } else {
+            let source = format!("/dav/notes/Tablet/source-{operation}.md");
+            assert_eq!(
+                dav(&app, "PUT", &source, Some(&auth), &[], b"winner".to_vec())
+                    .await
+                    .status(),
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                dav(
+                    &app,
+                    operation,
+                    &source,
+                    Some(&auth),
+                    &[("destination", &uri)],
+                    Vec::new()
+                )
+                .await
+                .status(),
+                StatusCode::CREATED
+            );
+        }
+        drop(sender);
+        assert_eq!(
+            pending.await.unwrap().unwrap().status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            text(dav(&app, "GET", &uri, Some(&auth), &[], Vec::new()).await).await,
+            "winner"
+        );
+    }
+    let uri = "/dav/notes/Tablet/create-first.md";
+    let response = dav(
+        &app,
+        "PUT",
+        uri,
+        Some(&auth),
+        &condition,
+        b"created".to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let revision = response.headers()["x-obsidisync-revision"]
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        dav(
+            &app,
+            "PUT",
+            uri,
+            Some(&auth),
+            &[],
+            b"later normal writer".to_vec()
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let history = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/users/alice/vaults/notes/blob?path=Tablet/create-first.md&hash={revision}"
+                ))
+                .header("authorization", BEARER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    assert_eq!(text(history).await, "created");
+}
+
+#[tokio::test]
+async fn conditional_stream_failure_and_oversize_never_publish() {
+    use axum::body::Bytes;
+    let root = tempfile::tempdir().unwrap();
+    let shared = state(root.path());
+    let vaults = shared.vaults.clone();
+    let app = router_with_webdav_limit(shared, 1024 * 1024, 8, Vec::new());
+    register(&app, root.path()).await;
+    let created = create_password(&app, "Writer", "Tablet").await;
+    let auth = basic("alice", created["password"].as_str().unwrap());
+    for failed in [true, false] {
+        let (mut sender, body) = http_body_util::channel::Channel::<Bytes, std::io::Error>::new(1);
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/dav/notes/Tablet/failed.md")
+            .header("authorization", &auth)
+            .header("if-none-match", "*")
+            .body(Body::new(body))
+            .unwrap();
+        let pending = tokio::spawn(app.clone().oneshot(request));
+        sender
+            .send_data(Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        if failed {
+            sender.abort(std::io::Error::other("fixture stream failure"));
+        } else {
+            sender
+                .send_data(Bytes::from_static(b"oversized"))
+                .await
+                .unwrap();
+            drop(sender);
+        }
+        let response = pending.await.unwrap().unwrap();
+        assert!(!response.status().is_success());
+        if !failed {
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        assert_eq!(
+            dav(
+                &app,
+                "GET",
+                "/dav/notes/Tablet/failed.md",
+                Some(&auth),
+                &[],
+                Vec::new()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let uploads = vaults
+            .storage_root("alice", "notes")
+            .unwrap()
+            .join("uploads");
+        assert!(!std::fs::read_dir(uploads).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("dav-")));
+    }
+}
+
 async fn register(app: &axum::Router, root: &std::path::Path) {
     common::publish_legacy(
         &root.join("data"),
@@ -571,7 +1200,7 @@ async fn webdav_uploads_reach_obsidian_clients_through_sync() {
         "PUT",
         "/dav/notes/Tablet/Notes/Meeting%20notes.pdf",
         Some(&auth),
-        &[("content-type", "application/pdf")],
+        &[("content-type", "application/pdf"), ("if-none-match", "*")],
         pdf.clone(),
     )
     .await;
@@ -582,7 +1211,7 @@ async fn webdav_uploads_reach_obsidian_clients_through_sync() {
         "PUT",
         "/dav/notes/Tablet/Notes/index.md",
         Some(&auth),
-        &[],
+        &[("if-none-match", "*")],
         b"# Tablet index\n".to_vec(),
     )
     .await;

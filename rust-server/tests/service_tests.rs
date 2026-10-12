@@ -1995,6 +1995,212 @@ struct GitFixture {
     remote: PathBuf,
 }
 
+#[tokio::test]
+async fn dav_conditional_create_remote_failure_preserves_commit_and_cleans_stage() {
+    use obsidian_git_sync_server::vault::dav::{DavDevice, DavWriteCondition};
+    let fixture = GitFixture::new().await;
+    fixture.seed_file("Seed.md", b"seed\n").await;
+    let service = VaultService::new_for_tests(fixture.root.path().join("data"));
+    service
+        .register(USER, VAULT, register_request(&fixture.remote))
+        .await
+        .unwrap();
+    // A missing remote makes completion fail after the local write and commit.
+    fs::rename(&fixture.remote, fixture.root.path().join("offline.git"))
+        .await
+        .unwrap();
+    let device = DavDevice {
+        client_id: "dav-fixture".into(),
+        name: "Synthetic".into(),
+    };
+    let create = || DavWriteCondition::Absent {
+        if_match: None,
+        granted_folder: "Tablet".into(),
+    };
+    let stage = service.dav_stage_upload(USER, VAULT).await.unwrap();
+    fs::write(&stage, b"surviving identity\n").await.unwrap();
+    let result = service
+        .dav_write_from_file_conditionally(
+            USER,
+            VAULT,
+            "Tablet/project.md",
+            &stage,
+            None,
+            create(),
+            &device,
+        )
+        .await;
+    assert!(result.is_err(), "remote failure must not return a receipt");
+    assert!(!stage.exists());
+    let repo = service.storage_root(USER, VAULT).unwrap().join("repo");
+    assert_eq!(
+        fs::read(repo.join("Tablet/project.md")).await.unwrap(),
+        b"surviving identity\n"
+    );
+    let committed = git(Some(&repo), &["show", "HEAD:Tablet/project.md"], &[0])
+        .await
+        .unwrap();
+    assert_eq!(committed.stdout, b"surviving identity\n");
+    let head = git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+        .await
+        .unwrap()
+        .stdout;
+    let stage = service.dav_stage_upload(USER, VAULT).await.unwrap();
+    fs::write(&stage, b"retry replacement").await.unwrap();
+    let error = service
+        .dav_write_from_file_conditionally(
+            USER,
+            VAULT,
+            "Tablet/project.md",
+            &stage,
+            None,
+            create(),
+            &device,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "precondition failed");
+    assert!(!stage.exists());
+    assert_eq!(
+        head,
+        git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+            .await
+            .unwrap()
+            .stdout
+    );
+}
+
+#[tokio::test]
+async fn dav_creation_receipt_omits_etag_after_remote_representation_transform() {
+    use obsidian_git_sync_server::vault::dav::{DavDevice, DavWriteCondition};
+    let fixture = GitFixture::new().await;
+    fixture.seed_file("seed.txt", b"seed\n").await;
+    let service = VaultService::new_for_tests(fixture.root.path().join("data"));
+    service
+        .register(USER, VAULT, register_request(&fixture.remote))
+        .await
+        .unwrap();
+    fixture
+        .commit_remote_file(
+            "attributes",
+            ".gitattributes",
+            b"*.md text eol=crlf\n",
+            "remote checkout policy",
+        )
+        .await;
+    let stage = service.dav_stage_upload(USER, VAULT).await.unwrap();
+    fs::write(&stage, b"identity\nsecond line\n").await.unwrap();
+    let result = service
+        .dav_write_from_file_conditionally(
+            USER,
+            VAULT,
+            "Tablet/project.md",
+            &stage,
+            None,
+            DavWriteCondition::Absent {
+                if_match: None,
+                granted_folder: "Tablet".into(),
+            },
+            &DavDevice {
+                client_id: "dav-fixture".into(),
+                name: "Synthetic".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.created);
+    assert!(!stage.exists());
+    let receipt = result.receipt.unwrap();
+    let repo = service.storage_root(USER, VAULT).unwrap().join("repo");
+    assert_eq!(
+        fs::read(repo.join("Tablet/project.md")).await.unwrap(),
+        b"identity\r\nsecond line\r\n"
+    );
+    assert!(receipt.etag.is_none());
+    assert_eq!(
+        receipt.revision.as_bytes(),
+        git(Some(&repo), &["rev-parse", "HEAD"], &[0])
+            .await
+            .unwrap()
+            .stdout
+            .trim_ascii()
+    );
+}
+
+#[tokio::test]
+async fn dav_conditional_remote_conflict_is_uncertain_and_retry_preserves_content() {
+    use obsidian_git_sync_server::vault::dav::{DavDevice, DavWriteCondition};
+    let fixture = GitFixture::new().await;
+    fixture.seed_file("Seed.md", b"seed\n").await;
+    let service = VaultService::new_for_tests(fixture.root.path().join("data"));
+    service
+        .register(USER, VAULT, register_request(&fixture.remote))
+        .await
+        .unwrap();
+    fixture
+        .commit_remote_file(
+            "competitor",
+            "Tablet/project.md",
+            b"remote identity\n",
+            "remote creation",
+        )
+        .await;
+    let device = DavDevice {
+        client_id: "dav-fixture".into(),
+        name: "Synthetic".into(),
+    };
+    let condition = || DavWriteCondition::Absent {
+        if_match: None,
+        granted_folder: "Tablet".into(),
+    };
+    let stage = service.dav_stage_upload(USER, VAULT).await.unwrap();
+    fs::write(&stage, b"local identity\n").await.unwrap();
+    let error = service
+        .dav_write_from_file_conditionally(
+            USER,
+            VAULT,
+            "Tablet/project.md",
+            &stage,
+            None,
+            condition(),
+            &device,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().starts_with("conflict:"));
+    assert!(!stage.exists());
+    let root = service.storage_root(USER, VAULT).unwrap();
+    let before = fs::read(root.join("repo/Tablet/project.md")).await.unwrap();
+    let conflicts = fs::read(root.join("pending-conflicts.json")).await.unwrap();
+    let stage = service.dav_stage_upload(USER, VAULT).await.unwrap();
+    fs::write(&stage, b"retry replacement").await.unwrap();
+    let error = service
+        .dav_write_from_file_conditionally(
+            USER,
+            VAULT,
+            "Tablet/project.md",
+            &stage,
+            None,
+            condition(),
+            &device,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "precondition failed");
+    assert!(!stage.exists());
+    assert_eq!(
+        before,
+        fs::read(root.join("repo/Tablet/project.md")).await.unwrap()
+    );
+    assert_eq!(
+        conflicts,
+        fs::read(root.join("pending-conflicts.json")).await.unwrap()
+    );
+}
+
 impl GitFixture {
     async fn new() -> Self {
         let root = tempfile::tempdir().unwrap();

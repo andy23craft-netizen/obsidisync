@@ -9,8 +9,8 @@ Start with the [project README](../README.md) for installation and normal use.
 - `maintainers/`: [release procedure](maintainers/RELEASING.md) and
   [implementation audit](maintainers/SERVER_IMPLEMENTATION_AUDIT.md).
 - `technical-reference/`: [InkVault protocol](technical-reference/INKVAULT_NOTES_V1.md) and
-  [WebDAV conditional-create investigation](technical-reference/WEBDAV_CREATE_IF_ABSENT_RESEARCH.md).
+  [WebDAV conditional creation](technical-reference/WEBDAV_CONDITIONAL_CREATE.md).
 - `architecture/`: [system structure and diagrams](architecture/README.md).
-- `tickets/`: outstanding work, currently [WebDAV atomic creation](tickets/FEAT-06-webdav-atomic-create-if-absent.md).
+- `tickets/`: outstanding work.
 
 Repository implementation and automated test evidence do not establish production deployment or human acceptance.
