@@ -178,7 +178,7 @@ async fn dav_conditional_create_active_grants_and_all_share_mounts() {
     }
     for uri in [
         uri.clone(),
-        format!("/remote.php/webdav/Household/nextcloud.md"),
+        "/remote.php/webdav/Household/nextcloud.md".to_string(),
         format!("/remote.php/dav/files/{share}/Household/files.md"),
     ] {
         let response = put(uri.clone(), auth.clone()).await.unwrap();
@@ -192,7 +192,7 @@ async fn dav_conditional_create_active_grants_and_all_share_mounts() {
     for uri in [
         format!("/dav/{share}/Private/hidden.md"),
         "/dav/nonexistent/Household/project.md".into(),
-        format!("/remote.php/dav/files/wrong/Household/project.md"),
+        "/remote.php/dav/files/wrong/Household/project.md".to_string(),
     ] {
         assert_eq!(
             put(uri, auth.clone()).await.unwrap().status(),
