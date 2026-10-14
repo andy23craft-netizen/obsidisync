@@ -20,7 +20,7 @@ export class ShareSelectionModal extends Modal {
     if (active) {
       status.setText(`${active.label} (${active.shareId}): ${active.capability}, ${active.status}. ${active.download.reconciliation.length} reconciliation barrier(s). Use the conflict command to review local records. Use a separate local vault for another share.`);
       if (active.status === "download-only") new Setting(contentEl).setName("Writable synchronization")
-        .setDesc("Enable uploads for reconciled files. Existing local barriers remain blocked until explicitly reconciled.")
+        .setDesc("New local changes sync automatically. Retained local barriers remain blocked until reconciled; writable mode offers a backed-up bulk upload.")
         .addButton((button) => button.setButtonText("Enable writes").onClick(async () => {
           if (!window.confirm("Enable share writes for safely reconciled files? Existing blocked edits stay blocked.")) return;
           button.setDisabled(true);

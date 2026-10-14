@@ -139,10 +139,13 @@ Git head: verify checksums, back up local bytes and guard application without ac
 preserve local bytes. The local reconciliation window offers a separate server resolver in writable mode. Explicit
 choices back up local files and use v2 resolve; pending paths are rechecked after resolution and restart.
 
-Back up and upload local choice is a separate explicit action for local barriers, available only in writable mode.
-It refreshes the remote target, captures/backups current bytes or deletion, and submits against that refreshed base.
-Concurrent remote changes can still conflict. Server-conflicted paths require the server resolver. Keep local alone
-never approves an upload. Historical reads, device listings/versions and mutable version metadata use v2.
+New local files and edits sync automatically while writable mode is enabled. A new path retained during download-only
+sync returns to the normal upload flow after writable sync refreshes the remote and confirms the path was absent from
+the initial local backup and remains absent remotely. Original setup files, explicit Keep local choices, collisions,
+and uncertain recovery records stay blocked. In the local reconciliation window, Back up and upload all submits the
+remaining choices after one confirmation and a verified backup of every current file; deletions are included.
+Individual upload choices remain available. Concurrent remote changes remain server conflicts for separate review.
+Keep local alone never approves an upload. Historical reads, device listings/versions and mutable version metadata use v2.
 
 The write journal stores exact per-file hash/deletion evidence before network mutation:
 

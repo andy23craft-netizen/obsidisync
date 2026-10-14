@@ -61,12 +61,16 @@ retargeted evidence fails closed. Before every dispatch, including after token r
 checks its original mount/binding/configuration revision/move generation, capability and affected path barriers.
 The same checks protect response acknowledgement and local application.
 
-Local reconciliation offers Keep local (upload blocked), Back up and use remote, and, with explicitly writable
-membership, Back up and upload local choice. Remote choice refreshes the current target and verifies a fresh local
-backup before replacement/deletion. Upload choice separately captures current bytes or deletion against a fresh
-remote base; concurrent changes can still conflict. Server conflicts have a separate per-mount resolver. Text marker
-views are checksum verified inline contents, never blobs inferred from the returned Git head. Binary choices retain
-their original bytes; the missing-file restore choice fetches checksum-verified current committed bytes.
+New local files and edits sync automatically in writable mounts. A new path retained during download-only sync returns
+to the normal upload flow after its remote target is refreshed and confirmed absent from both the initial local backup
+and the current remote snapshot. Original setup files, explicit Keep local choices, collisions and uncertain recovery
+records stay blocked. Local reconciliation offers Keep local (upload blocked), Back up and use remote, and, with
+explicitly writable membership, Back up and upload local choice. Back up and upload all handles the remaining records
+in one confirmed, verified-backup batch; individual choices remain available. Remote choice refreshes the current
+target and verifies a fresh local backup before replacement/deletion. Upload choices submit current bytes or deletion
+against a fresh remote base; concurrent changes can still conflict. Server conflicts have a separate per-mount resolver.
+Text marker views are checksum verified inline contents, never blobs inferred from the returned Git head. Binary choices
+retain their original bytes; the missing-file restore choice fetches checksum-verified current committed bytes.
 
 ## Detected moves
 

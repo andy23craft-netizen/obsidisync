@@ -12,14 +12,54 @@ export class LocalReconciliationModal extends Modal {
   onOpen(): void {
     this.guard();
     this.contentEl.empty();
+    if (this.modalEl) {
+      this.modalEl.style.width = "min(96vw, 900px)";
+      this.modalEl.style.maxWidth = "96vw";
+      this.modalEl.style.maxHeight = "90vh";
+    }
+    if (this.contentEl.style) {
+      this.contentEl.style.maxHeight = "80vh";
+      this.contentEl.style.overflowY = "auto";
+      this.contentEl.style.overflowX = "hidden";
+    }
     this.contentEl.createEl("h2", { text: this.mountId ? `Local reconciliation: ${this.service.compositeMounts().find((mount) => mount.mountId === this.mountId)?.localPrefix}/` : "Local reconciliation" });
-    this.contentEl.createEl("p", { text: "Keeping local bytes retains an upload barrier across restart and permission restoration. Using remote backs up current bytes first. Writable access offers a separate explicit upload decision." });
+    this.contentEl.createEl("p", { text: "New files sync automatically while writable sync is enabled. These retained files need a recovery choice. Remote replacement makes a backup first." });
     const records = this.service.localReconciliations(this.mountId);
     const status = this.contentEl.createEl("p", { text: records.length ? `${records.length} file(s) require attention.` : "No local reconciliation barriers." });
+    if (records.length && this.service.canWriteSelectedShare(this.mountId)) {
+      new Setting(this.contentEl).setName(`Upload all ${records.length} local choices`)
+        .setDesc("Back up current files, include local deletions, then submit them together. Server conflicts remain for separate review.")
+        .addButton((button) => button.setButtonText("Back up and upload all").setCta().onClick(async () => {
+          if (!window.confirm(`Back up and upload the current local choice for all ${records.length} listed files or deletions?`)) return;
+          button.setDisabled(true);
+          try { this.guard(); await this.service.uploadAllLocalReconciliations(this.mountId); this.onOpen(); }
+          catch (error) { status.setText(String(error)); button.setDisabled(false); }
+        }));
+    }
     for (const record of records) {
       const setting = new Setting(this.contentEl).setName(record.path)
-        .setDesc(`${record.reason}. Remote: ${record.remote.op} at ${record.remoteHead ?? "empty share"}.${record.backupFolder ? ` Backup: ${record.backupFolder}` : ""}`)
-        .addButton((button) => button.setButtonText("Keep local (upload blocked)").onClick(async () => {
+        .setDesc(`Reason: ${record.reason}. Remote target: ${record.remote.op} at ${record.remoteHead ?? "empty share"}.${record.backupFolder ? ` Backup: ${record.backupFolder}` : ""}`);
+      if (setting.settingEl) {
+        setting.settingEl.style.display = "block";
+        setting.settingEl.style.padding = "8px 0";
+      }
+      if (setting.infoEl) setting.infoEl.style.width = "100%";
+      if (setting.nameEl) {
+        setting.nameEl.style.whiteSpace = "normal";
+        setting.nameEl.style.overflowWrap = "anywhere";
+      }
+      if (setting.descEl) {
+        setting.descEl.style.whiteSpace = "normal";
+        setting.descEl.style.overflowWrap = "anywhere";
+      }
+      if (setting.controlEl) {
+        setting.controlEl.style.width = "100%";
+        setting.controlEl.style.display = "flex";
+        setting.controlEl.style.flexWrap = "wrap";
+        setting.controlEl.style.gap = "6px";
+        setting.controlEl.style.marginTop = "6px";
+      }
+      setting.addButton((button) => button.setButtonText("Keep local (upload blocked)").onClick(async () => {
           try { this.guard(); await this.service.keepLocalReconciliation(record.path, this.mountId); this.onOpen(); }
           catch (error) { status.setText(String(error)); }
         }))

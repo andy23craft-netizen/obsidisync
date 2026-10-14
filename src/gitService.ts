@@ -1036,6 +1036,14 @@ export class GitService {
     await this.applyShareSnapshot(selected, await this.shareSnapshot(selected), initial, action);
   }
 
+  private isAutomaticLocalAddition(selected: ActiveShare, record: LocalReconciliation): boolean {
+    if (record.baseline !== null || record.remote.op !== "delete" || record.localChoice || record.capturedWrite ||
+        !Array.isArray(selected.download.initial.backupManifest) ||
+        selected.download.initial.backupManifest.some((entry) => entry.path === record.path)) return false;
+    return record.reason.startsWith("Unsynchronized local change; explicit reconciliation required") ||
+      record.reason.startsWith("Local edit retained; future upload requires explicit reconciliation");
+  }
+
   private async performShareSync(selected: ActiveShare = this.settings.activeShare!, action = this.shareAction(selected)): Promise<SyncConflict[]> {
     await this.negotiateShare(selected, action.guard);
     // Recover application and network journals before collecting a single new upload.
@@ -1046,6 +1054,20 @@ export class GitService {
       else await this.performShareDownload(); return [];
     }
     await this.readShareConflicts(selected, [], action);
+    // A read-only sync may have recorded genuinely new local paths as barriers because they were absent
+    // from the remote snapshot. Once writes are enabled, refresh those targets and return safe additions
+    // to the ordinary upload path. Original backup files, conflicts and uncertain recovery records stay blocked.
+    if (selected.download.reconciliation.some((record) => this.isAutomaticLocalAddition(selected, record))) {
+      await this.downloadSnapshot(selected, false, action);
+      const conflicts = new Set((selected.download.serverConflicts ?? []).map((record) => record.path));
+      const automatic = new Set(selected.download.reconciliation.filter((record) =>
+        this.isAutomaticLocalAddition(selected, record) && !conflicts.has(record.path) && action.canApply(record.path))
+        .map((record) => record.path));
+      if (automatic.size) {
+        selected.download.reconciliation = selected.download.reconciliation.filter((record) => !automatic.has(record.path));
+        await action.save();
+      }
+    }
     const vault = action.vault;
     const paths = new Set([...vault.paths(), ...selected.download.baseline.map((entry) => entry.path)]);
     const captured: Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }> = [];
@@ -1205,6 +1227,46 @@ export class GitService {
     await this.exclusive(async () => {
       const selected = this.selectedShare(mountId);
       await this.uploadLocalChoice(selected, path, this.shareAction(selected));
+    });
+  }
+
+  /** Back up and submit the currently selected local reconciliation records as one explicit batch. */
+  async uploadAllLocalReconciliations(mountId?: string): Promise<void> {
+    await this.exclusive(async () => {
+      const selected = this.selectedShare(mountId);
+      const action = this.shareAction(selected);
+      if (!selected || selected.status !== "writable") throw new Error("Enable writable share synchronization first");
+      await this.requireShareWrite(selected, action);
+      await this.recoverShareWrite(selected, action);
+      const paths = selected.download.reconciliation.map((record) => record.path);
+      if (!paths.length) return;
+      await this.downloadSnapshot(selected, false, action);
+      const records = paths.filter((path) => selected.download.reconciliation.some((record) => record.path === path));
+      if (!records.length) return;
+      if (records.some((path) => selected.download.serverConflicts?.some((conflict) => conflict.path === path))) {
+        throw new Error("Resolve server-conflicted paths separately before bulk upload");
+      }
+      const captured = [] as Array<{ path: string; entry: ManifestEntry | null; bytes?: ArrayBuffer }>;
+      for (const path of records) captured.push({ path, ...(await action.vault.capture(path)) });
+      const folder = this.recoveryFolder();
+      const copied = await action.vault.verifiedBackup(folder, captured.filter((file) => file.entry).map((file) => file.path));
+      for (const file of captured) {
+        if (file.entry && !sameFile(copied.find((entry) => entry.path === file.path) ?? null, file.entry)) {
+          throw new Error(`File changed during reconciliation backup: ${file.path}`);
+        }
+      }
+      action.write(records);
+      for (const file of captured) {
+        const record = selected.download.reconciliation.find((entry) => entry.path === file.path);
+        if (record) record.backupFolder = folder;
+      }
+      await action.save();
+      await this.submitShareChanges(selected, captured, selected.download.observedHead, false, action);
+      if (!(selected.download.serverConflicts?.length)) {
+        selected.download.reconciliation = selected.download.reconciliation.filter((entry) => !records.includes(entry.path));
+      }
+      await action.save();
+      await this.downloadSnapshot(selected, false, action);
     });
   }
 
