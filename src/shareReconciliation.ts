@@ -15,6 +15,8 @@ export interface LocalReconciliation {
   uploadBlocked: true;
   localChoice?: "keep-local";
   backupFolder?: string;
+  /** Exact bytes (or confirmed absence) captured before a batch remote replacement. */
+  backupEntry?: ManifestEntry | null;
   capturedWrite?: { stage: "staging" | "submitted" | "accepted"; entry: ManifestEntry | null; mountAction?: MountActionToken };
 }
 
@@ -118,7 +120,27 @@ export class ShareReconciler {
       const record: LocalReconciliation = { path: remote.path, baseline, remote: target, remoteHead: head,
         reason: "Unsynchronized local change; explicit reconciliation required", uploadBlocked: true };
       const previous = this.state.reconciliation.find((entry) => entry.path === remote.path);
-      if (previous) { this.block({ ...record, baseline: previous.baseline, reason: previous.reason }); await this.save(); continue; }
+      if (previous) {
+        // A read/downgrade barrier can outlive the local edit that created it. Once the
+        // current bytes are again exactly at the recorded baseline, the refreshed target
+        // is safe to apply. Never infer this for an explicit choice, captured write,
+        // backup-backed recovery, or ambiguous interrupted disk operation.
+        const autoRecoverable = !previous.localChoice && !previous.capturedWrite && !previous.backupFolder &&
+          !/Interrupted application|Local state uncertain|changed during download\/application/i.test(previous.reason);
+        if (!autoRecoverable) {
+          this.block({ ...record, baseline: previous.baseline, reason: previous.reason }); await this.save(); continue;
+        }
+        try {
+          const current = await this.vault.checkedEntryFor(remote.path);
+          if (!sameFile(current, previous.baseline)) {
+            this.block({ ...record, baseline: previous.baseline, reason: previous.reason }); await this.save(); continue;
+          }
+        } catch (error) {
+          this.block({ ...record, baseline: previous.baseline, reason: `Local state uncertain: ${String(error)}` });
+          await this.save(); continue;
+        }
+        this.state.reconciliation = this.state.reconciliation.filter((entry) => entry.path !== remote.path);
+      }
       // Initial overwrite consent applies ONLY to bytes actually copied into the verified backup.
       const expected = initial && !this.state.initial.appliedPaths.includes(remote.path)
         ? this.state.initial.backupManifest?.find((entry) => entry.path === remote.path) ?? baseline

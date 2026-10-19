@@ -184,6 +184,10 @@ export function validateComposite(settings: IosGitSyncSettings): CompositeState 
       if (record.remote.op === "upsert" && !/^[a-f0-9]{64}$/.test(record.remote.sha256)) invalid();
       if (record.baseline) manifest([record.baseline]);
       if (record.baseline && record.baseline.path !== record.path) invalid();
+      if (record.backupEntry !== undefined && record.backupEntry !== null) {
+        manifest([record.backupEntry]);
+        if (record.backupEntry.path !== record.path) invalid();
+      }
       if (record.capturedWrite) {
         originalAction(record.capturedWrite.mountAction);
         if (!["staging", "submitted", "accepted"].includes(record.capturedWrite.stage)) invalid();

@@ -31,11 +31,12 @@ const USER = "dev";
 const VAULT = "harness";
 const DATA_DIR = path.join(SCRATCH, "server-data");
 
-function device(name, overrides = {}) {
+function device(name, overrides = {}, restore = false) {
   const dir = path.join(SCRATCH, "vaults", name);
-  fs.rmSync(dir, { recursive: true, force: true });
+  if (!restore) fs.rmSync(dir, { recursive: true, force: true });
   const vault = new obsidian.Vault(dir, name);
-  const settings = {
+  const settingsPath = path.join(SCRATCH, `${name}-settings.json`);
+  const settings = restore ? JSON.parse(fs.readFileSync(settingsPath, "utf8")) : {
     ...DEFAULT_SETTINGS,
     serverUrl: SERVER,
     oidcAccessToken: TOKEN,
@@ -48,7 +49,6 @@ function device(name, overrides = {}) {
     historyVersions: [],
     ...overrides
   };
-  const settingsPath = path.join(SCRATCH, `${name}-settings.json`);
   const persist = async (snapshot) => fs.writeFileSync(settingsPath, JSON.stringify(snapshot));
   const service = new GitService(vault, settings, async () => persist(settings), undefined, undefined, persist);
   const write = (rel, text) => {
@@ -128,7 +128,7 @@ const log = (...args) => console.log(...args);
 const show = (label, value) => log(`  ${label}:`, JSON.stringify(value));
 
 async function main() {
-  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js", "scenario-composite-writes.js", "scenario-conversion.js", "scenario-mount-history.js", "scenario-cross-mount-import.js"];
+  const scenarios = process.argv[2] ? [process.argv[2]] : ["scenario-conflicts.js", "scenario-share-downloads.js", "scenario-read-base-regression.js", "scenario-share-writes.js", "scenario-credentials.js", "scenario-composite-downloads.js", "scenario-composite-writes.js", "scenario-feat15-continuity.js", "scenario-conversion.js", "scenario-mount-history.js", "scenario-cross-mount-import.js"];
   for (const scenario of scenarios) {
     let server = await startServer();
     const stop = async () => {

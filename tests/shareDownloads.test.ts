@@ -215,6 +215,78 @@ test("head advancement retains blocked targets and baselines across restart and 
   onlyReads(f);
 });
 
+test("stale automatic barrier clears when local bytes return to baseline and applies the latest remote snapshot", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize();
+  f.write("a.md", "temporary local edit"); f.capability("read");
+  f.remote({ "a.md": "remote 2" }, "h2"); await f.service().sync();
+  assert.equal(f.service().localReconciliations().length, 1);
+  f.write("a.md", "base");
+  f.remote({ "a.md": "remote 3" }, "h3"); await f.service().sync();
+  assert.equal(f.read("a.md"), "remote 3");
+  assert.equal(f.service().localReconciliations().length, 0);
+  assert.equal(f.saved().activeShare.download.baseline[0].sha256, sha("remote 3"));
+  onlyReads(f);
+});
+
+test("bulk remote recovery backs up the full confirmed set before applying updates and deletions", async (t) => {
+  const f = fixture(t); f.remote({ "update.md": "base", "delete.md": "base", "absent.md": "base" }); await f.initialize();
+  f.write("update.md", "local edit"); f.write("delete.md", "local edit"); f.remove("absent.md");
+  f.remote({ "update.md": "remote update", "absent.md": "remote addition" }, "h2"); f.capability("read"); await f.service().sync();
+  assert.equal(f.service().localReconciliations().length, 3);
+  const result = await f.service().downloadAllLocalReconciliations(undefined,
+    f.service().localReconciliations().map((record: any) => record.path));
+  assert.deepEqual([result.applied, result.skipped, result.failed], [3, 0, 0]);
+  assert.equal(f.read("update.md"), "remote update"); assert.equal(f.read("delete.md"), null);
+  assert.equal(f.read("absent.md"), "remote addition");
+  assert.equal(f.read(`${result.backupFolder}/update.md`), "local edit");
+  assert.equal(f.read(`${result.backupFolder}/delete.md`), "local edit");
+  assert.equal(f.read(`${result.backupFolder}/absent.md`), null);
+  assert.equal(f.saved().activeShare.download.reconciliation.length, 0);
+  assert.equal(f.service().localReconciliations().length, 0); onlyReads(f);
+});
+
+test("bulk remote recovery backup failure performs no replacement", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize();
+  f.write("a.md", "local edit"); f.capability("read"); f.remote({ "a.md": "remote" }, "h2"); await f.service().sync();
+  const write = f.vault.adapter.writeBinary;
+  f.vault.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => {
+    if (path.startsWith(".obsidian-git-sync/backups/")) throw new Error("synthetic backup failure");
+    return write(path, bytes);
+  };
+  await assert.rejects(f.service().downloadAllLocalReconciliations(), /synthetic backup failure/);
+  assert.equal(f.read("a.md"), "local edit");
+  assert.equal(f.service().localReconciliations().length, 1);
+});
+
+test("bulk remote recovery preserves edits made during transfer and leaves a barrier", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize();
+  f.write("a.md", "before bulk recovery"); f.capability("read"); f.remote({ "a.md": "remote" }, "h2"); await f.service().sync();
+  f.hook(async (request: any) => { if (request.url.includes("/blob?")) f.write("a.md", "edit during bulk transfer"); });
+  const result = await f.service().downloadAllLocalReconciliations();
+  assert.deepEqual([result.applied, result.skipped, result.failed], [0, 0, 1]);
+  assert.equal(f.read("a.md"), "edit during bulk transfer");
+  assert.match(f.saved().activeShare.download.reconciliation[0].reason, /changed during bulk remote recovery/);
+  assert.equal(f.read(`${result.backupFolder}/a.md`), "before bulk recovery");
+});
+
+test("bulk remote recovery interruption keeps the old baseline and explicit recovery evidence", async (t) => {
+  const f = fixture(t); f.remote({ "a.md": "base" }); await f.initialize();
+  f.write("a.md", "local edit"); f.capability("read"); f.remote({ "a.md": "remote" }, "h2"); await f.service().sync();
+  const write = f.vault.adapter.writeBinary;
+  f.vault.adapter.writeBinary = async (path: string, bytes: ArrayBuffer) => {
+    await write(path, bytes);
+    if (path === "a.md") throw new Error("synthetic interruption after replacement");
+  };
+  const result = await f.service().downloadAllLocalReconciliations();
+  assert.deepEqual([result.applied, result.skipped, result.failed], [0, 0, 1]);
+  assert.equal(f.read("a.md"), "remote");
+  const state = f.saved().activeShare.download;
+  assert.equal(state.baseline[0].sha256, sha("base"));
+  assert.match(state.reconciliation[0].reason, /Bulk remote recovery interrupted/);
+  assert.equal(state.reconciliation[0].backupEntry.sha256, sha("local edit"));
+  assert.equal(f.read(`${result.backupFolder}/a.md`), "local edit");
+});
+
 test("interrupted disk application journals ambiguity and unaffected files continue after restart", async (t) => {
   const f = fixture(t); f.remote({ "a.md": "base", "b.md": "base" }); await f.initialize();
   const write = f.vault.adapter.writeBinary;

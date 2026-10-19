@@ -69,6 +69,10 @@ explicitly writable membership, Back up and upload local choice. Back up and upl
 in one confirmed, verified-backup batch; individual choices remain available. Remote choice refreshes the current
 target and verifies a fresh local backup before replacement/deletion. Upload choices submit current bytes or deletion
 against a fresh remote base; concurrent changes can still conflict. Server conflicts have a separate per-mount resolver.
+Back up and download all is available to read-only and writable members. It captures the listed paths, refreshes their
+remote targets, verifies a fresh backup of every current local file before the first replacement, and then applies
+guarded updates or deletions. Files arriving after confirmation are left for a later choice. The result shows applied,
+skipped and failed counts and the backup folder. A failed batch backup makes no target replacements.
 Text marker views are checksum verified inline contents, never blobs inferred from the returned Git head. Binary choices
 retain their original bytes; the missing-file restore choice fetches checksum-verified current committed bytes.
 
@@ -119,9 +123,24 @@ scenarios, including conversion/detachment. After the final original-conflict ga
 checks and real-server lifecycle scenario passed again. Tests use disposable synthetic data, not household
 documents or deployed services.
 
-No server migration is required for this client feature. Install the updated plugin through the normal operator
-workflow. A previous download-only composite build rejects writable/journal state; do not reset that state to
-force a downgrade. Preserve settings and recovery copies and reconcile uncertain contents before changing clients.
+FEAT-15 validation on 2026-10-19: `npm run test:plugin` passed 292 tests and `npm run build:plugin` passed. The
+direct two-client scenario and full existing real-server harness passed using the already-built local debug server;
+`npm run test:e2e` could not invoke Cargo because `cargo` was not on the WSL shell PATH. The added scenario covers
+composite Markdown/binary addition, phone-side edit/addition/deletion and persisted-client restart. Synthetic tests
+also reproduce and correct a stale automatic barrier when local contents return to their exact saved baseline.
+This defect is distinct from the reported generic composite-state validation error, which has not been reproduced.
+
+No server migration is required for this client feature. For a compatible patch, update in place through BRAT or
+the existing manual plugin-file workflow. Preserve Obsidian plugin settings, local files and recovery backups; keep
+the same account/server binding and mount configuration, then allow the next normal sync. Do not repeat share
+selection, enable writes again, or reset state solely because the plugin version changed. A previous download-only
+composite build rejects writable/journal state; do not reset that state to force a downgrade. If startup reports an
+invalid composite state, preserve the original state and files and stop before attempting repair or downgrade.
+The generic validation message currently does not identify the failing invariant, so retain it for diagnosis.
+
+The reported iPhone invalid-state incident remains unverified and is not resolved by synthetic test results. The
+persisted iPhone state and its exact failed invariant are needed to connect a code change to that incident. No phone
+state or deployed service was inspected during FEAT-15 work.
 
 Human desktop/iPhone acceptance remains required: use disposable notes/attachments to inspect setup/status,
 initial upload/enable writes, per-mount conflict/reconciliation, offline edits, permission loss, interruptions and

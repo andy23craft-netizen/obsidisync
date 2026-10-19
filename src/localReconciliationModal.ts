@@ -36,6 +36,21 @@ export class LocalReconciliationModal extends Modal {
           catch (error) { status.setText(String(error)); button.setDisabled(false); }
         }));
     }
+    if (records.length) {
+      const confirmedPaths = records.map((record) => record.path);
+      new Setting(this.contentEl).setName(`Download all ${records.length} remote choices`)
+        .setDesc("Back up every current local file first, then replace the listed choices with refreshed remote versions, including deletions. Newer choices are left for a separate confirmation.")
+        .addButton((button) => button.setButtonText("Back up and download all").setWarning().onClick(async () => {
+          if (!window.confirm(`Back up current local files and download remote versions or deletions for all ${confirmedPaths.length} listed choices? The backup must succeed before any replacement.`)) return;
+          button.setDisabled(true);
+          try {
+            this.guard();
+            const result = await this.service.downloadAllLocalReconciliations(this.mountId, confirmedPaths);
+            this.onOpen();
+            this.contentEl.createEl("p", { text: `Applied ${result.applied}; skipped ${result.skipped}; failed ${result.failed}.${result.backupFolder ? ` Backup: ${result.backupFolder}` : ""}` });
+          } catch (error) { status.setText(String(error)); button.setDisabled(false); }
+        }));
+    }
     for (const record of records) {
       const setting = new Setting(this.contentEl).setName(record.path)
         .setDesc(`Reason: ${record.reason}. Remote target: ${record.remote.op} at ${record.remoteHead ?? "empty share"}.${record.backupFolder ? ` Backup: ${record.backupFolder}` : ""}`);

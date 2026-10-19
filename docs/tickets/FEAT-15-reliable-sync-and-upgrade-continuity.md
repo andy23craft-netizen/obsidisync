@@ -1,6 +1,6 @@
 # FEAT-15 - Automatic device sync, composite recovery and upgrade continuity
 
-**Status:** Proposed  
+**Status:** Client implementation underway; device and deployment acceptance deferred
 **Owner:** ObsidiSync client, with server integration validation  
 **Priority:** High - ordinary household sync is requiring manual recovery
 
@@ -20,7 +20,7 @@ User report, 2026-10-19:
   "Invalid composite state; synchronization stopped, no v1 fallback" without further Obsidian changes.
 - Repeating the lengthy setup after patches makes updates impractical.
 
-Repository findings (not a reproduction of the phone failure):
+Repository findings before implementation (not a reproduction of the phone failure):
 
 - `src/shareReconciliation.ts`, `ShareReconciler.applySnapshot`, already intends to apply remote files automatically
   when local contents match the per-file baseline, including an absent local path with no baseline. Existing
@@ -146,6 +146,50 @@ do not automate host changes or hide required server/data migrations inside a cl
 12. Updated runbooks distinguish normal updates from first setup and exceptional recovery, including backup/settings
     retention and rollback limitations after newer writes.
 
+## Implementation diagnosis and evidence (2026-10-19)
+
+Diagnosis is split by evidence level so synthetic coverage is not mistaken for incident resolution:
+
+- **Reproduced defect:** a transient local edit recorded an automatic reconciliation barrier. After the file was
+  restored byte-for-byte to its saved baseline, a later remote update still retained the barrier and required a
+  choice. The refreshed remote target was safe to apply from that baseline, but `ShareReconciler.applySnapshot`
+  retained every pre-existing record unconditionally. This now auto-recovers only records with no explicit local
+  choice, captured write, backup-backed action or interrupted/uncertain application evidence.
+- **Implemented behavior:** local reconciliation now offers **Back up and download all** to read-only and writable
+  members. It captures the confirmed paths, refreshes remote targets, verifies one backup of every present local
+  file before replacing anything, records absent-path evidence through the captured set, applies guarded updates
+  and deletions, and reports applied/skipped/failed counts and the backup location. Server conflicts stay separate.
+- **Synthetic verification:** the existing plugin suite and real-server two-client harness pass. The added harness
+  case persists two independent composite clients, exchanges a Markdown addition and binary attachment, then
+  exercises a phone-side edit/addition/deletion across a simulated computer-client restart.
+- **Suspected, not established:** a save/load ordering or state producer/validator mismatch could explain the phone's
+  composite validation error. Current source validation emits the same generic message for many unrelated failures;
+  the exact rejected field, persisted schema and transition are unavailable. The barrier defect above does not by
+  itself explain or reproduce that validation error.
+- **Unverified production incident:** no persisted iPhone plugin state, household vault, production service or live
+  deployment was accessed. The reported error is not marked resolved. Synthetic success does not establish that the
+  phone state is valid or that an in-place update fixes it.
+
+## Deferred acceptance gates
+
+These gates require device state or deployment access intentionally excluded from this implementation task:
+
+1. On the affected iPhone, preserve a copy of the original plugin settings and relevant local files, capture the
+   exact safe validation failure and identify its rejected invariant without sharing note contents or credentials.
+   Re-run the unchanged-launch case and determine whether the state reproduces before applying a repair.
+2. Install the compatible plugin update over the configured iPhone state; verify account/server binding, mount IDs
+   and prefixes, initialization, writable choice, heads/baselines, backups, conflicts and recovery journals survive.
+3. On disposable device notes, verify phone-to-computer and computer-to-phone text, attachment, edit and deletion
+   flows after close/reopen and an expired-session renewal. Confirm safe remote changes apply without repeated
+   approval and genuine concurrent edits remain blocked with both versions recoverable.
+4. If production behavior is later authorized, deploy through the separate operator process and verify the same
+   acceptance cases against that deployment. This ticket does not authorize or perform deployment or migration.
+5. Add a regression fixture from the actual failing persisted state after sensitive content is removed and the exact
+   invariant is known. Until then the incident's validator root cause and compatible-update continuity remain open.
+6. The current loader still stops on a generic composite validation error and does not expose a safe recovery view
+   or stable invariant code. This remains an implementation gap; preserve the original state until a diagnostic and
+   recovery flow can be added without normal initialization, migration, v1 fallback or mutation.
+
 ## Testing and validation
 
 - Extend `tests/shareDownloads.test.ts` and `tests/compositeDownloads.test.ts` for both directions, remote additions,
@@ -178,9 +222,12 @@ execution guarantees, community-registry publication and changing Obsidian confi
 
 ## Implementation notes
 
-Implement in reviewable stages: reproduce/classify ordinary sync and invalid persistence transitions; correct those
-with regression fixtures; add bulk remote recovery; verify update continuity and document the short upgrade path.
-Do not substitute bulk recovery for fixing ordinary synchronization.
+The ordinary sync barrier correction and bulk remote recovery are implemented with synthetic regression coverage.
+The invalid persisted-state transition, safe recovery view and actual in-place device update continuity remain open
+as listed above. Do not treat bulk recovery or synthetic sync success as resolving the reported phone incident.
 
-Investigation for this ticket was read-only against source/documentation and synthetic test definitions. No tests
-were executed, no phone state was inspected, and no live server, household files or deployment was accessed.
+Implementation and tests use local synthetic fixtures only. The exact two-client scenario and full existing
+real-server harness pass using the repository's local debug server binary. `npm run test:e2e` itself could not run
+because `cargo` is unavailable on this WSL shell's PATH; the existing binary was already present and was used to
+run `node tests/e2e/harness.js` directly. No phone state, production service, household vault or deployment was
+accessed.

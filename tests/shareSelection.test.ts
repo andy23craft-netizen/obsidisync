@@ -523,22 +523,28 @@ test("initial share download UI requires explicit consent and active chooser can
   assert.equal(buttons.length, 0);
 });
 
-test("local reconciliation UI offers only local choices and confirms remote replacement", async () => {
+test("local reconciliation UI offers bulk remote recovery to read-only members", async () => {
   const calls: string[] = [];
   const service = {
     canWriteSelectedShare: () => false,
     localReconciliations: () => [{ path: "a.md", reason: "local edit", remote: { op: "delete" }, remoteHead: "h2" }],
     keepLocalReconciliation: async (path: string) => { calls.push(`keep:${path}`); },
-    useRemoteReconciliation: async (path: string) => { calls.push(`remote:${path}`); }
+    useRemoteReconciliation: async (path: string) => { calls.push(`remote:${path}`); },
+    downloadAllLocalReconciliations: async (_mountId: string | undefined, paths: string[]) => {
+      calls.push(`bulk:${paths.join(",")}`); return { applied: 1, skipped: 0, failed: 0, backupFolder: "backups/test" };
+    }
   };
   (globalThis as any).window = { confirm: () => false };
   buttons = []; new LocalReconciliationModal({}, service).onOpen();
-  assert.deepEqual(buttons.map((button) => button.text), ["Keep local (upload blocked)", "Back up and use remote"]);
-  await buttons[0].click(); assert.deepEqual(calls, ["keep:a.md"]);
-  const remote = buttons.find((button) => button.text === "Back up and use remote")!;
-  await remote.click(); assert.equal(calls.length, 1);
+  assert.deepEqual(buttons.map((button) => button.text), ["Back up and download all", "Keep local (upload blocked)", "Back up and use remote"]);
+  await buttons[0].click(); assert.deepEqual(calls, []);
   (globalThis as any).window.confirm = () => true;
-  await remote.click(); assert.deepEqual(calls, ["keep:a.md", "remote:a.md"]);
+  await buttons[0].click(); assert.deepEqual(calls, ["bulk:a.md"]);
+  buttons = []; new LocalReconciliationModal({}, service).onOpen();
+  const keep = buttons.find((button) => button.text === "Keep local (upload blocked)")!;
+  await keep.click(); assert.deepEqual(calls, ["bulk:a.md", "keep:a.md"]);
+  const remote = buttons.find((button) => button.text === "Back up and use remote")!;
+  await remote.click(); assert.deepEqual(calls, ["bulk:a.md", "keep:a.md", "remote:a.md"]);
 });
 
 test("writable reconciliation UI requires explicit confirmation for uploading a blocked local choice", async () => {

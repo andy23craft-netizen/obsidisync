@@ -1270,6 +1270,86 @@ export class GitService {
     });
   }
 
+  /** Apply one confirmed set of current local barriers after a single verified backup. */
+  async downloadAllLocalReconciliations(mountId?: string, confirmedPaths?: string[]): Promise<{
+    applied: number; skipped: number; failed: number; backupFolder: string
+  }> {
+    const result = await this.exclusive(async () => {
+      const selected = this.selectedShare(mountId);
+      const action = this.shareAction(selected);
+      if (!selected) throw new Error("Resume initial download before reconciling files");
+      const capturedPaths = [...new Set(confirmedPaths ?? selected.download.reconciliation.map((record) => record.path))];
+      if (!capturedPaths.length) return { applied: 0, skipped: 0, failed: 0, backupFolder: "" };
+      await this.negotiateShare(selected, action.guard);
+      await this.downloadSnapshot(selected, false, action);
+      action.guard();
+      const records = capturedPaths.map((path) => selected.download.reconciliation.find((record) => record.path === path))
+        .filter((record): record is LocalReconciliation => !!record &&
+          !selected.download.serverConflicts?.some((conflict) => conflict.path === record.path));
+      let skipped = capturedPaths.length - records.length;
+      if (!records.length) return { applied: 0, skipped, failed: 0, backupFolder: "" };
+      for (const record of records) if (!action.canApply(record.path)) throw new Error(`Move blocks local application: ${record.path}`);
+
+      const before = new Map<string, ManifestEntry | null>();
+      for (const record of records) before.set(record.path, await action.vault.checkedEntryFor(record.path));
+      const folder = this.recoveryFolder();
+      const copied = await action.vault.verifiedBackup(folder,
+        [...before].filter(([, entry]) => entry !== null).map(([path]) => path));
+      for (const [path, entry] of before) {
+        if (entry && !sameFile(copied.find((file) => file.path === path) ?? null, entry)) {
+          throw new Error(`Backup verification failed before remote recovery: ${path}`);
+        }
+        if (!entry && copied.some((file) => file.path === path)) throw new Error(`Unexpected backup entry: ${path}`);
+      }
+      for (const record of records) {
+        record.backupFolder = folder;
+        record.backupEntry = before.get(record.path) ?? null;
+      }
+      await action.save();
+
+      let applied = 0, failed = 0;
+      for (const record of records) {
+        try {
+          action.guard();
+          const current = await action.vault.checkedEntryFor(record.path);
+          if (!sameFile(current, before.get(record.path) ?? null) || !action.canApply(record.path)) { skipped += 1; continue; }
+          const target = record.remote;
+          const bytes = target.op === "upsert"
+            ? await action.vault.serverBytes(target, (file) => this.downloadShareFile(selected, file, record.remoteHead))
+            : undefined;
+          action.guard();
+          selected.download.applying = record;
+          await action.save();
+          const changed = await action.vault.applyGuarded(target, before.get(record.path) ?? null, bytes, () => {
+            action.guard(); if (!action.canApply(record.path)) throw new Error("Move blocks local application");
+          });
+          action.guard();
+          if (!changed) { failed += 1; record.reason = "Local file changed during bulk remote recovery; bytes retained"; }
+          else {
+            selected.download.baseline = selected.download.baseline.filter((entry) => entry.path !== record.path);
+            if (target.op === "upsert") selected.download.baseline.push({ path: target.path, sha256: target.sha256,
+              size: bytes!.byteLength, mtime: Date.now() });
+            selected.download.reconciliation = selected.download.reconciliation.filter((entry) => entry !== record);
+            applied += 1;
+          }
+          delete selected.download.applying;
+          await action.save();
+        } catch {
+          failed += 1;
+          if (selected.download.applying === record) {
+            delete selected.download.applying;
+            selected.download.reconciliation = selected.download.reconciliation.filter((entry) => entry !== record);
+            selected.download.reconciliation.push({ ...record, reason: "Bulk remote recovery interrupted; inspect local bytes before retry" });
+          }
+          await action.save();
+        }
+      }
+      return { applied, skipped, failed, backupFolder: folder };
+    });
+    if (!result) throw new Error("Bulk remote recovery did not start; retry after the current sync finishes");
+    return result;
+  }
+
   private async uploadLocalChoice(selected: ActiveShare, path: string, action: ShareAction): Promise<void> {
     if (!selected || selected.status !== "writable") throw new Error("Enable writable share synchronization first");
     await this.requireShareWrite(selected, action);
