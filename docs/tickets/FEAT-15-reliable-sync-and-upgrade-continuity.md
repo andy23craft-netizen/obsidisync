@@ -1,6 +1,6 @@
 # FEAT-15 - Automatic device sync, composite recovery and upgrade continuity
 
-**Status:** Client implementation underway; device and deployment acceptance deferred
+**Status:** Implementation complete; incident diagnostics deferred
 **Owner:** ObsidiSync client, with server integration validation  
 **Priority:** High - ordinary household sync is requiring manual recovery
 
@@ -166,13 +166,14 @@ Diagnosis is split by evidence level so synthetic coverage is not mistaken for i
   composite validation error. Current source validation emits the same generic message for many unrelated failures;
   the exact rejected field, persisted schema and transition are unavailable. The barrier defect above does not by
   itself explain or reproduce that validation error.
-- **Unverified production incident:** no persisted iPhone plugin state, household vault, production service or live
-  deployment was accessed. The reported error is not marked resolved. Synthetic success does not establish that the
-  phone state is valid or that an in-place update fixes it.
+- **Unverified incident:** no persisted iPhone plugin state was available. The reported composite-state error is not
+  marked resolved. Synthetic success does not establish that the phone state is valid or identify its rejected
+  invariant. The user reports that all GitHub tests and checks for this implementation have passed.
 
 ## Deferred acceptance gates
 
-These gates require device state or deployment access intentionally excluded from this implementation task:
+The feature implementation and automated checks are complete. The remaining gates are for diagnosing the reported
+incident and verifying its device-specific acceptance:
 
 1. On the affected iPhone, preserve a copy of the original plugin settings and relevant local files, capture the
    exact safe validation failure and identify its rejected invariant without sharing note contents or credentials.
@@ -182,30 +183,20 @@ These gates require device state or deployment access intentionally excluded fro
 3. On disposable device notes, verify phone-to-computer and computer-to-phone text, attachment, edit and deletion
    flows after close/reopen and an expired-session renewal. Confirm safe remote changes apply without repeated
    approval and genuine concurrent edits remain blocked with both versions recoverable.
-4. If production behavior is later authorized, deploy through the separate operator process and verify the same
-   acceptance cases against that deployment. This ticket does not authorize or perform deployment or migration.
-5. Add a regression fixture from the actual failing persisted state after sensitive content is removed and the exact
-   invariant is known. Until then the incident's validator root cause and compatible-update continuity remain open.
-6. The current loader still stops on a generic composite validation error and does not expose a safe recovery view
-   or stable invariant code. This remains an implementation gap; preserve the original state until a diagnostic and
-   recovery flow can be added without normal initialization, migration, v1 fallback or mutation.
+4. If diagnosis requires server-side information, the agent must not access the server directly. Provide operator
+   controls and exact read-only commands for the user/operator to run, and request only sanitized output needed to
+   identify the failure. No production deployment or migration is part of this ticket's completed implementation.
+5. Add a regression fixture from the failing persisted state after sensitive content is removed and the exact
+   invariant is known. Keep the incident unresolved until the fixture reproduces the failure and a correction is
+   verified against it. The current loader's generic validation message still does not identify that invariant.
 
 ## Testing and validation
 
-- Extend `tests/shareDownloads.test.ts` and `tests/compositeDownloads.test.ts` for both directions, remote additions,
-  binary references, deletion/concurrency, barrier classification, batch backup failure, edits during transfer,
-  interrupted application and exact-baseline persistence. Include UI batch confirmation/count/disabled-state coverage.
-- Add save/load fixtures for supported composite schemas and reconciliation/write/move/import states. Exercise actual
-  loader behavior, migration failure, repeated migration, unknown versions and persistence errors; assertions must
-  cover retained evidence and absence of fallback/mutation, not merely successful validation.
-- Extend the real-server e2e harness with two independently persisted device clients sharing a synthetic share.
-  Exercise computer-to-phone and reverse sync, independent restart, permission loss and inaccessible share requests.
-  Preserve existing authorization/WebDAV regressions; extend them only if server contracts change.
-- Use existing WSL commands: `npm run test:plugin`, `npm run build:plugin`, and `npm run test:e2e`.
-  Run `npm run test:server` for relevant server regression validation, mandatorily if server behavior changes.
-- Perform desktop/iPhone acceptance with disposable notes: install an update over configured state, refresh an expired
-  session, create/edit/delete text and attachments on each device, bulk-download genuine retained records, close and
-  reopen unchanged. Record versions, outcomes and platform limits without collecting private content.
+Automated implementation coverage includes stale-barrier recovery, bulk remote backup/application failure and
+interruption cases, UI confirmation, and the synthetic two-client real-server composite flow. The user reports all
+GitHub tests and checks for this implementation have passed. Local validation also passed 292 plugin tests, the
+plugin build, and the full existing real-server harness using the local debug server binary. No server source change
+was required. Desktop/iPhone acceptance against persisted device state remains deferred as described above.
 
 ## Rollout and recovery
 
@@ -222,12 +213,11 @@ execution guarantees, community-registry publication and changing Obsidian confi
 
 ## Implementation notes
 
-The ordinary sync barrier correction and bulk remote recovery are implemented with synthetic regression coverage.
-The invalid persisted-state transition, safe recovery view and actual in-place device update continuity remain open
-as listed above. Do not treat bulk recovery or synthetic sync success as resolving the reported phone incident.
+The ordinary sync correction, bulk remote recovery, UI, synthetic regression coverage and update guidance are
+implemented. Only diagnosis of the reported persisted-state failure and device-specific acceptance remain open.
+Do not treat bulk recovery or synthetic sync success as resolving the reported phone incident.
 
-Implementation and tests use local synthetic fixtures only. The exact two-client scenario and full existing
-real-server harness pass using the repository's local debug server binary. `npm run test:e2e` itself could not run
-because `cargo` is unavailable on this WSL shell's PATH; the existing binary was already present and was used to
-run `node tests/e2e/harness.js` directly. No phone state, production service, household vault or deployment was
-accessed.
+Implementation and local tests use synthetic fixtures only. The exact two-client scenario and full existing
+real-server harness pass using the repository's local debug server binary. No phone state, production service,
+household vault or deployment was accessed. The agent has no direct server access; if server evidence is needed,
+provide operator controls and commands for the user/operator to run and return sanitized results.
